@@ -332,6 +332,21 @@ export class ArtifactRepository {
     ) as unknown as Array<{ payload: string }>;
     return rows.map(rowToArtifact);
   }
+
+  listByProject(projectId: string, kind?: ArtifactKind): Artifact[] {
+    const rows = (
+      kind
+        ? this.db
+            .prepare(
+              "SELECT payload FROM artifacts WHERE project_id = ? AND kind = ? ORDER BY created_at",
+            )
+            .all(projectId, kind)
+        : this.db
+            .prepare("SELECT payload FROM artifacts WHERE project_id = ? ORDER BY created_at")
+            .all(projectId)
+    ) as unknown as Array<{ payload: string }>;
+    return rows.map(rowToArtifact);
+  }
 }
 
 export class ContextRepository {
@@ -419,6 +434,7 @@ export interface ExecutionRecord {
   errorMessage: string | null;
   stdoutTail: string | null;
   stderrTail: string | null;
+  replyText: string | null;
   startedAt: string;
   finishedAt: string | null;
   durationMs: number | null;
@@ -443,6 +459,7 @@ interface ExecutionRow {
   error_message: string | null;
   stdout_tail: string | null;
   stderr_tail: string | null;
+  reply_text: string | null;
   started_at: string;
   finished_at: string | null;
   duration_ms: number | null;
@@ -453,7 +470,7 @@ interface ExecutionRow {
 const EXECUTION_COLUMNS =
   "id, run_id, project_id, task_id, agent_id, role, runtime, status, " +
   "failure_kind, instruction, session_ref, exit_code, stopped_reason, " +
-  "error_message, stdout_tail, stderr_tail, started_at, finished_at, " +
+  "error_message, stdout_tail, stderr_tail, reply_text, started_at, finished_at, " +
   "duration_ms, result_artifact_id, verification_artifact_id";
 
 function rowToExecution(r: ExecutionRow): ExecutionRecord {
@@ -474,6 +491,7 @@ function rowToExecution(r: ExecutionRow): ExecutionRecord {
     errorMessage: r.error_message,
     stdoutTail: r.stdout_tail,
     stderrTail: r.stderr_tail,
+    replyText: r.reply_text,
     startedAt: r.started_at,
     finishedAt: r.finished_at,
     durationMs: r.duration_ms === null ? null : Number(r.duration_ms),
@@ -492,9 +510,9 @@ export class ExecutionRepository {
         `INSERT INTO executions (
            id, run_id, project_id, task_id, agent_id, role, runtime, status,
            failure_kind, instruction, session_ref, exit_code, stopped_reason,
-           error_message, stdout_tail, stderr_tail, started_at, finished_at,
+           error_message, stdout_tail, stderr_tail, reply_text, started_at, finished_at,
            duration_ms, result_artifact_id, verification_artifact_id
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         row.id,
@@ -513,6 +531,7 @@ export class ExecutionRepository {
         row.errorMessage,
         row.stdoutTail,
         row.stderrTail,
+        row.replyText,
         row.startedAt,
         row.finishedAt,
         row.durationMs,
@@ -529,7 +548,7 @@ export class ExecutionRepository {
            run_id = ?, project_id = ?, task_id = ?, agent_id = ?, role = ?,
            runtime = ?, status = ?, failure_kind = ?, instruction = ?,
            session_ref = ?, exit_code = ?, stopped_reason = ?, error_message = ?,
-           stdout_tail = ?, stderr_tail = ?, started_at = ?, finished_at = ?,
+           stdout_tail = ?, stderr_tail = ?, reply_text = ?, started_at = ?, finished_at = ?,
            duration_ms = ?, result_artifact_id = ?, verification_artifact_id = ?
          WHERE id = ?`,
       )
@@ -549,6 +568,7 @@ export class ExecutionRepository {
         rec.errorMessage,
         rec.stdoutTail,
         rec.stderrTail,
+        rec.replyText,
         rec.startedAt,
         rec.finishedAt,
         rec.durationMs,

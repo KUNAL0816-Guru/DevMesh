@@ -119,6 +119,13 @@ const MIGRATIONS: readonly Migration[] = [
        CREATE INDEX idx_executions_failure ON executions(failure_kind);`,
     ],
   },
+  {
+    version: 4,
+    name: "execution-reply-text",
+    up: [
+      `ALTER TABLE executions ADD COLUMN reply_text TEXT;`,
+    ],
+  },
 ];
 
 function currentVersion(db: DatabaseSync): number {

@@ -14,6 +14,7 @@ import { normalizeError } from "./errors-map.js";
 import { GitService } from "@devmesh/workspace";
 import { ExecutionService } from "./executions/service.js";
 import { VERIFICATION_COMMAND_PATTERN } from "./executions/commands.js";
+import { Orchestrator } from "./orchestrator.js";
 
 export const APP_VERSION = "0.1.0";
 
@@ -289,6 +290,62 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
       const problem = normalizeError(err);
       return reply.status(problem.status).send({
         error: { code: (err as { code?: string }).code ?? problem.code, message: problem.message },
+      });
+    }
+  });
+
+  // -- pipeline (multi-agent orchestrator) -----------------------------------
+  const startPipelineBody = z.strictObject({
+    instruction: z.string().min(1).max(8000),
+  });
+
+  app.post("/projects/:projectId/pipeline", async (req, reply) => {
+    if (!executions.configured) {
+      return reply.status(503).send({
+        error: { code: "runtime/not-configured", message: "no agent runtime wired" },
+      });
+    }
+    const params = z.strictObject({ projectId: z.string() }).safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid project id" },
+      });
+    }
+    const parsedId = projectIdSchema.safeParse(params.data.projectId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    const parsedBody = startPipelineBody.safeParse(req.body);
+    if (!parsedBody.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "body must be {instruction: string}" },
+      });
+    }
+    const orchestrator = new Orchestrator({
+      storage: opts.storage,
+      workspaces: opts.workspaces,
+      executionService: executions,
+    });
+    try {
+      // Run the pipeline asynchronously; the client can poll task status
+      const result = orchestrator.run(parsedId.data, parsedBody.data.instruction);
+      // Don't await — let it run in background; return 202 immediately
+      void result.catch((err) => {
+        app.log.error({ err }, "pipeline failed");
+      });
+      return reply.status(202).send({
+        message: "pipeline started",
+        projectId: parsedId.data,
+      });
+    } catch (err) {
+      const problem = normalizeError(err);
+      return reply.status(problem.status).send({
+        error: {
+          code: (err as { code?: string }).code ?? problem.code,
+          message: problem.message,
+        },
       });
     }
   });

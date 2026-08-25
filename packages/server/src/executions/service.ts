@@ -169,6 +169,7 @@ export class ExecutionService {
       errorMessage: null,
       stdoutTail: null,
       stderrTail: null,
+      replyText: null,
       startedAt: new Date().toISOString(),
       finishedAt: null,
       durationMs: null,
@@ -400,6 +401,7 @@ export class ExecutionService {
               ? "verification failed: DevMesh rejected the claimed changes"
               : result.failureReason ?? null,
         stderrTail: result.stderrTail.slice(0, 16_000) || null,
+        replyText: result.finalText.slice(0, 16_000) || null,
         finishedAt,
         durationMs: result.durationMs,
         resultArtifactId: changeSetId,

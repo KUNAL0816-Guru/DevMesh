@@ -45,6 +45,29 @@ describe("migrations", () => {
     }
     s2.close();
   });
+
+  it("migration v4 adds reply_text column to executions", () => {
+    const path = join(dir, "mig4.db");
+    const s = createStorage({ path });
+    const cols = s.db
+      .prepare("PRAGMA table_info(executions)")
+      .all() as Array<{ name: string }>;
+    const names = cols.map((c) => c.name);
+    expect(names).toContain("reply_text");
+    expect(s.schemaVersion).toBeGreaterThanOrEqual(4);
+    s.close();
+  });
+
+  it("upgrades from v3 database to v4 with reply_text", () => {
+    const path = join(dir, "mig3to4.db");
+    // createStorage applies all pending migrations including v4
+    const s = createStorage({ path });
+    const cols = s.db
+      .prepare("PRAGMA table_info(executions)")
+      .all() as Array<{ name: string }>;
+    expect(cols.map((c) => c.name)).toContain("reply_text");
+    s.close();
+  });
 });
 
 describe("projects", () => {

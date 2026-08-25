@@ -31,6 +31,9 @@ export interface FakeScript {
   stepDelayMs?: number;
 }
 
+/** A function that returns a FakeScript based on the execution request. */
+export type FakeScriptFactory = (request: AgentExecutionRequest) => FakeScript;
+
 interface LiveRun {
   cancelled: boolean;
   cancelReason?: string;
@@ -47,11 +50,11 @@ interface LiveRun {
  */
 export class FakeRuntime implements AgentRuntime {
   readonly name = "fake";
-  private readonly script: FakeScript;
+  private readonly scriptOrFactory: FakeScript | FakeScriptFactory;
   private readonly live = new Map<string, LiveRun>();
 
-  constructor(script: FakeScript) {
-    this.script = script;
+  constructor(script: FakeScript | FakeScriptFactory) {
+    this.scriptOrFactory = script;
   }
 
   /** Fakes serve any agent definition so the full pipeline is testable. */
@@ -64,6 +67,10 @@ export class FakeRuntime implements AgentRuntime {
   }
 
   start(request: AgentExecutionRequest): RunningExecution {
+    const script =
+      typeof this.scriptOrFactory === "function"
+        ? this.scriptOrFactory(request)
+        : this.scriptOrFactory;
     const handlers: Array<(e: AgentStreamEvent) => void> = [];
     const run: LiveRun = { cancelled: false, timers: [], wakeFns: new Set() };
     this.live.set(request.executionId, run);
@@ -77,7 +84,7 @@ export class FakeRuntime implements AgentRuntime {
 
     const startedAt = Date.now();
     const deadline = startedAt + Math.max(request.timeoutMs, 1);
-    const delay = this.script.stepDelayMs ?? 10;
+    const delay = script.stepDelayMs ?? 10;
 
     const finish = (r: Omit<AgentExecutionResult, "durationMs">) => {
       for (const t of run.timers) clearTimeout(t);
@@ -105,7 +112,7 @@ export class FakeRuntime implements AgentRuntime {
         );
         return;
       }
-      for (const step of this.script.steps ?? []) {
+      for (const step of script.steps ?? []) {
         if (run.cancelled) break;
         if (Date.now() >= deadline) break;
         for (const e of step.events ?? []) emit(e);
@@ -142,7 +149,7 @@ export class FakeRuntime implements AgentRuntime {
         });
         return;
       }
-      if (Date.now() >= deadline && this.script.outcome.status !== "timeout") {
+      if (Date.now() >= deadline && script.outcome.status !== "timeout") {
         finish({
           status: "timeout",
           exitCode: null,
@@ -152,7 +159,7 @@ export class FakeRuntime implements AgentRuntime {
         });
         return;
       }
-      const o = this.script.outcome;
+      const o = script.outcome;
       finish({
         status: o.status,
         exitCode: o.exitCode ?? (o.status === "completed" ? 0 : 1),

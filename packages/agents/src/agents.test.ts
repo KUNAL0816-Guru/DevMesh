@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { agentDefinitionSchema } from "./schema.js";
 import { AgentRegistry, AgentRegistryError } from "./registry.js";
-import { createDefaultAgentRegistry, DEVELOPER_AGENT_ID } from "./builtins.js";
+import { createDefaultAgentRegistry } from "./builtins.js";
 
 describe("agent definition schema", () => {
   const valid = {
@@ -108,29 +108,33 @@ describe("AgentRegistry", () => {
   });
 });
 
-describe("built-in definitions (Phase 3)", () => {
-  it("defines all four roles but only developer is executable", () => {
+describe("built-in definitions (Phase 4B)", () => {
+  it("defines all four roles and all are executable", () => {
     const reg = createDefaultAgentRegistry();
     const ids = reg.list().map((d) => d.id);
     expect(ids).toEqual(["architect", "developer", "reviewer", "tester"]);
 
-    const dev = reg.requireExecutable(DEVELOPER_AGENT_ID);
-    expect(dev.role).toBe("developer");
-    expect(dev.runtime).toBe("opencode");
-    expect(dev.systemInstructions.length).toBeGreaterThan(50);
-
-    for (const id of ["architect", "tester", "reviewer"]) {
-      try {
-        reg.requireExecutable(id);
-        expect.unreachable(`${id} should not be executable`);
-      } catch (err) {
-        expect((err as AgentRegistryError).code).toBe("agent/not-executable");
-      }
+    for (const id of ["architect", "developer", "tester", "reviewer"]) {
+      const def = reg.requireExecutable(id);
+      expect(def.runtime).toBe("opencode");
+      expect(def.systemInstructions.length).toBeGreaterThan(50);
     }
   });
 
   it("carries no hard-coded model constants", () => {
     const reg = createDefaultAgentRegistry();
     for (const def of reg.list()) expect(def.model).toBeUndefined();
+  });
+
+  it("respects permission profiles per agent", () => {
+    const reg = createDefaultAgentRegistry();
+    const architect = reg.require("architect");
+    expect(architect.allowedOperations).not.toContain("write_files");
+    const developer = reg.require("developer");
+    expect(developer.allowedOperations).toContain("write_files");
+    const tester = reg.require("tester");
+    expect(tester.allowedOperations).toContain("write_files");
+    const reviewer = reg.require("reviewer");
+    expect(reviewer.allowedOperations).not.toContain("write_files");
   });
 });

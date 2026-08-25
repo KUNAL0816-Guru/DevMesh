@@ -276,6 +276,7 @@ describe("ExecutionService with FakeRuntime", () => {
       errorMessage: null,
       stdoutTail: null,
       stderrTail: null,
+      replyText: null,
       startedAt: new Date().toISOString(),
       finishedAt: null,
       durationMs: null,
@@ -446,7 +447,7 @@ describe("Phase 3: agent gating via the registry", () => {
     await stack.app.close();
   });
 
-  it("rejects unknown agents with 400 and non-executable with 409", async () => {
+  it("rejects unknown agents with 400", async () => {
     const stack = makeStack(() => new FakeRuntime(hangScript()));
     const unknown = await stack.app.inject({
       method: "POST",
@@ -455,14 +456,6 @@ describe("Phase 3: agent gating via the registry", () => {
     });
     expect(unknown.statusCode).toBe(400);
     expect(unknown.json().error.code).toBe("runtime/invalid-request");
-
-    const architect = await stack.app.inject({
-      method: "POST",
-      url: `/projects/${stack.handle.projectId}/executions`,
-      payload: { instruction: "x", agentId: "architect" },
-    });
-    expect(architect.statusCode).toBe(409);
-    expect(architect.json().error.code).toBe("agent/not-executable");
     await stack.app.close();
   });
 
