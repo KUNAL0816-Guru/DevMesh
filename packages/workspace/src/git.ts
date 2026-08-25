@@ -38,6 +38,21 @@ export interface GitCommitResult {
 
 const REF_PATTERN = /^[A-Za-z0-9._~/-]{1,120}$/;
 
+/** Prefix for DevMesh-owned checkpoint commit messages. */
+export const CHECKPOINT_PREFIX = "devmesh/checkpoint/";
+
+export interface GitCheckpointResult {
+  sha: string;
+  label: string;
+  timestamp: string;
+}
+
+export interface CheckpointInfo {
+  sha: string;
+  label: string;
+  timestamp: string;
+}
+
 export interface GitServiceOptions {
   gitBin?: string;
   timeoutMs?: number;
@@ -249,6 +264,128 @@ export class GitService {
       }
     }
     this.expect(root, ["add", "--", ...paths]);
+  }
+
+  /**
+   * Create a DevMesh checkpoint commit.
+   *
+   * Safety requirements:
+   * - The workspace MUST be clean (no uncommitted changes) before the first
+   *   checkpoint in a pipeline. This prevents committing user-owned changes
+   *   that DevMesh cannot prove it owns.
+   * - DevMesh only checkpoints its own managed changes; pre-existing
+   *   uncommitted work is never silently committed.
+   */
+  checkpoint(root: string, label: string): GitCheckpointResult {
+    this.assertRoot(root);
+    if (!this.isRepository(root)) {
+      throw new WorkspaceError("git/not-a-repository", "workspace is not a git repository");
+    }
+    if (!label.trim() || label.length > 120) {
+      throw new WorkspaceError("git/invalid-message", "checkpoint label must be 1-120 characters");
+    }
+    // Verify workspace is clean before creating a checkpoint.
+    const preStatus = this.status(root);
+    if (!preStatus.clean) {
+      throw new WorkspaceError(
+        "git/dirty-workspace",
+        "cannot create checkpoint: workspace has uncommitted changes",
+        { details: { entries: preStatus.entries.map((e) => `${e.x}${e.y} ${e.path}`) } },
+      );
+    }
+    const timestamp = new Date().toISOString();
+    const message = `${CHECKPOINT_PREFIX}${label}/${timestamp}`;
+    const commitResult = this.commit(root, message, { allowEmpty: true });
+    return { sha: commitResult.sha, label, timestamp };
+  }
+
+  /**
+   * Rollback the workspace to a DevMesh-owned checkpoint commit.
+   *
+   * Safety requirements:
+   * - Only commits prefixed with `devmesh/checkpoint/` are valid targets.
+   * - Refuses if unexpected uncommitted changes exist that DevMesh did not
+   *   create (workspace must be clean, or only contain changes after the
+   *   checkpoint commit).
+   * - Uses `git reset --hard` only to a verified checkpoint SHA.
+   */
+  rollbackTo(root: string, targetSha: string): void {
+    this.assertRoot(root);
+    if (!this.isRepository(root)) {
+      throw new WorkspaceError("git/not-a-repository", "workspace is not a git repository");
+    }
+    if (!/^[0-9a-f]{4,40}$/i.test(targetSha)) {
+      throw new WorkspaceError("git/command-failed", "invalid commit SHA format");
+    }
+    // Verify the target commit is a DevMesh checkpoint.
+    const logResult = this.run(root, [
+      "log", "-1", "--format=%s", targetSha,
+    ]);
+    if (!logResult.ok) {
+      throw new WorkspaceError("git/command-failed", `commit ${targetSha} not found`);
+    }
+    const message = logResult.stdout.trim();
+    if (!message.startsWith(CHECKPOINT_PREFIX)) {
+      throw new WorkspaceError(
+        "git/not-a-devmesh-checkpoint",
+        `commit ${targetSha} is not a DevMesh checkpoint (message: ${message.slice(0, 80)})`,
+      );
+    }
+    // Check for unexpected uncommitted changes before resetting.
+    const statusBefore = this.status(root);
+    if (!statusBefore.clean) {
+      throw new WorkspaceError(
+        "git/rollback-conflict",
+        "cannot rollback: workspace has uncommitted changes",
+        { details: { entries: statusBefore.entries.map((e) => `${e.x}${e.y} ${e.path}`) } },
+      );
+    }
+    // Perform the reset.
+    this.expect(root, ["reset", "--hard", targetSha]);
+    // Post-rollback integrity check: workspace should still be clean.
+    const statusAfter = this.status(root);
+    if (!statusAfter.clean) {
+      throw new WorkspaceError(
+        "git/rollback-conflict",
+        "rollback resulted in unexpected uncommitted changes",
+        { details: { entries: statusAfter.entries.map((e) => `${e.x}${e.y} ${e.path}`) } },
+      );
+    }
+  }
+
+  /**
+   * List all DevMesh checkpoint commits in the repository.
+   * Returns commits in reverse chronological order (newest first).
+   */
+  listCheckpoints(root: string): CheckpointInfo[] {
+    this.assertRoot(root);
+    if (!this.isRepository(root)) {
+      throw new WorkspaceError("git/not-a-repository", "workspace is not a git repository");
+    }
+    const result = this.run(root, [
+      "log",
+      "--all",
+      "--format=%H %s",
+      `--grep=${CHECKPOINT_PREFIX}`,
+      "--regexp-ignore-case",
+    ]);
+    if (!result.ok) return [];
+    const checkpoints: CheckpointInfo[] = [];
+    for (const line of result.stdout.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const spaceIdx = trimmed.indexOf(" ");
+      if (spaceIdx <= 0) continue;
+      const sha = trimmed.slice(0, spaceIdx);
+      const message = trimmed.slice(spaceIdx + 1);
+      if (!message.startsWith(CHECKPOINT_PREFIX)) continue;
+      const rest = message.slice(CHECKPOINT_PREFIX.length);
+      const lastSlash = rest.lastIndexOf("/");
+      const label = lastSlash >= 0 ? rest.slice(0, lastSlash) : rest;
+      const timestamp = lastSlash >= 0 ? rest.slice(lastSlash + 1) : "";
+      checkpoints.push({ sha, label, timestamp });
+    }
+    return checkpoints;
   }
 
   /**

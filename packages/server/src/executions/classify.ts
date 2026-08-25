@@ -13,6 +13,7 @@ export const failureKinds = [
   "invalid_output",
   "verification_failed",
   "task_failed",
+  "doom_loop",
   "internal",
 ] as const;
 export type FailureKind = (typeof failureKinds)[number];
@@ -52,5 +53,6 @@ export function classifyStartError(err: unknown): FailureKind {
   if (code === "task/exhausted") return "task_failed";
   if (code === "workspace/locked") return "task_failed";
   if (code === "runtime/unavailable") return "process_failure";
+  if (code === "orchestrator/doom-loop") return "doom_loop";
   return "internal";
 }

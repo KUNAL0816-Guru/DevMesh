@@ -544,6 +544,7 @@ describe("Phase 3: failure classification", () => {
       "invalid_output",
       "verification_failed",
       "task_failed",
+      "doom_loop",
       "internal",
     ]);
   });
@@ -568,6 +569,7 @@ describe("Phase 3: failure classification", () => {
     expect(classifyStartError({ code: "runtime/not-configured" })).toBe("task_failed");
     expect(classifyStartError({ code: "workspace/locked" })).toBe("task_failed");
     expect(classifyStartError({ code: "task/exhausted" })).toBe("task_failed");
+    expect(classifyStartError({ code: "orchestrator/doom-loop" })).toBe("doom_loop");
     expect(classifyStartError(new Error("boom"))).toBe("internal");
   });
 

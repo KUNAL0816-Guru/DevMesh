@@ -14,6 +14,10 @@ export class WorkspaceError extends Error {
       | "git/timeout"
       | "git/nothing-to-commit"
       | "git/invalid-message"
+      | "git/dirty-workspace"
+      | "git/not-a-devmesh-checkpoint"
+      | "git/rollback-conflict"
+      | "git/no-checkpoint"
       | "task/exhausted",
     message: string,
     options?: { cause?: unknown; details?: unknown },

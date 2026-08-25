@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   type ProjectId,
+  type TaskId,
 } from "@devmesh/contracts";
 import { createStorage, type Storage } from "@devmesh/storage";
 import { WorkspaceService } from "@devmesh/workspace";
@@ -11,6 +12,7 @@ import { FakeRuntime, type FakeScriptFactory } from "@devmesh/runtime";
 import { createDefaultAgentRegistry } from "@devmesh/agents";
 import { Orchestrator, type PipelineResult } from "./orchestrator.js";
 import { ExecutionService } from "./executions/service.js";
+import { DoomLoopDetector, computeFailureSignature } from "./orchestrator.js";
 import type { Config } from "./config.js";
 
 let dataRoot: string;
@@ -29,6 +31,8 @@ afterEach(() => {
 interface Stack {
   storage: Storage;
   orchestrator: Orchestrator;
+  ws: WorkspaceService;
+  es: ExecutionService;
   projectId: ProjectId;
   root: string;
 }
@@ -93,7 +97,7 @@ function makeStack(
     workspaces,
     executionService,
   });
-  return { storage, orchestrator, projectId: handle.projectId, root: handle.root };
+  return { storage, orchestrator, ws: workspaces, es: executionService, projectId: handle.projectId, root: handle.root };
 }
 
 /** Script factory that returns a different script per agent role. */
@@ -599,5 +603,471 @@ describe("Orchestrator: agent permission profiles", () => {
     expect(reviewer.allowedOperations).toContain("read_files");
     expect(reviewer.allowedOperations).not.toContain("write_files");
     expect(reviewer.allowedOperations).not.toContain("run_commands");
+  });
+});
+
+describe("DoomLoopDetector", () => {
+  it("detects doom-loop after threshold consecutive identical failures", () => {
+    const detector = new DoomLoopDetector(3);
+    expect(detector.recordFailure("tester", "sig_a")).toBe(false);
+    expect(detector.recordFailure("tester", "sig_a")).toBe(false);
+    expect(detector.recordFailure("tester", "sig_a")).toBe(true);
+    expect(detector.isDoomLoop("tester")).toBe(true);
+  });
+
+  it("resets on different failure signature", () => {
+    const detector = new DoomLoopDetector(3);
+    expect(detector.recordFailure("tester", "sig_a")).toBe(false);
+    expect(detector.recordFailure("tester", "sig_a")).toBe(false);
+    expect(detector.recordFailure("tester", "sig_b")).toBe(false);
+    expect(detector.getCount("tester")).toBe(1);
+    expect(detector.isDoomLoop("tester")).toBe(false);
+  });
+
+  it("resets on success", () => {
+    const detector = new DoomLoopDetector(3);
+    expect(detector.recordFailure("tester", "sig_a")).toBe(false);
+    expect(detector.recordFailure("tester", "sig_a")).toBe(false);
+    detector.recordSuccess("tester");
+    expect(detector.getCount("tester")).toBe(0);
+    expect(detector.recordFailure("tester", "sig_a")).toBe(false);
+    expect(detector.isDoomLoop("tester")).toBe(false);
+  });
+
+  it("independent per-role tracking", () => {
+    const detector = new DoomLoopDetector(2);
+    expect(detector.recordFailure("tester", "sig_a")).toBe(false);
+    expect(detector.recordFailure("tester", "sig_a")).toBe(true);
+    expect(detector.isDoomLoop("reviewer")).toBe(false);
+  });
+});
+
+describe("computeFailureSignature", () => {
+  it("normalizes dynamic parts of error messages", () => {
+    const rec1 = {
+      failureKind: "process_failure" as const,
+      errorMessage: "Error at 2026-08-25T12:30:00.000Z in tests/login.test.ts:42",
+    };
+    const rec2 = {
+      failureKind: "process_failure" as const,
+      errorMessage: "Error at 2026-08-25T15:45:30.500Z in tests/login.test.ts:42",
+    };
+    expect(computeFailureSignature(rec1 as never)).toBe(computeFailureSignature(rec2 as never));
+  });
+
+  it("produces different signatures for different failure kinds", () => {
+    const a = computeFailureSignature({ failureKind: "timeout", errorMessage: "x" } as never);
+    const b = computeFailureSignature({ failureKind: "process_failure", errorMessage: "x" } as never);
+    expect(a).not.toBe(b);
+  });
+});
+
+describe("Orchestrator: doom-loop integration", () => {
+  it("16. same tester failure triggers doom-loop termination", async () => {
+    // Doom-loop threshold=2, tester maxAttempts=10 so doom-loop fires before budget exhaustion
+    const storage2 = createStorage({ path: join(dataRoot, `orch-dl-${crypto.randomUUID()}.db`) });
+    const workspaces2 = new WorkspaceService({
+      store: storage2.projects,
+      workspacesRoot: join(dataRoot, "ws-dl"),
+    });
+    const handle2 = workspaces2.create("doom-test");
+    const agents2 = createDefaultAgentRegistry();
+    const executionService2 = new ExecutionService({
+      storage: storage2,
+      workspaces: workspaces2,
+      git: { init: () => {}, status: () => ({ branch: "HEAD", entries: [] }) } as never,
+      runtime: new FakeRuntime(
+        (req) => {
+          const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+          const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+          if (role === "tester") {
+            return {
+              steps: [{ events: [{ kind: "text", text: "test failed: assertion error" }] }],
+              outcome: { status: "failed", finalText: "test failed: assertion error in test_login" },
+              stepDelayMs: 5,
+            };
+          }
+          if (role === "developer") {
+            return {
+              steps: [{
+                effect: () => writeFileSync(join(handle2.root, "app.js"), "code"),
+                events: [{ kind: "text", text: "fixed" }],
+              }],
+              outcome: { status: "completed", finalText: "fixed" },
+              stepDelayMs: 5,
+            };
+          }
+          return {
+            steps: [{ events: [{ kind: "text", text: `${role} ok` }] }],
+            outcome: { status: "completed", finalText: `${role} ok` },
+            stepDelayMs: 5,
+          };
+        },
+      ),
+      agents: agents2,
+      defaultTimeoutMs: 10_000,
+    });
+    const orchestrator2 = new Orchestrator({
+      storage: storage2,
+      workspaces: workspaces2,
+      executionService: executionService2,
+      doomLoopThreshold: 2,
+      maxTesterRevisions: 10,
+      maxReviewerRevisions: 5,
+      taskMaxAttempts: { tester: 10, developer: 10 },
+    });
+
+    const result = await orchestrator2.run(handle2.projectId, "doom loop test");
+    expect(result.status).toBe("failed");
+    expect(result.errorMessage).toContain("doom-loop");
+
+    // Verify doom-loop event was emitted
+    const events = [...storage2.events.listAfter(0, 500)];
+    const doomEvents = events.filter(
+      (e) => e.type === "error.raised" && "scope" in e && e.scope === "orchestrator/doom-loop",
+    );
+    expect(doomEvents.length).toBe(1);
+
+    await storage2.close();
+  });
+
+  it("17. doom-loop counter resets after a successful stage", async () => {
+    // Scenario: tester fails once (same sig), then passes, then fails once more.
+    // With doom-loop threshold=2, the 2nd failure does NOT trigger doom-loop
+    // because the counter was reset by the success in between.
+    let testerAttempt = 0;
+    const storage2 = createStorage({ path: join(dataRoot, `orch-dlr-${crypto.randomUUID()}.db`) });
+    const workspaces2 = new WorkspaceService({
+      store: storage2.projects,
+      workspacesRoot: join(dataRoot, "ws-dlr"),
+    });
+    const handle2 = workspaces2.create("doom-reset-test");
+    const agents2 = createDefaultAgentRegistry();
+    const executionService2 = new ExecutionService({
+      storage: storage2,
+      workspaces: workspaces2,
+      git: { init: () => {}, status: () => ({ branch: "HEAD", entries: [] }) } as never,
+      runtime: new FakeRuntime(
+        (req) => {
+          const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+          const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+          if (role === "tester") {
+            testerAttempt++;
+            // Fail on attempt 1, pass on attempt 2, fail on attempt 3, pass on attempt 4
+            if (testerAttempt === 1 || testerAttempt === 3) {
+              return {
+                steps: [{ events: [{ kind: "text", text: "test failed" }] }],
+                outcome: { status: "failed", finalText: "test failed: assertion error" },
+                stepDelayMs: 5,
+              };
+            }
+            return {
+              steps: [{ events: [{ kind: "text", text: "tests pass" }] }],
+              outcome: { status: "completed", finalText: "all tests pass" },
+              stepDelayMs: 5,
+            };
+          }
+          return {
+            steps: [{
+              effect: () => writeFileSync(join(handle2.root, "app.js"), "code"),
+              events: [{ kind: "text", text: "ok" }],
+            }],
+            outcome: { status: "completed", finalText: "ok" },
+            stepDelayMs: 5,
+          };
+        },
+      ),
+      agents: agents2,
+      defaultTimeoutMs: 10_000,
+    });
+    const orchestrator2 = new Orchestrator({
+      storage: storage2,
+      workspaces: workspaces2,
+      executionService: executionService2,
+      doomLoopThreshold: 2,
+      maxTesterRevisions: 10,
+      maxReviewerRevisions: 5,
+      taskMaxAttempts: { tester: 10, developer: 10 },
+    });
+
+    const result = await orchestrator2.run(handle2.projectId, "doom reset test");
+    // Should complete because tester's doom-loop counter resets after each success
+    expect(result.status).toBe("completed");
+
+    await storage2.close();
+  });
+});
+
+describe("Orchestrator: structured context assembly", () => {
+  it("18. developer revision receives structured test failure context", async () => {
+    let testerRan = false;
+    const capturedInstructions: string[] = [];
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      capturedInstructions.push(req.instruction);
+
+      if (role === "tester" && !testerRan) {
+        testerRan = true;
+        return {
+          steps: [{ events: [{ kind: "text", text: "2 tests failed" }] }],
+          outcome: {
+            status: "failed",
+            finalText: "FAIL test_login - expected 200 got 500\ntest_db - connection timeout",
+          },
+          stepDelayMs: 5,
+        };
+      }
+      if (role === "developer") {
+        return {
+          steps: [{
+            effect: () => writeFileSync(join(stack.root, "app.js"), "fixed"),
+            events: [{ kind: "text", text: "fixed" }],
+          }],
+          outcome: { status: "completed", finalText: "fixed" },
+          stepDelayMs: 5,
+        };
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} ok` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+
+    const result = await stack.orchestrator.run(stack.projectId, "fix failing tests");
+    expect(result.status).toBe("completed");
+
+    // At least one developer instruction should mention test failure details
+    const hasFailureContext = capturedInstructions.some((i) =>
+      (i.includes("test_login") || i.includes("FAIL") || i.includes("failure")) &&
+      i.includes("Context from previous stages"),
+    );
+    expect(hasFailureContext).toBe(true);
+
+    await stack.storage.close();
+  });
+});
+
+describe("Orchestrator: revision cycle storage", () => {
+  it("19. tester failure records a revision cycle", async () => {
+    let testerRunCount = 0;
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      if (role === "tester") {
+        testerRunCount++;
+        if (testerRunCount === 1) {
+          return {
+            steps: [{ events: [{ kind: "text", text: "test failed" }] }],
+            outcome: { status: "failed", finalText: "FAIL test_main - assertion error" },
+            stepDelayMs: 5,
+          };
+        }
+        return {
+          steps: [{ events: [{ kind: "text", text: "all tests pass" }] }],
+          outcome: { status: "completed", finalText: "pass" },
+          stepDelayMs: 5,
+        };
+      }
+      if (role === "developer") {
+        return {
+          steps: [{
+            effect: () => writeFileSync(join(stack.root, "app.js"), "fixed"),
+            events: [{ kind: "text", text: "fixed" }],
+          }],
+          outcome: { status: "completed", finalText: "fixed" },
+          stepDelayMs: 5,
+        };
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} ok` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+
+    const result = await stack.orchestrator.run(stack.projectId, "test revision cycles");
+    expect(result.status).toBe("completed");
+
+    // Find the tester task
+    const devTask = stack.storage.tasks.get(result.taskId as TaskId);
+    expect(devTask).toBeDefined();
+    const allTasks = stack.storage.tasks.listByRun(devTask!.runId);
+    const testerTask = allTasks.find((t) => t.role === "tester");
+    expect(testerTask).toBeDefined();
+    const testerId = testerTask!.id;
+    const cycles = stack.storage.revisionCycles.listByTask(testerId);
+    expect(cycles.length).toBeGreaterThanOrEqual(1);
+    expect(cycles[0]!.cycleType).toBe("tester_failure");
+
+    await stack.storage.close();
+  });
+});
+
+describe("Orchestrator: git checkpoint integration", () => {
+  it("20. git checkpoint is created before developer and rolled back on failure", async () => {
+    const { GitService } = await import("@devmesh/workspace");
+    const git = new GitService();
+
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      if (role === "tester") {
+        return {
+          steps: [{ events: [{ kind: "text", text: "test failed" }] }],
+          outcome: { status: "failed", finalText: "FAIL test_main" },
+          stepDelayMs: 5,
+        };
+      }
+      if (role === "developer") {
+        return {
+          steps: [{
+            effect: () => writeFileSync(join(stack.root, "app.js"), "broken"),
+            events: [{ kind: "text", text: "done" }],
+          }],
+          outcome: { status: "completed", finalText: "done" },
+          stepDelayMs: 5,
+        };
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} ok` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+
+    // Initialize git repo in the workspace so checkpoints work
+    git.init(stack.root);
+
+    // Create orchestrator with git service
+    const orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      git,
+      maxTesterRevisions: 1,
+    });
+
+    const result = await orchestrator.run(stack.projectId, "test git checkpoints");
+    // Pipeline fails because tester always fails and budget exhausted
+    expect(result.status).toBe("failed");
+
+    // Should have created at least one checkpoint
+    const handle = stack.ws.get(stack.projectId);
+    const checkpoints = git.listCheckpoints(handle.root);
+    expect(checkpoints.length).toBeGreaterThanOrEqual(1);
+
+    // After rollback, workspace should not contain the broken file
+    const { existsSync } = await import("node:fs");
+    expect(existsSync(join(handle.root, "app.js"))).toBe(false);
+
+    await stack.storage.close();
+  });
+});
+
+describe("Orchestrator: pipeline-level attempt limits", () => {
+  it("21. maxTotalAttempts terminates the pipeline early", async () => {
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      if (role === "tester") {
+        return {
+          steps: [{ events: [{ kind: "text", text: "test failed" }] }],
+          outcome: { status: "failed", finalText: "FAIL" },
+          stepDelayMs: 5,
+        };
+      }
+      if (role === "developer") {
+        return {
+          steps: [{
+            effect: () => writeFileSync(join(stack.root, "app.js"), "fixed"),
+            events: [{ kind: "text", text: "fixed" }],
+          }],
+          outcome: { status: "completed", finalText: "fixed" },
+          stepDelayMs: 5,
+        };
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} ok` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+
+    // arch=1, dev=1, tester_fail=1 → dev retry=1, tester_fail=2 → budget at 6
+    // But tester budget=2 means tester rev 1 triggers, rev 2 exceeds → dev blocks at attempt 3
+    // So use a very low pipeline budget to hit before task budgets
+    const orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      maxTesterRevisions: 10,
+      maxTotalAttempts: 5,
+      taskMaxAttempts: { developer: 10 },
+    });
+
+    const result = await orchestrator.run(stack.projectId, "test total attempts");
+    expect(result.status).toBe("failed");
+    expect(result.errorMessage).toContain("pipeline total attempt budget exhausted");
+
+    await stack.storage.close();
+  });
+});
+
+describe("Orchestrator: interrupted pipeline recovery", () => {
+  it("22. recoverInterruptedPipelines marks stale executions as interrupted", async () => {
+    const { GitService } = await import("@devmesh/workspace");
+    const git = new GitService();
+    const stack = makeStack(() => ({
+      steps: [{ events: [{ kind: "text", text: "ok" }] }],
+      outcome: { status: "completed", finalText: "ok" },
+      stepDelayMs: 5,
+    }));
+
+    git.init(stack.root);
+
+    const orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      git,
+    });
+
+    // Simulate a stale execution left running
+    stack.storage.executions.insert({
+      id: "exec-stale-1",
+      runId: "run-stale",
+      projectId: stack.projectId,
+      taskId: null,
+      agentId: null,
+      role: "developer",
+      runtime: "fake",
+      status: "running",
+      failureKind: null,
+      instruction: "stale execution",
+      sessionRef: null,
+      exitCode: null,
+      stoppedReason: null,
+      errorMessage: null,
+      stdoutTail: null,
+      stderrTail: null,
+      replyText: null,
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      durationMs: null,
+      resultArtifactId: null,
+      verificationArtifactId: null,
+    });
+
+    const recovered = orchestrator.recoverInterruptedPipelines(stack.projectId);
+    expect(recovered).toBe(1);
+
+    // The execution should now be marked interrupted
+    const rec = stack.storage.executions.get("exec-stale-1");
+    expect(rec).toBeDefined();
+    expect(rec!.status).toBe("interrupted");
+
+    await stack.storage.close();
   });
 });

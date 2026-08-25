@@ -8,9 +8,10 @@ import {
   type ArtifactId,
   type AgentRole,
   type Artifact,
+  type ArtifactKind,
 } from "@devmesh/contracts";
 import type { Storage, ExecutionRecord } from "@devmesh/storage";
-import type { WorkspaceService } from "@devmesh/workspace";
+import type { WorkspaceService, GitService } from "@devmesh/workspace";
 import type { ExecutionService } from "./executions/service.js";
 import {
   buildSpecArtifact,
@@ -25,6 +26,81 @@ import {
 
 const MAX_TESTER_REVISIONS = 2;
 const MAX_REVIEWER_REVISIONS = 1;
+const DEFAULT_DOOM_LOOP_THRESHOLD = 3;
+
+// ---------------------------------------------------------------------------
+// Doom-loop detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Detects repeated ineffective cycles where the same agent fails with the
+ * identical signature multiple times in a row. When a doom-loop is detected,
+ * the pipeline terminates with a stable failure reason.
+ */
+export class DoomLoopDetector {
+  private readonly threshold: number;
+  /** Map from agent role → consecutive failure count for the current signature. */
+  private readonly consecutiveFailures = new Map<string, number>();
+  /** Map from agent role → the last failure signature seen. */
+  private readonly lastSignature = new Map<string, string | null>();
+
+  constructor(threshold: number = DEFAULT_DOOM_LOOP_THRESHOLD) {
+    this.threshold = threshold;
+  }
+
+  /**
+   * Record a failure for the given agent role. Returns `true` if a doom-loop
+   * is detected (threshold exceeded).
+   */
+  recordFailure(role: string, failureSignature: string): boolean {
+    const prev = this.lastSignature.get(role);
+    if (prev === failureSignature) {
+      const count = (this.consecutiveFailures.get(role) ?? 0) + 1;
+      this.consecutiveFailures.set(role, count);
+      return count >= this.threshold;
+    }
+    // New or different signature — reset to 1
+    this.lastSignature.set(role, failureSignature);
+    this.consecutiveFailures.set(role, 1);
+    return false;
+  }
+
+  /**
+   * Call when an agent succeeds to reset its doom-loop counter.
+   */
+  recordSuccess(role: string): void {
+    this.consecutiveFailures.delete(role);
+    this.lastSignature.delete(role);
+  }
+
+  /** Get the current consecutive failure count for a role. */
+  getCount(role: string): number {
+    return this.consecutiveFailures.get(role) ?? 0;
+  }
+
+  /** Check if a doom-loop is currently active for a role. */
+  isDoomLoop(role: string): boolean {
+    return (this.consecutiveFailures.get(role) ?? 0) >= this.threshold;
+  }
+}
+
+/**
+ * Compute a compact failure signature from a runtime execution record.
+ * Two failures with the same kind and similar message produce the same
+ * signature, enabling doom-loop detection.
+ */
+export function computeFailureSignature(rec: ExecutionRecord): string {
+  const kind = rec.failureKind ?? "unknown";
+  const msg = (rec.errorMessage ?? "").slice(0, 200);
+  // Strip dynamic parts (timestamps, UUIDs, line numbers) for fuzzy matching
+  const normalized = msg
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "<id>")
+    .replace(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[.\d]*Z?/g, "<ts>")
+    .replace(/:\d+:\d+/g, ":L")
+    .replace(/\s+/g, " ")
+    .trim();
+  return `${kind}:${normalized}`;
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -48,10 +124,21 @@ export interface OrchestratorOptions {
   storage: Storage;
   workspaces: WorkspaceService;
   executionService: ExecutionService;
+  git?: GitService;
   /** Max tester revision cycles before blocking (default 2). */
   maxTesterRevisions?: number;
   /** Max reviewer revision cycles before blocking (default 1). */
   maxReviewerRevisions?: number;
+  /** Consecutive identical failures before doom-loop termination (default 3). */
+  doomLoopThreshold?: number;
+  /** Override default maxAttempts per role. */
+  taskMaxAttempts?: Partial<Record<TaskCard["role"], number>>;
+  /**
+   * Hard cap on total execution attempts across all roles in a single
+   * pipeline run. If exceeded, the pipeline terminates immediately.
+   * Default: Infinity (no pipeline-level cap).
+   */
+  maxTotalAttempts?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -73,16 +160,24 @@ export class Orchestrator {
   private readonly storage: Storage;
   private readonly workspaces: WorkspaceService;
   private readonly executionService: ExecutionService;
+  private readonly git: GitService | null;
   private readonly maxTesterRevisions: number;
   private readonly maxReviewerRevisions: number;
+  private readonly doomLoop: DoomLoopDetector;
+  private readonly taskMaxAttempts: Partial<Record<TaskCard["role"], number>>;
+  private readonly maxTotalAttempts: number;
   private _userTask = "";
 
   constructor(opts: OrchestratorOptions) {
     this.storage = opts.storage;
     this.workspaces = opts.workspaces;
     this.executionService = opts.executionService;
+    this.git = opts.git ?? null;
     this.maxTesterRevisions = opts.maxTesterRevisions ?? MAX_TESTER_REVISIONS;
     this.maxReviewerRevisions = opts.maxReviewerRevisions ?? MAX_REVIEWER_REVISIONS;
+    this.doomLoop = new DoomLoopDetector(opts.doomLoopThreshold ?? DEFAULT_DOOM_LOOP_THRESHOLD);
+    this.taskMaxAttempts = opts.taskMaxAttempts ?? {};
+    this.maxTotalAttempts = opts.maxTotalAttempts ?? Infinity;
   }
 
   /**
@@ -125,6 +220,7 @@ export class Orchestrator {
     let currentIdx = 0;
     let testerRevisions = 0;
     let reviewerRevisions = 0;
+    let totalAttempts = 0;
 
     // Track artifact IDs for downstream reference
     let latestChangeSetId: ArtifactId | undefined;
@@ -133,6 +229,23 @@ export class Orchestrator {
     while (currentIdx < taskChain.length) {
       const card = taskChain[currentIdx]!;
       const role = card.role;
+
+      // Pipeline-level attempt budget check
+      totalAttempts++;
+      if (totalAttempts > this.maxTotalAttempts) {
+        this.emit({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "error.raised",
+          scope: "orchestrator/pipeline-budget",
+          message: `pipeline total attempt budget exhausted (${this.maxTotalAttempts})`,
+          fatal: true,
+        });
+        return this.result("failed", card.id, projectId,
+          "pipeline total attempt budget exhausted");
+      }
 
       // Unready tasks (deps not satisfied) — should not happen with our
       // linear chain, but guard against it.
@@ -144,6 +257,23 @@ export class Orchestrator {
 
       this.transitionTask(card, "ready");
       const instruction = this.assembleInstruction(card, taskChain, handle.root);
+
+      // --- Git checkpoint before developer starts modifying files -----------
+      if (role === "developer" && this.git && card.attempts <= 1) {
+        try {
+          const cp = this.git.checkpoint(handle.root, `pre-developer-${card.attempts}`);
+          this.emit({
+            ts: new Date().toISOString(),
+            runId,
+            projectId,
+            actor: "system",
+            type: "run.started",
+            goal: `git checkpoint created: ${cp.label}`,
+          });
+        } catch {
+          // Checkpoint failure is non-fatal — pipeline continues
+        }
+      }
 
       let rec: ExecutionRecord;
       try {
@@ -170,6 +300,7 @@ export class Orchestrator {
         currentIdx++;
         testerRevisions = 0;
         reviewerRevisions = 0;
+        this.doomLoop.recordSuccess(role);
 
         // --- Produce structured artifacts from agent text reply -----------
         const replyText = this.getTaskReplyText(card) ?? "";
@@ -266,6 +397,36 @@ export class Orchestrator {
           return this.result("failed", testerTask.id, projectId,
             "tester revision budget exhausted");
         }
+        // Doom-loop detection: check if tester keeps failing identically
+        const lastExec = this.getLatestTaskExecution(testerTask);
+        if (lastExec) {
+          const sig = computeFailureSignature(lastExec);
+          if (this.doomLoop.recordFailure("tester", sig)) {
+            this.transitionTask(testerTask, "blocked");
+            this.emit({
+              ts: new Date().toISOString(),
+              runId,
+              projectId,
+              actor: "system",
+              type: "error.raised",
+              scope: "orchestrator/doom-loop",
+              message: `doom-loop: tester repeating identical failure (${this.doomLoop.getCount("tester")}x)`,
+              fatal: true,
+            });
+            return this.result("failed", testerTask.id, projectId,
+              `doom-loop: tester repeating identical failure`);
+          }
+          // Record the revision cycle for structured tracking
+          this.storage.revisionCycles.insert({
+            runId,
+            projectId,
+            taskId: testerTask.id,
+            cycleType: "tester_failure",
+            attemptNumber: testerRevisions,
+            failureKind: lastExec.failureKind,
+            failureSignature: sig,
+          });
+        }
         // Retry developer
         this.transitionTask(developerTask, "revising");
         this.transitionTask(developerTask, "running");
@@ -287,6 +448,36 @@ export class Orchestrator {
           });
           return this.result("failed", reviewerTask.id, projectId,
             "reviewer revision budget exhausted");
+        }
+        // Doom-loop detection: check if reviewer keeps rejecting identically
+        const lastExec = this.getLatestTaskExecution(reviewerTask);
+        if (lastExec) {
+          const sig = computeFailureSignature(lastExec);
+          if (this.doomLoop.recordFailure("reviewer", sig)) {
+            this.transitionTask(reviewerTask, "blocked");
+            this.emit({
+              ts: new Date().toISOString(),
+              runId,
+              projectId,
+              actor: "system",
+              type: "error.raised",
+              scope: "orchestrator/doom-loop",
+              message: `doom-loop: reviewer repeating identical rejection (${this.doomLoop.getCount("reviewer")}x)`,
+              fatal: true,
+            });
+            return this.result("failed", reviewerTask.id, projectId,
+              `doom-loop: reviewer repeating identical rejection`);
+          }
+          // Record the revision cycle for structured tracking
+          this.storage.revisionCycles.insert({
+            runId,
+            projectId,
+            taskId: reviewerTask.id,
+            cycleType: "reviewer_rejection",
+            attemptNumber: reviewerRevisions,
+            failureKind: lastExec.failureKind,
+            failureSignature: sig,
+          });
         }
         // Retry developer -> tester -> reviewer
         this.transitionTask(developerTask, "revising");
@@ -353,6 +544,8 @@ export class Orchestrator {
     detail: string,
     dependsOn: TaskId[],
   ): TaskCard {
+    const defaultMax = role === "developer" ? 3 : 2;
+    const maxAttempts = this.taskMaxAttempts[role] ?? defaultMax;
     const card = makeTaskCard({
       projectId,
       runId,
@@ -362,7 +555,7 @@ export class Orchestrator {
       detail,
       acceptanceCriteria: [`DevMesh verification passes`],
       dependsOn,
-      maxAttempts: role === "developer" ? 3 : 2,
+      maxAttempts,
     });
     this.storage.tasks.insert(card);
     this.emit({
@@ -503,34 +696,120 @@ export class Orchestrator {
       }
     }
 
-    // For retries: include failure context
+    // For retries: include structured failure context from artifacts
     if (card.attempts > 0) {
       if (card.role === "developer") {
-        // Check if tester or reviewer failed previously
+        // Check if tester failed — provide structured test report context
         const testerTask = this.findTaskByRole("tester");
         if (testerTask && testerTask.status === "failed") {
-          const latestText = this.getLatestTextArtifact(testerTask);
-          if (latestText) {
-            snippets.push(
-              "## Tester's failure report (please fix these issues)",
-              latestText.slice(0, 2000),
-            );
+          const failureCtx = this.buildTesterFailureContext(testerTask);
+          if (failureCtx) {
+            snippets.push(failureCtx);
+          } else {
+            // Fallback to text artifact
+            const latestText = this.getLatestTextArtifact(testerTask);
+            if (latestText) {
+              snippets.push(
+                "## Tester's failure report (please fix these issues)",
+                latestText.slice(0, 2000),
+              );
+            }
           }
         }
+        // Check if reviewer rejected — provide structured review context
         const reviewerTask = this.findTaskByRole("reviewer");
         if (reviewerTask && reviewerTask.status === "failed") {
-          const latestText = this.getLatestTextArtifact(reviewerTask);
-          if (latestText) {
-            snippets.push(
-              "## Reviewer's rejection (please address these issues)",
-              latestText.slice(0, 2000),
-            );
+          const rejectionCtx = this.buildReviewerRejectionContext(reviewerTask);
+          if (rejectionCtx) {
+            snippets.push(rejectionCtx);
+          } else {
+            const latestText = this.getLatestTextArtifact(reviewerTask);
+            if (latestText) {
+              snippets.push(
+                "## Reviewer's rejection (please address these issues)",
+                latestText.slice(0, 2000),
+              );
+            }
           }
         }
       }
     }
 
     return snippets.join("\n\n");
+  }
+
+  /** Build structured failure context from the tester's test_report.v1 artifact. */
+  private buildTesterFailureContext(testerTask: TaskCard): string | null {
+    const trArtifact = this.findLatestArtifactOfKind(testerTask, "test_report");
+    if (!trArtifact) return null;
+    const p = trArtifact.payload as Record<string, unknown>;
+    const verdict = p.verdict as string | undefined;
+    const failures = p.failures as Array<{ name?: string; message?: string }> | undefined;
+    const totals = p.totals as { passed?: number; failed?: number } | undefined;
+    const lines = ["## Tester's failure report (please fix these issues)"];
+    lines.push(`Verdict: ${verdict ?? "fail"}`);
+    if (totals) {
+      lines.push(`Totals: ${totals.passed ?? 0} passed, ${totals.failed ?? 0} failed`);
+    }
+    if (failures && failures.length > 0) {
+      lines.push("Failures:");
+      for (const f of failures.slice(0, 10)) {
+        const name = f.name ?? "unknown";
+        const msg = f.message ? ` — ${f.message.slice(0, 300)}` : "";
+        lines.push(`- ${name}${msg}`);
+      }
+      if (failures.length > 10) {
+        lines.push(`... and ${failures.length - 10} more`);
+      }
+    }
+    return lines.join("\n");
+  }
+
+  /** Build structured rejection context from the reviewer's review.v1 artifact. */
+  private buildReviewerRejectionContext(reviewerTask: TaskCard): string | null {
+    const rvArtifact = this.findLatestArtifactOfKind(reviewerTask, "review");
+    if (!rvArtifact) return null;
+    const p = rvArtifact.payload as Record<string, unknown>;
+    const verdict = p.verdict as string | undefined;
+    const findings = p.findings as Array<{ severity?: string; file?: string; message?: string }> | undefined;
+    const summary = p.summary as string | undefined;
+    const lines = ["## Reviewer's rejection (please address these issues)"];
+    lines.push(`Verdict: ${verdict ?? "changes_requested"}`);
+    if (summary) {
+      lines.push(`Summary: ${summary.slice(0, 1000)}`);
+    }
+    if (findings && findings.length > 0) {
+      // Filter to actionable findings (major/critical)
+      const actionable = findings.filter((f) => f.severity === "major" || f.severity === "critical");
+      const display = actionable.length > 0 ? actionable : findings;
+      lines.push("Findings:");
+      for (const f of display.slice(0, 10)) {
+        const sev = f.severity ?? "info";
+        const loc = f.file ? ` (${f.file})` : "";
+        const msg = f.message ?? "";
+        lines.push(`- [${sev}]${loc} ${msg.slice(0, 300)}`);
+      }
+      if (display.length > 10) {
+        lines.push(`... and ${display.length - 10} more`);
+      }
+    }
+    return lines.join("\n");
+  }
+
+  /** Find the latest artifact of a specific kind for a given task. */
+  private findLatestArtifactOfKind(task: TaskCard, kind: ArtifactKind): Artifact | null {
+    // Search across all runs for this project, filtered by task
+    const recs = this.storage.executions.listByProject(task.projectId);
+    for (const rec of [...recs].reverse()) {
+      if (rec.taskId !== task.id) continue;
+      if (rec.status !== "completed" && rec.status !== "failed") continue;
+      if (!rec.runId) continue;
+      const artifacts = this.storage.artifacts.listByRun(rec.runId as never);
+      for (const a of [...artifacts].reverse()) {
+        if (a.kind === kind) return a;
+      }
+    }
+    return null;
   }
 
   private findCompletedTask(role: string): TaskCard | null {
@@ -610,6 +889,21 @@ export class Orchestrator {
     projectId: ProjectId,
     errorMessage?: string,
   ): PipelineResult {
+    // Attempt rollback on fatal failures if git is available
+    if ((status === "failed" || status === "cancelled" || status === "timeout") && this.git) {
+      try {
+        const handle = this.workspaces.get(projectId);
+        const checkpoints = this.git.listCheckpoints(handle.root);
+        if (checkpoints.length > 0) {
+          // Clean untracked/modified files before rollback so the workspace is clean
+          this.git.run(handle.root, ["checkout", "--", "."]);
+          this.git.run(handle.root, ["clean", "-fd"]);
+          this.git.rollbackTo(handle.root, checkpoints[0]!.sha);
+        }
+      } catch {
+        // Rollback failure is non-fatal — the pipeline status is what matters
+      }
+    }
     return { status, taskId, projectId, errorMessage };
   }
 
@@ -642,5 +936,72 @@ export class Orchestrator {
       }
     }
     return null;
+  }
+
+  /** Get the latest execution for a task, regardless of terminal status. */
+  private getLatestTaskExecution(task: TaskCard): ExecutionRecord | null {
+    const recs = this.storage.executions.listByProject(task.projectId);
+    let latest: ExecutionRecord | null = null;
+    for (const rec of recs) {
+      if (rec.taskId === task.id && rec.status !== "running" && rec.status !== "pending") {
+        if (!latest || (rec.startedAt ?? "") > (latest.startedAt ?? "")) {
+          latest = rec;
+        }
+      }
+    }
+    return latest;
+  }
+
+  /**
+   * Detect and report interrupted pipeline executions for a project.
+   * Called on startup to surface any executions that were left in-flight
+   * by a previous DevMesh process. Rolls back the workspace to the last
+   * checkpoint if one exists.
+   *
+   * Returns the number of interrupted executions found.
+   */
+  recoverInterruptedPipelines(projectId: ProjectId): number {
+    const unfinished = this.storage.executions.findUnfinished();
+    const projectUnfinished = unfinished.filter((r) => r.projectId === projectId);
+    if (projectUnfinished.length === 0) return 0;
+
+    const now = new Date().toISOString();
+
+    // Mark all unfinished executions as interrupted
+    for (const rec of projectUnfinished) {
+      this.storage.executions.update({
+        ...rec,
+        status: "interrupted",
+        finishedAt: now,
+        errorMessage: rec.errorMessage ?? "Pipeline was interrupted by a DevMesh restart",
+      });
+      this.emit({
+        ts: now,
+        runId: rec.runId,
+        projectId,
+        actor: "system",
+        type: "error.raised",
+        scope: "execution/interrupted",
+        message: `execution ${rec.id} was interrupted by a DevMesh restart`,
+        fatal: false,
+      } as never);
+    }
+
+    // Attempt to roll back workspace to last checkpoint
+    if (this.git) {
+      try {
+        const handle = this.workspaces.get(projectId);
+        const checkpoints = this.git.listCheckpoints(handle.root);
+        if (checkpoints.length > 0) {
+          this.git.run(handle.root, ["checkout", "--", "."]);
+          this.git.run(handle.root, ["clean", "-fd"]);
+          this.git.rollbackTo(handle.root, checkpoints[0]!.sha);
+        }
+      } catch {
+        // Rollback failure is non-fatal
+      }
+    }
+
+    return projectUnfinished.length;
   }
 }

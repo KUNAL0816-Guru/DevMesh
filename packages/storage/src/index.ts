@@ -8,6 +8,7 @@ import {
   EventRepository,
   ExecutionRepository,
   ProjectRepository,
+  RevisionCycleRepository,
   TaskRepository,
 } from "./repos.js";
 
@@ -19,6 +20,7 @@ export interface Storage {
   readonly artifacts: ArtifactRepository;
   readonly context: ContextRepository;
   readonly executions: ExecutionRepository;
+  readonly revisionCycles: RevisionCycleRepository;
   /** Applied schema version. */
   readonly schemaVersion: number;
   /** Flush WAL and close; safe to call once. */
@@ -30,7 +32,7 @@ export interface CreateStorageOptions {
   path: string;
 }
 
-export type { ExecutionRecord, ExecutionRowStatus } from "./repos.js";
+export type { ExecutionRecord, ExecutionRowStatus, RevisionCycleRecord } from "./repos.js";
 
 /**
  * Open the DevMesh control-plane database and apply pending migrations.
@@ -52,6 +54,7 @@ export function createStorage(opts: CreateStorageOptions): Storage {
     artifacts: new ArtifactRepository(db),
     context: new ContextRepository(db),
     executions: new ExecutionRepository(db),
+    revisionCycles: new RevisionCycleRepository(db),
     close(): void {
       try {
         // best-effort WAL checkpoint so all state lands in the main file

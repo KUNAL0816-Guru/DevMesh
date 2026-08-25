@@ -14,6 +14,8 @@ export const contextNamespaces = [
   "convention",
   "finding",
   "report",
+  "failure",
+  "revision",
 ] as const;
 export const contextNamespaceSchema = z.enum(contextNamespaces);
 export type ContextNamespace = z.infer<typeof contextNamespaceSchema>;

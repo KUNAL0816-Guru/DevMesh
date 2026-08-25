@@ -627,3 +627,122 @@ export class ExecutionRepository {
     return unfinished.map((r) => ({ ...r, status: "interrupted" as const }));
   }
 }
+
+// ---------------------------------------------------------------------------
+// RevisionCycleRepository
+// ---------------------------------------------------------------------------
+
+export interface RevisionCycleRecord {
+  id: string;
+  runId: RunId;
+  projectId: ProjectId;
+  taskId: TaskId;
+  cycleType: "tester_failure" | "reviewer_rejection";
+  attemptNumber: number;
+  failureKind: string | null;
+  failureSignature: string | null;
+  createdAt: string;
+}
+
+interface RevisionCycleRow {
+  id: string;
+  run_id: string;
+  project_id: string;
+  task_id: string;
+  cycle_type: string;
+  attempt_number: number;
+  failure_kind: string | null;
+  failure_signature: string | null;
+  created_at: string;
+}
+
+const RC_COLUMNS =
+  "id, run_id, project_id, task_id, cycle_type, attempt_number, failure_kind, failure_signature, created_at";
+
+function rowToRevisionCycle(row: RevisionCycleRow): RevisionCycleRecord {
+  return {
+    id: row.id,
+    runId: row.run_id as RunId,
+    projectId: row.project_id as ProjectId,
+    taskId: row.task_id as TaskId,
+    cycleType: row.cycle_type as RevisionCycleRecord["cycleType"],
+    attemptNumber: row.attempt_number,
+    failureKind: row.failure_kind,
+    failureSignature: row.failure_signature,
+    createdAt: row.created_at,
+  };
+}
+
+export class RevisionCycleRepository {
+  constructor(private readonly db: Database) {}
+
+  insert(
+    rec: Omit<RevisionCycleRecord, "id" | "createdAt"> & { id?: string },
+  ): RevisionCycleRecord {
+    const id = rec.id ?? crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO revision_cycles
+         (id, run_id, project_id, task_id, cycle_type, attempt_number,
+          failure_kind, failure_signature, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        rec.runId,
+        rec.projectId,
+        rec.taskId,
+        rec.cycleType,
+        rec.attemptNumber,
+        rec.failureKind ?? null,
+        rec.failureSignature ?? null,
+        createdAt,
+      );
+    return { ...rec, id: id as string, createdAt } as RevisionCycleRecord;
+  }
+
+  listByTask(taskId: string, limit = 50): RevisionCycleRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ${RC_COLUMNS} FROM revision_cycles
+         WHERE task_id = ? ORDER BY attempt_number DESC LIMIT ?`,
+      )
+      .all(taskId, limit) as unknown as RevisionCycleRow[];
+    return rows.map(rowToRevisionCycle);
+  }
+
+  listByRun(runId: string, limit = 100): RevisionCycleRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ${RC_COLUMNS} FROM revision_cycles
+         WHERE run_id = ? ORDER BY attempt_number ASC LIMIT ?`,
+      )
+      .all(runId, limit) as unknown as RevisionCycleRow[];
+    return rows.map(rowToRevisionCycle);
+  }
+
+  /** Count failures with a given signature for a task (for doom-loop detection). */
+  countBySignature(taskId: string, failureSignature: string): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) as cnt FROM revision_cycles
+         WHERE task_id = ? AND failure_signature = ?`,
+      )
+      .get(taskId, failureSignature) as { cnt: number } | undefined;
+    return row?.cnt ?? 0;
+  }
+
+  listByFailureKind(failureKind: string, projectId?: string, limit = 100): RevisionCycleRecord[] {
+    let query = `SELECT ${RC_COLUMNS} FROM revision_cycles WHERE failure_kind = ?`;
+    const params: (string | number)[] = [failureKind];
+    if (projectId) {
+      query += ` AND project_id = ?`;
+      params.push(projectId);
+    }
+    query += ` ORDER BY created_at DESC LIMIT ?`;
+    params.push(limit);
+    const rows = this.db.prepare(query).all(...params) as unknown as RevisionCycleRow[];
+    return rows.map(rowToRevisionCycle);
+  }
+}

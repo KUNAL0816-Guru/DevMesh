@@ -126,6 +126,27 @@ const MIGRATIONS: readonly Migration[] = [
       `ALTER TABLE executions ADD COLUMN reply_text TEXT;`,
     ],
   },
+  {
+    version: 5,
+    name: "revision-cycles",
+    up: [
+      `CREATE TABLE revision_cycles (
+         id TEXT PRIMARY KEY,
+         run_id TEXT NOT NULL,
+         project_id TEXT NOT NULL REFERENCES projects(id),
+         task_id TEXT NOT NULL,
+         cycle_type TEXT NOT NULL,
+           -- 'tester_failure' | 'reviewer_rejection'
+         attempt_number INTEGER NOT NULL,
+         failure_kind TEXT,
+         failure_signature TEXT,
+         created_at TEXT NOT NULL
+       );
+       CREATE INDEX idx_revision_cycles_run ON revision_cycles(run_id);
+       CREATE INDEX idx_revision_cycles_task ON revision_cycles(task_id);
+       CREATE INDEX idx_revision_cycles_sig ON revision_cycles(failure_signature);`,
+    ],
+  },
 ];
 
 function currentVersion(db: DatabaseSync): number {
