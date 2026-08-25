@@ -147,6 +147,25 @@ const MIGRATIONS: readonly Migration[] = [
        CREATE INDEX idx_revision_cycles_sig ON revision_cycles(failure_signature);`,
     ],
   },
+  {
+    version: 6,
+    name: "pipeline-runs",
+    up: [
+      `CREATE TABLE pipeline_runs (
+         id TEXT PRIMARY KEY,
+         project_id TEXT NOT NULL REFERENCES projects(id),
+         status TEXT NOT NULL,
+           -- running | completed | failed | cancelled | timeout
+         goal TEXT NOT NULL,
+         error_message TEXT,
+         created_at TEXT NOT NULL,
+         finished_at TEXT,
+         duration_ms INTEGER
+       );
+       CREATE INDEX idx_pipeline_runs_project ON pipeline_runs(project_id, created_at);
+       CREATE INDEX idx_pipeline_runs_status ON pipeline_runs(status);`,
+    ],
+  },
 ];
 
 function currentVersion(db: DatabaseSync): number {

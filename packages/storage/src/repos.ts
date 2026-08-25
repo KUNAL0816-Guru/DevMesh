@@ -11,6 +11,7 @@ import {
   type ContextEntryId,
   type DomainEvent,
   type EventInput,
+  type PipelineRunStatus,
   type ProjectId,
   type RunId,
   type TaskCard,
@@ -744,5 +745,116 @@ export class RevisionCycleRepository {
     params.push(limit);
     const rows = this.db.prepare(query).all(...params) as unknown as RevisionCycleRow[];
     return rows.map(rowToRevisionCycle);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PipelineRunRepository
+// ---------------------------------------------------------------------------
+
+export interface PipelineRunRecord {
+  id: string;
+  projectId: string;
+  status: PipelineRunStatus;
+  goal: string;
+  errorMessage: string | null;
+  createdAt: string;
+  finishedAt: string | null;
+  durationMs: number | null;
+}
+
+interface PipelineRunRow {
+  id: string;
+  project_id: string;
+  status: string;
+  goal: string;
+  error_message: string | null;
+  created_at: string;
+  finished_at: string | null;
+  duration_ms: number | null;
+}
+
+const PR_COLUMNS =
+  "id, project_id, status, goal, error_message, created_at, finished_at, duration_ms";
+
+function rowToPipelineRun(row: PipelineRunRow): PipelineRunRecord {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    status: row.status as PipelineRunStatus,
+    goal: row.goal,
+    errorMessage: row.error_message,
+    createdAt: row.created_at,
+    finishedAt: row.finished_at,
+    durationMs: row.duration_ms === null ? null : Number(row.duration_ms),
+  };
+}
+
+export class PipelineRunRepository {
+  constructor(private readonly db: Database) {}
+
+  insert(rec: PipelineRunRecord): PipelineRunRecord {
+    this.db
+      .prepare(
+        `INSERT INTO pipeline_runs
+         (id, project_id, status, goal, error_message, created_at, finished_at, duration_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        rec.id,
+        rec.projectId,
+        rec.status,
+        rec.goal,
+        rec.errorMessage ?? null,
+        rec.createdAt,
+        rec.finishedAt ?? null,
+        rec.durationMs ?? null,
+      );
+    return rec;
+  }
+
+  update(rec: PipelineRunRecord): void {
+    const res = this.db
+      .prepare(
+        `UPDATE pipeline_runs SET
+           status = ?, error_message = ?, finished_at = ?, duration_ms = ?
+         WHERE id = ?`,
+      )
+      .run(
+        rec.status,
+        rec.errorMessage ?? null,
+        rec.finishedAt ?? null,
+        rec.durationMs ?? null,
+        rec.id,
+      );
+    if (Number(res.changes) === 0) {
+      throw new StorageError("storage/not-found", `pipeline run ${rec.id} does not exist`);
+    }
+  }
+
+  get(id: string): PipelineRunRecord | null {
+    const row = this.db
+      .prepare(`SELECT ${PR_COLUMNS} FROM pipeline_runs WHERE id = ?`)
+      .get(id) as unknown as PipelineRunRow | undefined;
+    return row ? rowToPipelineRun(row) : null;
+  }
+
+  listByProject(projectId: string, limit = 100): PipelineRunRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ${PR_COLUMNS} FROM pipeline_runs WHERE project_id = ?
+         ORDER BY created_at DESC LIMIT ?`,
+      )
+      .all(projectId, limit) as unknown as PipelineRunRow[];
+    return rows.map(rowToPipelineRun);
+  }
+
+  findRunning(): PipelineRunRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ${PR_COLUMNS} FROM pipeline_runs WHERE status = 'running'`,
+      )
+      .all() as unknown as PipelineRunRow[];
+    return rows.map(rowToPipelineRun);
   }
 }

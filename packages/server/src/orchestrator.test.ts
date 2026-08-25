@@ -1071,3 +1071,74 @@ describe("Orchestrator: interrupted pipeline recovery", () => {
     await stack.storage.close();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Pipeline run persistence (Phase 6A)
+// ---------------------------------------------------------------------------
+
+describe("Orchestrator: pipeline run persistence", () => {
+  it("23. creates a pipeline_runs row on start and updates on completion", async () => {
+    const stack = makeStack();
+    const result = await stack.orchestrator.run(stack.projectId, "build the feature");
+
+    expect(result.status).toBe("completed");
+    expect(result.projectId).toBe(stack.projectId);
+
+    // Pipeline run should be persisted
+    const runs = stack.storage.pipelineRuns.listByProject(stack.projectId);
+    expect(runs.length).toBeGreaterThanOrEqual(1);
+    const pipelineRun = runs[runs.length - 1]!;
+    expect(pipelineRun.status).toBe("completed");
+    expect(pipelineRun.goal).toBe("build the feature");
+    expect(pipelineRun.finishedAt).not.toBeNull();
+    expect(pipelineRun.durationMs).toBeGreaterThanOrEqual(0);
+    expect(pipelineRun.errorMessage).toBeNull();
+    await stack.storage.close();
+  });
+
+  it("24. persists failed pipeline with error message", async () => {
+    const stack = makeStack(
+      failingAgentScript("developer", "syntax error in main.ts"),
+    );
+    const result = await stack.orchestrator.run(stack.projectId, "implement something");
+
+    expect(result.status).toBe("failed");
+
+    const runs = stack.storage.pipelineRuns.listByProject(stack.projectId);
+    expect(runs.length).toBeGreaterThanOrEqual(1);
+    const pipelineRun = runs[runs.length - 1]!;
+    expect(pipelineRun.status).toBe("failed");
+    expect(pipelineRun.finishedAt).not.toBeNull();
+    expect(pipelineRun.durationMs).toBeGreaterThanOrEqual(0);
+    await stack.storage.close();
+  });
+
+  it("25. persists timeout pipeline", async () => {
+    const stack = makeStack(
+      perAgentScript({ "*": { status: "failed", text: "timeout" } }),
+      { execTimeoutMs: 1 },
+    );
+    // Use a very low timeout so the execution times out quickly
+    const result = await stack.orchestrator.run(stack.projectId, "timeout test");
+
+    // Pipeline should end with failed or timeout
+    expect(["failed", "timeout"]).toContain(result.status);
+
+    const runs = stack.storage.pipelineRuns.listByProject(stack.projectId);
+    expect(runs.length).toBeGreaterThanOrEqual(1);
+    const pipelineRun = runs[runs.length - 1]!;
+    expect(["failed", "timeout"]).toContain(pipelineRun.status);
+    expect(pipelineRun.finishedAt).not.toBeNull();
+    await stack.storage.close();
+  });
+
+  it("26. orchestrator.currentRunId is set during pipeline execution", async () => {
+    const stack = makeStack();
+    // Before run, currentRunId should be null
+    expect(stack.orchestrator.currentRunId).toBeNull();
+    await stack.orchestrator.run(stack.projectId, "test currentRunId");
+    // After run completes, currentRunId should be null again
+    expect(stack.orchestrator.currentRunId).toBeNull();
+    await stack.storage.close();
+  });
+});

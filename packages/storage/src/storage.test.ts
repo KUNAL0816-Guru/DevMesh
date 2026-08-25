@@ -266,3 +266,247 @@ describe("durability", () => {
     }
   });
 });
+
+describe("migration v6 (pipeline_runs)", () => {
+  it("creates pipeline_runs table with correct columns", () => {
+    const path = join(dir, "mig6.db");
+    const s = createStorage({ path });
+    expect(s.schemaVersion).toBeGreaterThanOrEqual(6);
+    const cols = s.db
+      .prepare("PRAGMA table_info(pipeline_runs)")
+      .all() as Array<{ name: string }>;
+    const names = cols.map((c) => c.name);
+    expect(names).toContain("id");
+    expect(names).toContain("project_id");
+    expect(names).toContain("status");
+    expect(names).toContain("goal");
+    expect(names).toContain("error_message");
+    expect(names).toContain("created_at");
+    expect(names).toContain("finished_at");
+    expect(names).toContain("duration_ms");
+    s.close();
+  });
+
+  it("idempotent across reopens", () => {
+    const path = join(dir, "mig6-idempotent.db");
+    const s1 = createStorage({ path });
+    expect(s1.schemaVersion).toBeGreaterThanOrEqual(6);
+    s1.close();
+    const s2 = createStorage({ path });
+    expect(s2.schemaVersion).toBe(s1.schemaVersion);
+    s2.close();
+  });
+});
+
+describe("pipelineRuns", () => {
+  it("inserts and retrieves a pipeline run", () => {
+    const s = fileStorage();
+    const projectId = newProjectId();
+    s.projects.insert({
+      id: projectId,
+      name: "pr-test",
+      rootPath: "/tmp/pr-test",
+      createdAt: new Date().toISOString(),
+    });
+    const runId = newRunId();
+    const now = new Date().toISOString();
+    s.pipelineRuns.insert({
+      id: runId,
+      projectId,
+      status: "running",
+      goal: "build feature X",
+      errorMessage: null,
+      createdAt: now,
+      finishedAt: null,
+      durationMs: null,
+    });
+    const rec = s.pipelineRuns.get(runId);
+    expect(rec).not.toBeNull();
+    expect(rec!.id).toBe(runId);
+    expect(rec!.projectId).toBe(projectId);
+    expect(rec!.status).toBe("running");
+    expect(rec!.goal).toBe("build feature X");
+    expect(rec!.errorMessage).toBeNull();
+    expect(rec!.finishedAt).toBeNull();
+    s.close();
+  });
+
+  it("updates a pipeline run to terminal status", () => {
+    const s = fileStorage();
+    const projectId = newProjectId();
+    s.projects.insert({
+      id: projectId,
+      name: "pr-update",
+      rootPath: "/tmp/pr-update",
+      createdAt: new Date().toISOString(),
+    });
+    const runId = newRunId();
+    const now = new Date().toISOString();
+    s.pipelineRuns.insert({
+      id: runId,
+      projectId,
+      status: "running",
+      goal: "fix bug",
+      errorMessage: null,
+      createdAt: now,
+      finishedAt: null,
+      durationMs: null,
+    });
+    const finishedAt = new Date().toISOString();
+    s.pipelineRuns.update({
+      id: runId,
+      projectId,
+      status: "completed",
+      goal: "fix bug",
+      errorMessage: null,
+      createdAt: now,
+      finishedAt,
+      durationMs: 5000,
+    });
+    const rec = s.pipelineRuns.get(runId);
+    expect(rec!.status).toBe("completed");
+    expect(rec!.finishedAt).toBe(finishedAt);
+    expect(rec!.durationMs).toBe(5000);
+    s.close();
+  });
+
+  it("persists error message on failure", () => {
+    const s = fileStorage();
+    const projectId = newProjectId();
+    s.projects.insert({
+      id: projectId,
+      name: "pr-fail",
+      rootPath: "/tmp/pr-fail",
+      createdAt: new Date().toISOString(),
+    });
+    const runId = newRunId();
+    const now = new Date().toISOString();
+    s.pipelineRuns.insert({
+      id: runId,
+      projectId,
+      status: "running",
+      goal: "implement Y",
+      errorMessage: null,
+      createdAt: now,
+      finishedAt: null,
+      durationMs: null,
+    });
+    const finishedAt = new Date().toISOString();
+    s.pipelineRuns.update({
+      id: runId,
+      projectId,
+      status: "failed",
+      goal: "implement Y",
+      errorMessage: "developer failed",
+      createdAt: now,
+      finishedAt,
+      durationMs: 12000,
+    });
+    const rec = s.pipelineRuns.get(runId);
+    expect(rec!.status).toBe("failed");
+    expect(rec!.errorMessage).toBe("developer failed");
+    expect(rec!.durationMs).toBe(12000);
+    s.close();
+  });
+
+  it("returns null for non-existent id", () => {
+    const s = fileStorage();
+    expect(s.pipelineRuns.get(crypto.randomUUID())).toBeNull();
+    s.close();
+  });
+
+  it("throws on update of non-existent row", () => {
+    const s = fileStorage();
+    expect(() =>
+      s.pipelineRuns.update({
+        id: crypto.randomUUID(),
+        projectId: newProjectId(),
+        status: "completed",
+        goal: "x",
+        errorMessage: null,
+        createdAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        durationMs: 100,
+      }),
+    ).toThrow(/does not exist/);
+    s.close();
+  });
+
+  it("listByProject returns runs ordered by created_at DESC", () => {
+    const s = fileStorage();
+    const projectId = newProjectId();
+    s.projects.insert({
+      id: projectId,
+      name: "pr-list",
+      rootPath: "/tmp/pr-list",
+      createdAt: new Date().toISOString(),
+    });
+    const r1 = newRunId();
+    const r2 = newRunId();
+    const now1 = "2026-01-01T00:00:00.000Z";
+    const now2 = "2026-01-02T00:00:00.000Z";
+    s.pipelineRuns.insert({
+      id: r1, projectId, status: "completed", goal: "first",
+      errorMessage: null, createdAt: now1, finishedAt: null, durationMs: null,
+    });
+    s.pipelineRuns.insert({
+      id: r2, projectId, status: "running", goal: "second",
+      errorMessage: null, createdAt: now2, finishedAt: null, durationMs: null,
+    });
+    const list = s.pipelineRuns.listByProject(projectId);
+    expect(list).toHaveLength(2);
+    expect(list[0]!.id).toBe(r2);
+    expect(list[1]!.id).toBe(r1);
+    s.close();
+  });
+
+  it("listByProject scoped to a specific project", () => {
+    const s = fileStorage();
+    const p1 = newProjectId();
+    const p2 = newProjectId();
+    s.projects.insert({ id: p1, name: "a", rootPath: "/a", createdAt: new Date().toISOString() });
+    s.projects.insert({ id: p2, name: "b", rootPath: "/b", createdAt: new Date().toISOString() });
+    const now = new Date().toISOString();
+    s.pipelineRuns.insert({ id: newRunId(), projectId: p1, status: "running", goal: "a1", errorMessage: null, createdAt: now, finishedAt: null, durationMs: null });
+    s.pipelineRuns.insert({ id: newRunId(), projectId: p2, status: "running", goal: "b1", errorMessage: null, createdAt: now, finishedAt: null, durationMs: null });
+    expect(s.pipelineRuns.listByProject(p1)).toHaveLength(1);
+    expect(s.pipelineRuns.listByProject(p2)).toHaveLength(1);
+    s.close();
+  });
+
+  it("findRunning returns only running pipelines", () => {
+    const s = fileStorage();
+    const projectId = newProjectId();
+    s.projects.insert({ id: projectId, name: "c", rootPath: "/c", createdAt: new Date().toISOString() });
+    const now = new Date().toISOString();
+    s.pipelineRuns.insert({ id: newRunId(), projectId, status: "running", goal: "r1", errorMessage: null, createdAt: now, finishedAt: null, durationMs: null });
+    s.pipelineRuns.insert({ id: newRunId(), projectId, status: "running", goal: "r2", errorMessage: null, createdAt: now, finishedAt: null, durationMs: null });
+    s.pipelineRuns.insert({ id: newRunId(), projectId, status: "completed", goal: "done", errorMessage: null, createdAt: now, finishedAt: now, durationMs: 100 });
+    s.pipelineRuns.insert({ id: newRunId(), projectId, status: "failed", goal: "fail", errorMessage: "err", createdAt: now, finishedAt: now, durationMs: 50 });
+    const running = s.pipelineRuns.findRunning();
+    expect(running).toHaveLength(2);
+    expect(running.every((r) => r.status === "running")).toBe(true);
+    s.close();
+  });
+
+  it("pipeline_runs state survives close + reopen", () => {
+    const path = join(dir, "pr-durable.db");
+    const projectId = newProjectId();
+    const runId = newRunId();
+    const now = new Date().toISOString();
+    {
+      const s = createStorage({ path });
+      s.projects.insert({ id: projectId, name: "dur", rootPath: "/dur", createdAt: now });
+      s.pipelineRuns.insert({ id: runId, projectId, status: "running", goal: "persist", errorMessage: null, createdAt: now, finishedAt: null, durationMs: null });
+      s.close();
+    }
+    {
+      const s = createStorage({ path });
+      const rec = s.pipelineRuns.get(runId);
+      expect(rec).not.toBeNull();
+      expect(rec!.status).toBe("running");
+      expect(rec!.goal).toBe("persist");
+      s.close();
+    }
+  });
+});

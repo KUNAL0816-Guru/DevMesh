@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createStorage } from "@devmesh/storage";
 import { WorkspaceService } from "@devmesh/workspace";
+import { FakeRuntime } from "@devmesh/runtime";
+import { createDefaultAgentRegistry } from "@devmesh/agents";
 import { loadConfig } from "./config.js";
 import { buildApp } from "./app.js";
 import { startServer } from "./bootstrap.js";
@@ -134,5 +136,74 @@ describe("graceful lifecycle (real listen)", () => {
     // after shutdown the port is released; a second bind on :0 is trivially fine,
     // so assert shutdown idempotence instead:
     await expect(server.shutdown()).resolves.toBeUndefined();
+  });
+});
+
+describe("POST /projects/:id/pipeline returns runId", () => {
+  it("returns pipeline object with runId, projectId, status, goal, createdAt", async () => {
+    const config = testConfig();
+    const storage = createStorage({ path: join(config.dataRoot, "test.db") });
+    const workspaces = new WorkspaceService({
+      store: storage.projects,
+      workspacesRoot: join(config.dataRoot, "workspaces"),
+    });
+    const runtime = new FakeRuntime({
+      steps: [{ events: [{ kind: "text", text: "done" }] }],
+      outcome: { status: "completed", sessionId: "ses_0", finalText: "ok" },
+      stepDelayMs: 5,
+    });
+    const app = buildApp({
+      config: { ...config, runtime: "opencode" } as typeof config,
+      storage,
+      workspaces,
+      runtime,
+      agents: createDefaultAgentRegistry(),
+    });
+
+    // Create a project first
+    const created = await app.inject({
+      method: "POST",
+      url: "/projects",
+      payload: { name: "pipeline-test" },
+    });
+    expect(created.statusCode).toBe(201);
+    const projectId = created.json().id;
+
+    // Start a pipeline
+    const res = await app.inject({
+      method: "POST",
+      url: `/projects/${projectId}/pipeline`,
+      payload: { instruction: "build the feature" },
+    });
+    expect(res.statusCode).toBe(202);
+    const body = res.json();
+    expect(body.pipeline).toBeDefined();
+    expect(body.pipeline.runId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(body.pipeline.projectId).toBe(projectId);
+    expect(body.pipeline.status).toBe("running");
+    expect(body.pipeline.goal).toBe("build the feature");
+    expect(body.pipeline.createdAt).toBeDefined();
+    expect(body.message).toBeUndefined();
+
+    await app.close();
+  });
+
+  it("503 when no runtime is wired", async () => {
+    const { app } = await buildStack();
+    const created = await app.inject({
+      method: "POST",
+      url: "/projects",
+      payload: { name: "no-runtime" },
+    });
+    const projectId = created.json().id;
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/projects/${projectId}/pipeline`,
+      payload: { instruction: "do something" },
+    });
+    expect(res.statusCode).toBe(503);
+    expect(res.json().error.code).toBe("runtime/not-configured");
+    await app.close();
   });
 });

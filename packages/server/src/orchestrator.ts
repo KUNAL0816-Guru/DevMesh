@@ -167,6 +167,7 @@ export class Orchestrator {
   private readonly taskMaxAttempts: Partial<Record<TaskCard["role"], number>>;
   private readonly maxTotalAttempts: number;
   private _userTask = "";
+  private _currentPipelineRunId: string | null = null;
 
   constructor(opts: OrchestratorOptions) {
     this.storage = opts.storage;
@@ -180,6 +181,11 @@ export class Orchestrator {
     this.maxTotalAttempts = opts.maxTotalAttempts ?? Infinity;
   }
 
+  /** Return the runId of the most recently started pipeline, or null. */
+  get currentRunId(): string | null {
+    return this._currentPipelineRunId;
+  }
+
   /**
    * Execute the full multi-agent pipeline for a user task.
    * Returns when the pipeline reaches a terminal state.
@@ -191,6 +197,25 @@ export class Orchestrator {
     this._userTask = userTask;
     const handle = this.workspaces.get(projectId);
     const runId = newRunId();
+
+    // --- Persist pipeline run identity ------------------------------------
+    const pipelineRunId = runId;
+    this._currentPipelineRunId = pipelineRunId;
+    const pipelineRunCreatedAt = new Date().toISOString();
+    try {
+      this.storage.pipelineRuns.insert({
+        id: pipelineRunId,
+        projectId,
+        status: "running",
+        goal: userTask.slice(0, 8000),
+        errorMessage: null,
+        createdAt: pipelineRunCreatedAt,
+        finishedAt: null,
+        durationMs: null,
+      });
+    } catch {
+      /* persistence best-effort */
+    }
 
     this.emit({
       ts: new Date().toISOString(),
@@ -904,6 +929,29 @@ export class Orchestrator {
         // Rollback failure is non-fatal — the pipeline status is what matters
       }
     }
+
+    // --- Update pipeline run persistence ----------------------------------
+    if (this._currentPipelineRunId) {
+      const now = new Date().toISOString();
+      const existing = this.storage.pipelineRuns.get(this._currentPipelineRunId);
+      if (existing) {
+        const finishedAt = now;
+        const durationMs = new Date(now).getTime() - new Date(existing.createdAt).getTime();
+        try {
+          this.storage.pipelineRuns.update({
+            ...existing,
+            status,
+            errorMessage: errorMessage ?? existing.errorMessage,
+            finishedAt,
+            durationMs,
+          });
+        } catch {
+          /* persistence best-effort */
+        }
+      }
+      this._currentPipelineRunId = null;
+    }
+
     return { status, taskId, projectId, errorMessage };
   }
 

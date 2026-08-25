@@ -335,9 +335,28 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
       void result.catch((err) => {
         app.log.error({ err }, "pipeline failed");
       });
+      // Read the pipeline run created by the orchestrator
+      const runId = orchestrator.currentRunId;
+      if (runId) {
+        const pipelineRun = opts.storage.pipelineRuns.get(runId);
+        return reply.status(202).send({
+          pipeline: {
+            runId,
+            projectId: parsedId.data,
+            status: pipelineRun?.status ?? "running",
+            goal: parsedBody.data.instruction.slice(0, 8000),
+            createdAt: pipelineRun?.createdAt ?? new Date().toISOString(),
+          },
+        });
+      }
       return reply.status(202).send({
-        message: "pipeline started",
-        projectId: parsedId.data,
+        pipeline: {
+          runId: null,
+          projectId: parsedId.data,
+          status: "running",
+          goal: parsedBody.data.instruction.slice(0, 8000),
+          createdAt: new Date().toISOString(),
+        },
       });
     } catch (err) {
       const problem = normalizeError(err);
