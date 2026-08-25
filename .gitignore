@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.eslintcache
+
+# environment / secrets
+.env
+.env.*
+!.env.example
+
+# local state (future DevMesh data dir)
+.devmesh/
+
+*.log
+.DS_Store

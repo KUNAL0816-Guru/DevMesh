@@ -1,0 +1,31 @@
+{
+  "name": "devmesh-monorepo",
+  "private": true,
+  "version": "0.0.0",
+  "description": "DevMesh — multi-agent AI software engineering platform (control plane + swappable agent runtimes)",
+  "type": "module",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --if-present -w @devmesh/contracts && npm run build --if-present -w @devmesh/agents && npm run build --if-present -w @devmesh/storage && npm run build --if-present -w @devmesh/workspace && npm run build --if-present -w @devmesh/runtime && npm run build --if-present -w @devmesh/opencode-adapter && npm run build --if-present -w @devmesh/server",
+    "typecheck": "npm run build && npm run typecheck --workspaces --if-present",
+    "lint": "eslint .",
+    "test": "bash scripts/run-tests.sh",
+    "test:watch": "vitest",
+    "check": "npm run typecheck && npm run lint && npm run test",
+    "doctor": "node scripts/doctor.mjs",
+    "start": "node packages/server/dist/main.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "eslint": "^9.0.0",
+    "typescript": "^5.5.0",
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^3.0.0"
+  }
+}

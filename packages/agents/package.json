@@ -1,0 +1,25 @@
+{
+  "name": "@devmesh/agents",
+  "version": "0.1.0",
+  "description": "Runtime-neutral agent definitions and registry",
+  "type": "module",
+  "license": "UNLICENSED",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@devmesh/contracts": "*",
+    "zod": "^4.3.5"
+  }
+}

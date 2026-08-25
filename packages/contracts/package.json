@@ -1,0 +1,24 @@
+{
+  "name": "@devmesh/contracts",
+  "version": "0.1.0",
+  "description": "Shared schemas and types for the DevMesh control plane, agent runtimes, and typed artifacts",
+  "type": "module",
+  "license": "UNLICENSED",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "zod": "^4.0.5"
+  }
+}

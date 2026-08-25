@@ -1,0 +1,24 @@
+{
+  "name": "@devmesh/storage",
+  "version": "0.1.0",
+  "description": "SQLite persistence for DevMesh control plane state (node:sqlite, no native deps)",
+  "type": "module",
+  "license": "UNLICENSED",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@devmesh/contracts": "*"
+  }
+}

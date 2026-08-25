@@ -1,0 +1,31 @@
+{
+  "name": "@devmesh/server",
+  "version": "0.1.0",
+  "description": "DevMesh control-plane HTTP server (Phase 2: agent runtime execution)",
+  "type": "module",
+  "license": "UNLICENSED",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@devmesh/agents": "*",
+    "@devmesh/contracts": "*",
+    "@devmesh/opencode-adapter": "*",
+    "@devmesh/runtime": "*",
+    "@devmesh/storage": "*",
+    "@devmesh/workspace": "*",
+    "fastify": "^5.0.0"
+  }
+}
