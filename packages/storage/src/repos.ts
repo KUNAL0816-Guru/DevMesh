@@ -424,6 +424,23 @@ export class ContextRepository {
     return map;
   }
 
+  /** Latest entry per key across all namespaces (superseded entries ignored). */
+  latestAll(): Map<string, ContextEntry> {
+    const rows = this.db
+      .prepare(
+        `SELECT ${CONTEXT_COLUMNS} FROM context_entries
+         WHERE id NOT IN (SELECT supersedes FROM context_entries WHERE supersedes IS NOT NULL)
+         ORDER BY namespace, created_at`,
+      )
+      .all() as unknown as ContextRow[];
+    const map = new Map<string, ContextEntry>();
+    for (const row of rows) {
+      const entry = rowToContextEntry(row);
+      map.set(`${entry.namespace}:${entry.key}`, entry);
+    }
+    return map;
+  }
+
   history(key: string, namespace: string): ContextEntry[] {
     const rows = this.db
       .prepare(

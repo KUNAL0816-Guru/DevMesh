@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   artifactSchema,
+  makeContextEntry,
   makeTaskCard,
   newArtifactBase,
   newProjectId,
@@ -736,6 +737,248 @@ describe("run/project ownership enforcement", () => {
     const evtRes = await app.inject({ method: "GET", url: `/pipelines/${runId}/events` });
     const evts = (evtRes.json() as { events: Array<{ runId?: string }> }).events;
     expect(evts.every((e) => e.runId === runId || e.runId === undefined)).toBe(true);
+    await app.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 7A: Context API tests
+// ---------------------------------------------------------------------------
+
+function seedContextData(storage: Storage) {
+  const projectId = newProjectId();
+  storage.projects.insert({ id: projectId, name: "ctx-test", rootPath: "/tmp/ctx-" + projectId, createdAt: new Date().toISOString() });
+
+  const e1 = makeContextEntry({ namespace: "spec", key: "api-url", value: "/api/v1", createdBy: "architect" });
+  const e2 = makeContextEntry({ namespace: "spec", key: "api-url", value: "/api/v2", createdBy: "architect", supersedes: e1.id });
+  const e3 = makeContextEntry({ namespace: "spec", key: "db-engine", value: "sqlite", createdBy: "architect" });
+  const e4 = makeContextEntry({ namespace: "decision", key: "auth-strategy", value: "jwt", createdBy: "developer" });
+
+  storage.context.put(e1);
+  storage.context.put(e2);
+  storage.context.put(e3);
+  storage.context.put(e4);
+
+  return { projectId, e1, e2, e3, e4 };
+}
+
+describe("GET /projects/:projectId/context", () => {
+  it("returns latest entries grouped by namespace", async () => {
+    const { app, storage } = await buildStack();
+    const { projectId, e2, e3, e4 } = seedContextData(storage);
+    const res = await app.inject({ method: "GET", url: `/projects/${projectId}/context` });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { context: { spec: Array<{ key: string; id: string }>; decision: Array<{ key: string; id: string }> } };
+    expect(body.context.spec).toBeDefined();
+    expect(body.context.decision).toBeDefined();
+    // e2 supersedes e1, so only e2 should be latest for key "api-url"
+    const specKeys = body.context.spec.map((e) => e.key);
+    expect(specKeys).toContain("api-url");
+    expect(specKeys).toContain("db-engine");
+    // Verify superseded entry e1 is excluded
+    const specUrls = body.context.spec.filter((e) => e.key === "api-url");
+    expect(specUrls).toHaveLength(1);
+    expect(specUrls[0]!.id).toBe(e2.id);
+    // e4 is the latest for auth-strategy
+    expect(body.context.decision.find((e) => e.key === "auth-strategy")!.id).toBe(e4.id);
+    // db-engine entry
+    expect(body.context.spec.find((e) => e.key === "db-engine")!.id).toBe(e3.id);
+    await app.close();
+  });
+
+  it("returns 404 for missing project", async () => {
+    const { app } = await buildStack();
+    const res = await app.inject({
+      method: "GET",
+      url: "/projects/00000000-0000-4000-8000-000000000000/context",
+    });
+    expect(res.statusCode).toBe(404);
+    expect((res.json() as { error: { code: string } }).error.code).toBe("workspace/not-found");
+    await app.close();
+  });
+
+  it("returns empty context for a project with no entries", async () => {
+    const { app, storage } = await buildStack();
+    const projectId = newProjectId();
+    storage.projects.insert({ id: projectId, name: "empty", rootPath: "/empty", createdAt: new Date().toISOString() });
+    const res = await app.inject({ method: "GET", url: `/projects/${projectId}/context` });
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as { context: Record<string, unknown[]> }).context).toEqual({});
+    await app.close();
+  });
+});
+
+describe("GET /projects/:projectId/context/:namespace", () => {
+  it("returns only entries in the specified namespace", async () => {
+    const { app, storage } = await buildStack();
+    const { projectId, e2, e3, e4 } = seedContextData(storage);
+    const res = await app.inject({ method: "GET", url: `/projects/${projectId}/context/spec` });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { context: Array<{ key: string; id: string }> };
+    expect(body.context.length).toBeGreaterThanOrEqual(2);
+    const ids = body.context.map((e) => e.id);
+    expect(ids).toContain(e2.id);
+    expect(ids).toContain(e3.id);
+    // Should not contain decision namespace entries
+    expect(ids).not.toContain(e4.id);
+    await app.close();
+  });
+
+  it("returns 400 for invalid namespace", async () => {
+    const { app, storage } = await buildStack();
+    const { projectId } = seedContextData(storage);
+    const res = await app.inject({ method: "GET", url: `/projects/${projectId}/context/gossip` });
+    expect(res.statusCode).toBe(400);
+    expect((res.json() as { error: { code: string } }).error.code).toBe("request/invalid");
+    await app.close();
+  });
+
+  it("returns 404 for missing project", async () => {
+    const { app } = await buildStack();
+    const res = await app.inject({
+      method: "GET",
+      url: "/projects/00000000-0000-4000-8000-000000000000/context/spec",
+    });
+    expect(res.statusCode).toBe(404);
+    await app.close();
+  });
+});
+
+describe("GET /projects/:projectId/context/:namespace/history/:key", () => {
+  it("returns version chain in chronological order", async () => {
+    const { app, storage } = await buildStack();
+    const { projectId, e1, e2 } = seedContextData(storage);
+    const res = await app.inject({ method: "GET", url: `/projects/${projectId}/context/spec/history/api-url` });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { history: Array<{ id: string; supersedes?: string }> };
+    expect(body.history).toHaveLength(2);
+    // First entry should not have supersedes
+    expect(body.history[0]!.id).toBe(e1.id);
+    expect(body.history[0]!.supersedes).toBeUndefined();
+    // Second entry supersedes the first
+    expect(body.history[1]!.id).toBe(e2.id);
+    expect(body.history[1]!.supersedes).toBe(e1.id);
+    await app.close();
+  });
+
+  it("returns empty history for a nonexistent key", async () => {
+    const { app, storage } = await buildStack();
+    const { projectId } = seedContextData(storage);
+    const res = await app.inject({ method: "GET", url: `/projects/${projectId}/context/spec/history/no-such-key` });
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as { history: unknown[] }).history).toEqual([]);
+    await app.close();
+  });
+
+  it("returns 400 for invalid namespace", async () => {
+    const { app, storage } = await buildStack();
+    const { projectId } = seedContextData(storage);
+    const res = await app.inject({ method: "GET", url: `/projects/${projectId}/context/gossip/history/x` });
+    expect(res.statusCode).toBe(400);
+    await app.close();
+  });
+
+  it("returns 404 for missing project", async () => {
+    const { app } = await buildStack();
+    const res = await app.inject({
+      method: "GET",
+      url: "/projects/00000000-0000-4000-8000-000000000000/context/spec/history/x",
+    });
+    expect(res.statusCode).toBe(404);
+    await app.close();
+  });
+});
+
+describe("POST /projects/:projectId/context", () => {
+  it("creates a new context entry with server-assigned id/timestamp", async () => {
+    const { app, storage } = await buildStack();
+    const { projectId } = seedContextData(storage);
+    const res = await app.inject({
+      method: "POST",
+      url: `/projects/${projectId}/context`,
+      payload: { namespace: "convention", key: "style/lint", value: "eslint", createdBy: "system" },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as { context: { id: string; namespace: string; key: string; value: string; createdAt: string } };
+    expect(body.context.id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(body.context.namespace).toBe("convention");
+    expect(body.context.key).toBe("style/lint");
+    expect(body.context.value).toBe("eslint");
+    expect(body.context.createdAt).toMatch(/Z$/);
+    // Verify it's persisted
+    const entry = storage.context.get(body.context.id as never);
+    expect(entry).not.toBeNull();
+    expect(entry!.key).toBe("style/lint");
+    await app.close();
+  });
+
+  it("returns 400 for invalid body", async () => {
+    const { app, storage } = await buildStack();
+    const { projectId } = seedContextData(storage);
+    const res = await app.inject({
+      method: "POST",
+      url: `/projects/${projectId}/context`,
+      payload: { namespace: "bad" },
+    });
+    expect(res.statusCode).toBe(400);
+    expect((res.json() as { error: { code: string } }).error.code).toBe("request/invalid");
+    await app.close();
+  });
+
+  it("returns 400 for invalid namespace in body", async () => {
+    const { app, storage } = await buildStack();
+    const { projectId } = seedContextData(storage);
+    const res = await app.inject({
+      method: "POST",
+      url: `/projects/${projectId}/context`,
+      payload: { namespace: "nonexistent", key: "k", value: "v", createdBy: "system" },
+    });
+    expect(res.statusCode).toBe(400);
+    await app.close();
+  });
+
+  it("returns 404 for missing project", async () => {
+    const { app } = await buildStack();
+    const res = await app.inject({
+      method: "POST",
+      url: "/projects/00000000-0000-4000-8000-000000000000/context",
+      payload: { namespace: "spec", key: "k", value: "v", createdBy: "system" },
+    });
+    expect(res.statusCode).toBe(404);
+    await app.close();
+  });
+});
+
+describe("context project ownership enforcement", () => {
+  it("returns 404 for context queries on non-existent projects", async () => {
+    const { app, storage } = await buildStack();
+    seedContextData(storage);
+
+    const res1 = await app.inject({
+      method: "GET",
+      url: "/projects/00000000-0000-4000-8000-000000000000/context",
+    });
+    expect(res1.statusCode).toBe(404);
+
+    const res2 = await app.inject({
+      method: "GET",
+      url: "/projects/00000000-0000-4000-8000-000000000000/context/spec",
+    });
+    expect(res2.statusCode).toBe(404);
+
+    const res3 = await app.inject({
+      method: "GET",
+      url: "/projects/00000000-0000-4000-8000-000000000000/context/spec/history/api-url",
+    });
+    expect(res3.statusCode).toBe(404);
+
+    const res4 = await app.inject({
+      method: "POST",
+      url: "/projects/00000000-0000-4000-8000-000000000000/context",
+      payload: { namespace: "spec", key: "k", value: "v", createdBy: "system" },
+    });
+    expect(res4.statusCode).toBe(404);
+
     await app.close();
   });
 });

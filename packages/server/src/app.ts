@@ -1,6 +1,8 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import {
   artifactKindSchema,
+  contextEntrySchema,
+  contextNamespaceSchema,
   projectIdSchema,
   runIdSchema,
   taskIdSchema,
@@ -39,6 +41,13 @@ const startExecutionBody = z.strictObject({
     .max(300)
     .regex(VERIFICATION_COMMAND_PATTERN, "command contains forbidden characters")
     .optional(),
+});
+
+const createContextEntryBody = z.strictObject({
+  namespace: contextNamespaceSchema,
+  key: z.string().min(1).max(200),
+  value: z.unknown(),
+  createdBy: z.string().min(1).max(50),
 });
 
 export interface BuildAppOptions {
@@ -708,6 +717,148 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
       kind = kindParsed.data;
     }
     return { artifacts: opts.storage.artifacts.listByProject(parsedId.data, kind as never) };
+  });
+
+  // -- context (namespaced blackboard) ----------------------------------------
+
+  // GET /projects/:projectId/context — latest entries across all namespaces
+  app.get("/projects/:projectId/context", async (req, reply) => {
+    const params = z.strictObject({ projectId: z.string() }).safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid project id" },
+      });
+    }
+    const parsedId = projectIdSchema.safeParse(params.data.projectId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    const rec = opts.storage.projects.get(parsedId.data);
+    if (!rec) {
+      return reply.status(404).send({
+        error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    const all = opts.storage.context.latestAll();
+    const grouped: Record<string, unknown[]> = {};
+    for (const entry of all.values()) {
+      const ns = entry.namespace;
+      if (!grouped[ns]) grouped[ns] = [];
+      grouped[ns]!.push(entry);
+    }
+    return { context: grouped };
+  });
+
+  // GET /projects/:projectId/context/:namespace
+  app.get("/projects/:projectId/context/:namespace", async (req, reply) => {
+    const params = z
+      .strictObject({ projectId: z.string(), namespace: z.string() })
+      .safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid params" },
+      });
+    }
+    const parsedId = projectIdSchema.safeParse(params.data.projectId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    const rec = opts.storage.projects.get(parsedId.data);
+    if (!rec) {
+      return reply.status(404).send({
+        error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    const nsParsed = contextNamespaceSchema.safeParse(params.data.namespace);
+    if (!nsParsed.success) {
+      return reply.status(400).send({
+        error: {
+          code: "request/invalid",
+          message: `invalid namespace; valid: ${contextNamespaceSchema.options.join(",")}`,
+        },
+      });
+    }
+    const map = opts.storage.context.latestByKey(nsParsed.data);
+    return { context: Array.from(map.values()) };
+  });
+
+  // GET /projects/:projectId/context/:namespace/history/:key
+  app.get("/projects/:projectId/context/:namespace/history/:key", async (req, reply) => {
+    const params = z
+      .strictObject({ projectId: z.string(), namespace: z.string(), key: z.string() })
+      .safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid params" },
+      });
+    }
+    const parsedId = projectIdSchema.safeParse(params.data.projectId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    const rec = opts.storage.projects.get(parsedId.data);
+    if (!rec) {
+      return reply.status(404).send({
+        error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    const nsParsed = contextNamespaceSchema.safeParse(params.data.namespace);
+    if (!nsParsed.success) {
+      return reply.status(400).send({
+        error: {
+          code: "request/invalid",
+          message: `invalid namespace; valid: ${contextNamespaceSchema.options.join(",")}`,
+        },
+      });
+    }
+    if (!params.data.key) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "key is required" },
+      });
+    }
+    const entries = opts.storage.context.history(params.data.key, nsParsed.data);
+    return { history: entries };
+  });
+
+  // POST /projects/:projectId/context — create a context entry
+  app.post("/projects/:projectId/context", async (req, reply) => {
+    const params = z.strictObject({ projectId: z.string() }).safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid project id" },
+      });
+    }
+    const parsedId = projectIdSchema.safeParse(params.data.projectId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    const rec = opts.storage.projects.get(parsedId.data);
+    if (!rec) {
+      return reply.status(404).send({
+        error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    const parsedBody = createContextEntryBody.safeParse(req.body);
+    if (!parsedBody.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "body must include namespace, key, value, createdBy" },
+      });
+    }
+    const entry = contextEntrySchema.parse({
+      id: crypto.randomUUID(),
+      createdAt: new Date().toISOString(),
+      ...parsedBody.data,
+    });
+    opts.storage.context.put(entry);
+    return reply.status(201).send({ context: entry });
   });
 
   // -- lifecycle ------------------------------------------------------------
