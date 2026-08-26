@@ -237,6 +237,13 @@ export class TaskRepository {
     return rows.map(rowToTask);
   }
 
+  listByProject(projectId: ProjectId, limit = 200): TaskCard[] {
+    const rows = this.db
+      .prepare("SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at DESC LIMIT ?")
+      .all(projectId, limit) as unknown as Array<Record<string, unknown>>;
+    return rows.map(rowToTask);
+  }
+
   countByStatus(projectId: ProjectId): Record<string, number> {
     const rows = this.db
       .prepare("SELECT status, COUNT(*) AS n FROM tasks WHERE project_id = ? GROUP BY status")
@@ -283,6 +290,19 @@ export class EventRepository {
     const rows = this.db
       .prepare("SELECT seq, payload FROM events WHERE run_id = ? ORDER BY seq LIMIT ?")
       .all(runId, limit) as unknown as Array<{ seq: number | bigint; payload: string }>;
+    return rows.map(rowToEvent);
+  }
+
+  /** Events for a specific run with seq strictly greater than `afterSeq`. */
+  listByRunAfter(runId: RunId, afterSeq: number, limit = 100): DomainEvent[] {
+    const rows = this.db
+      .prepare(
+        "SELECT seq, payload FROM events WHERE run_id = ? AND seq > ? ORDER BY seq LIMIT ?",
+      )
+      .all(runId, afterSeq, limit) as unknown as Array<{
+      seq: number | bigint;
+      payload: string;
+    }>;
     return rows.map(rowToEvent);
   }
 }

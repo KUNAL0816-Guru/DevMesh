@@ -1,6 +1,8 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import {
+  artifactKindSchema,
   projectIdSchema,
+  runIdSchema,
   taskIdSchema,
 } from "@devmesh/contracts";
 import type { Storage } from "@devmesh/storage";
@@ -367,6 +369,225 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         },
       });
     }
+  });
+
+  // -- pipeline query routes (read-only) ------------------------------------
+
+  // GET /projects/:projectId/pipelines
+  app.get("/projects/:projectId/pipelines", async (req, reply) => {
+    const params = z.strictObject({ projectId: z.string() }).safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid project id" },
+      });
+    }
+    const parsedId = projectIdSchema.safeParse(params.data.projectId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    const rec = opts.storage.projects.get(parsedId.data);
+    if (!rec) {
+      return reply.status(404).send({
+        error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    return { pipelines: opts.storage.pipelineRuns.listByProject(parsedId.data) };
+  });
+
+  // GET /pipelines/:runId
+  app.get("/pipelines/:runId", async (req, reply) => {
+    const params = z.strictObject({ runId: z.string() }).safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid run id" },
+      });
+    }
+    const parsedId = runIdSchema.safeParse(params.data.runId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    const rec = opts.storage.pipelineRuns.get(parsedId.data);
+    if (!rec) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    return { pipeline: rec };
+  });
+
+  // GET /pipelines/:runId/tasks
+  app.get("/pipelines/:runId/tasks", async (req, reply) => {
+    const params = z.strictObject({ runId: z.string() }).safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid run id" },
+      });
+    }
+    const parsedId = runIdSchema.safeParse(params.data.runId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    const rec = opts.storage.pipelineRuns.get(parsedId.data);
+    if (!rec) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    return { tasks: opts.storage.tasks.listByRun(parsedId.data) };
+  });
+
+  // GET /pipelines/:runId/events
+  app.get("/pipelines/:runId/events", async (req, reply) => {
+    const params = z.strictObject({ runId: z.string() }).safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid run id" },
+      });
+    }
+    const parsedId = runIdSchema.safeParse(params.data.runId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    const rec = opts.storage.pipelineRuns.get(parsedId.data);
+    if (!rec) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    const raw = (req.query ?? {}) as Record<string, unknown>;
+    const afterSeq = Number(raw.afterSeq);
+    const limitRaw = Number(raw.limit);
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(Math.floor(limitRaw), 500) : 100;
+    const safeAfter = Number.isFinite(afterSeq) && afterSeq >= 0 ? Math.floor(afterSeq) : 0;
+    const events = opts.storage.events.listByRunAfter(parsedId.data, safeAfter, limit + 1);
+    const hasMore = events.length > limit;
+    if (hasMore) events.pop();
+    return { events, hasMore };
+  });
+
+  // GET /pipelines/:runId/artifacts
+  app.get("/pipelines/:runId/artifacts", async (req, reply) => {
+    const params = z.strictObject({ runId: z.string() }).safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid run id" },
+      });
+    }
+    const parsedId = runIdSchema.safeParse(params.data.runId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    const rec = opts.storage.pipelineRuns.get(parsedId.data);
+    if (!rec) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    const raw = (req.query ?? {}) as Record<string, unknown>;
+    const kindRaw = typeof raw.kind === "string" ? raw.kind : undefined;
+    let kind: string | undefined;
+    if (kindRaw !== undefined) {
+      const kindParsed = artifactKindSchema.safeParse(kindRaw);
+      if (!kindParsed.success) {
+        return reply.status(400).send({
+          error: { code: "request/invalid", message: `invalid artifact kind; valid: ${artifactKindSchema.options.join(",")}` },
+        });
+      }
+      kind = kindParsed.data;
+    }
+    return { artifacts: opts.storage.artifacts.listByRun(parsedId.data, kind as never) };
+  });
+
+  // GET /pipelines/:runId/executions
+  app.get("/pipelines/:runId/executions", async (req, reply) => {
+    const params = z.strictObject({ runId: z.string() }).safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid run id" },
+      });
+    }
+    const parsedId = runIdSchema.safeParse(params.data.runId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    const rec = opts.storage.pipelineRuns.get(parsedId.data);
+    if (!rec) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    const allExecs = opts.storage.executions.listByProject(rec.projectId);
+    return { executions: allExecs.filter((e) => e.runId === parsedId.data) };
+  });
+
+  // GET /projects/:projectId/tasks
+  app.get("/projects/:projectId/tasks", async (req, reply) => {
+    const params = z.strictObject({ projectId: z.string() }).safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid project id" },
+      });
+    }
+    const parsedId = projectIdSchema.safeParse(params.data.projectId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    const rec = opts.storage.projects.get(parsedId.data);
+    if (!rec) {
+      return reply.status(404).send({
+        error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    return { tasks: opts.storage.tasks.listByProject(parsedId.data) };
+  });
+
+  // GET /projects/:projectId/artifacts
+  app.get("/projects/:projectId/artifacts", async (req, reply) => {
+    const params = z.strictObject({ projectId: z.string() }).safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid project id" },
+      });
+    }
+    const parsedId = projectIdSchema.safeParse(params.data.projectId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    const rec = opts.storage.projects.get(parsedId.data);
+    if (!rec) {
+      return reply.status(404).send({
+        error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    const raw = (req.query ?? {}) as Record<string, unknown>;
+    const kindRaw = typeof raw.kind === "string" ? raw.kind : undefined;
+    let kind: string | undefined;
+    if (kindRaw !== undefined) {
+      const kindParsed = artifactKindSchema.safeParse(kindRaw);
+      if (!kindParsed.success) {
+        return reply.status(400).send({
+          error: { code: "request/invalid", message: `invalid artifact kind; valid: ${artifactKindSchema.options.join(",")}` },
+        });
+      }
+      kind = kindParsed.data;
+    }
+    return { artifacts: opts.storage.artifacts.listByProject(parsedId.data, kind as never) };
   });
 
   // -- lifecycle ------------------------------------------------------------
