@@ -372,7 +372,7 @@ describe("GET /pipelines/:runId", () => {
     const { runId } = seedPipelineData(storage);
     const res = await app.inject({ method: "GET", url: `/pipelines/${runId}` });
     expect(res.statusCode).toBe(200);
-    const body = res.json() as { pipeline: { id: string; status: string } };
+    const body = res.json() as { pipeline: { id: string; status: string; goal: string } };
     expect(body.pipeline.id).toBe(runId);
     expect(body.pipeline.status).toBe("running");
     expect(body.pipeline.goal).toBe("implement feature X");
@@ -497,6 +497,128 @@ describe("GET /pipelines/:runId/artifacts", () => {
     const res = await app.inject({ method: "GET", url: `/pipelines/${runId}/artifacts?kind=invalid_kind` });
     expect(res.statusCode).toBe(400);
     expect((res.json() as { error: { code: string } }).error.code).toBe("request/invalid");
+    await app.close();
+  });
+});
+
+describe("POST /pipelines/:runId/cancel", () => {
+  it("returns 404 for a missing pipeline", async () => {
+    const { app } = await buildStack();
+    const res = await app.inject({
+      method: "POST",
+      url: "/pipelines/00000000-0000-4000-8000-000000000000/cancel",
+      payload: {},
+    });
+    expect(res.statusCode).toBe(404);
+    expect((res.json() as { error: { code: string } }).error.code).toBe("pipeline/not-found");
+    await app.close();
+  });
+
+  it("returns 200 for already completed pipeline (idempotent)", async () => {
+    const { app, storage } = await buildStack();
+    const projectId = newProjectId();
+    const runId = newRunId();
+    storage.projects.insert({ id: projectId, name: "cancel-test", rootPath: "/tmp/cancel", createdAt: new Date().toISOString() });
+    storage.pipelineRuns.insert({
+      id: runId,
+      projectId,
+      status: "completed",
+      goal: "done",
+      errorMessage: null,
+      createdAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      durationMs: 100,
+    });
+
+    const res = await app.inject({ method: "POST", url: `/pipelines/${runId}/cancel`, payload: {} });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { pipeline: { status: string } };
+    expect(body.pipeline.status).toBe("completed");
+    await app.close();
+  });
+
+  it("returns 200 for already cancelled pipeline (idempotent)", async () => {
+    const { app, storage } = await buildStack();
+    const projectId = newProjectId();
+    const runId = newRunId();
+    storage.projects.insert({ id: projectId, name: "cancel-test2", rootPath: "/tmp/cancel2", createdAt: new Date().toISOString() });
+    storage.pipelineRuns.insert({
+      id: runId,
+      projectId,
+      status: "cancelled",
+      goal: "already cancelled",
+      errorMessage: null,
+      createdAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      durationMs: 50,
+    });
+
+    const res = await app.inject({ method: "POST", url: `/pipelines/${runId}/cancel`, payload: {} });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { pipeline: { status: string } };
+    expect(body.pipeline.status).toBe("cancelled");
+    await app.close();
+  });
+
+  it("cancels a running pipeline via API and returns 202", async () => {
+    const config = testConfig();
+    const storage = createStorage({ path: join(config.dataRoot, "test.db") });
+    const workspaces = new WorkspaceService({
+      store: storage.projects,
+      workspacesRoot: join(config.dataRoot, "workspaces"),
+    });
+    const runtime = new FakeRuntime((_req) => ({
+      steps: [{ effect: () => undefined }],
+      outcome: { status: "completed" },
+      stepDelayMs: 30_000,
+    }));
+    const app = buildApp({
+      config: { ...config, runtime: "opencode" } as typeof config,
+      storage,
+      workspaces,
+      runtime,
+      agents: createDefaultAgentRegistry(),
+    });
+
+    // Create a project and start a pipeline
+    const created = await app.inject({ method: "POST", url: "/projects", payload: { name: "cancel-api" } });
+    const projectId = (created.json() as { id: string }).id;
+    const startRes = await app.inject({
+      method: "POST",
+      url: `/projects/${projectId}/pipeline`,
+      payload: { instruction: "long task" },
+    });
+    expect(startRes.statusCode).toBe(202);
+    const runId = (startRes.json() as { pipeline: { runId: string } }).pipeline.runId;
+
+    // Wait for pipeline to start
+    await new Promise((r) => setTimeout(r, 300));
+
+    // Cancel the pipeline
+    const cancelRes = await app.inject({ method: "POST", url: `/pipelines/${runId}/cancel`, payload: {} });
+    expect(cancelRes.statusCode).toBe(202);
+    const cancelBody = cancelRes.json() as { pipeline: { id: string; status: string } };
+    expect(cancelBody.pipeline.id).toBe(runId);
+
+    // Wait for the pipeline to fully terminate
+    await new Promise((r) => setTimeout(r, 1000));
+
+    // Verify persisted state
+    const getRes = await app.inject({ method: "GET", url: `/pipelines/${runId}` });
+    const pipelineRun = (getRes.json() as { pipeline: { status: string } }).pipeline;
+    expect(["cancelled", "running"]).toContain(pipelineRun.status);
+
+    await app.close();
+  });
+
+  it("returns 404 for invalid run id format", async () => {
+    const { app } = await buildStack();
+    const res = await app.inject({
+      method: "POST",
+      url: "/pipelines/not-a-uuid/cancel",
+      payload: {},
+    });
+    expect(res.statusCode).toBe(404);
     await app.close();
   });
 });

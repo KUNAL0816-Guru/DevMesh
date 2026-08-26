@@ -168,6 +168,7 @@ export class Orchestrator {
   private readonly maxTotalAttempts: number;
   private _userTask = "";
   private _currentPipelineRunId: string | null = null;
+  private _cancelled = false;
 
   constructor(opts: OrchestratorOptions) {
     this.storage = opts.storage;
@@ -184,6 +185,40 @@ export class Orchestrator {
   /** Return the runId of the most recently started pipeline, or null. */
   get currentRunId(): string | null {
     return this._currentPipelineRunId;
+  }
+
+  /** Whether cancellation has been requested for the current pipeline run. */
+  get isCancelled(): boolean {
+    return this._cancelled;
+  }
+
+  /**
+   * Request cancellation of the currently running pipeline.
+   *
+   * Safe to call multiple times (idempotent). Cancels the active execution
+   * if one exists. The pipeline will transition to the terminal "cancelled"
+   * state at the next stage boundary or after the active execution stops.
+   */
+  cancel(): void {
+    if (this._cancelled) return;
+    this._cancelled = true;
+    const runId = this._currentPipelineRunId;
+    if (!runId) return;
+    const projectId = this._findProjectIdForRun(runId);
+    if (!projectId) return;
+    try {
+      // ExecutionService enforces one active execution per project.
+      const execs = this.storage.executions.listByProject(projectId);
+      for (const exec of execs) {
+        if (exec.status === "running") {
+          void this.executionService.cancel(exec.id, "pipeline cancelled").catch(() => {});
+          break;
+        }
+      }
+    } catch {
+      // Best-effort: if we can't find/cancel the execution, the cancellation
+      // flag will still prevent further stages from starting.
+    }
   }
 
   /**
@@ -252,6 +287,19 @@ export class Orchestrator {
     let latestTestReportId: ArtifactId | undefined;
 
     while (currentIdx < taskChain.length) {
+      // --- Cancellation check at stage boundary ----------------------------
+      if (this._cancelled) {
+        this.emit({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "run.cancelled",
+          reason: "pipeline cancelled",
+        });
+        return this.result("cancelled", taskChain[currentIdx]!.id, projectId, "pipeline cancelled");
+      }
+
       const card = taskChain[currentIdx]!;
       const role = card.role;
 
@@ -316,6 +364,20 @@ export class Orchestrator {
 
       // Wait for terminal state
       const terminal = await this.waitForTerminal(card.id, rec.id);
+
+      // --- Cancellation check after execution completes --------------------
+      if (this._cancelled) {
+        this.emit({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "run.cancelled",
+          reason: "pipeline cancelled",
+        });
+        return this.result("cancelled", card.id, projectId, "pipeline cancelled");
+      }
+
       const refreshed = this.storage.tasks.get(card.id as TaskId)!;
 
       if (refreshed.status === "in_review") {
@@ -560,6 +622,12 @@ export class Orchestrator {
   }
 
   // --- Internal helpers ---------------------------------------------------
+
+  /** Look up the projectId for a given runId from the pipeline_runs table. */
+  private _findProjectIdForRun(runId: string): ProjectId | null {
+    const rec = this.storage.pipelineRuns.get(runId);
+    return rec ? (rec.projectId as ProjectId) : null;
+  }
 
   private createTask(
     runId: ReturnType<typeof newRunId>,
@@ -901,6 +969,8 @@ export class Orchestrator {
   ): Promise<ExecutionRecord["status"]> {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
+      // Check cancellation — don't wait for the execution to finish naturally
+      if (this._cancelled) return "cancelled";
       const rec = this.storage.executions.get(executionId);
       if (rec && rec.status !== "running") return rec.status;
       if (Date.now() > deadline) return "timeout";

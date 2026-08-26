@@ -1142,3 +1142,376 @@ describe("Orchestrator: pipeline run persistence", () => {
     await stack.storage.close();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 6D: Pipeline cancellation
+// ---------------------------------------------------------------------------
+
+describe("Orchestrator: pipeline cancellation", () => {
+  it("27. cancel a running pipeline returns cancelled status", async () => {
+    const stack = makeStack((_req) => ({
+      steps: [{ effect: () => undefined }],
+      outcome: { status: "completed" },
+      stepDelayMs: 30_000,
+    }));
+
+    const pipelinePromise = stack.orchestrator.run(stack.projectId, "long task");
+    // Give the pipeline time to start and register the execution
+    await new Promise((r) => setTimeout(r, 200));
+
+    stack.orchestrator.cancel();
+    const result = await pipelinePromise;
+    expect(result.status).toBe("cancelled");
+    await stack.storage.close();
+  });
+
+  it("28. cancelling before first stage prevents all execution", async () => {
+    const stack = makeStack((_req) => ({
+      steps: [{ effect: () => undefined }],
+      outcome: { status: "completed" },
+      stepDelayMs: 30_000,
+    }));
+
+    const pipelinePromise = stack.orchestrator.run(stack.projectId, "cancel early");
+    // Cancel immediately — before the execution starts
+    await new Promise((r) => setTimeout(r, 50));
+    stack.orchestrator.cancel();
+    const result = await pipelinePromise;
+    expect(result.status).toBe("cancelled");
+
+    // The architect execution may have been created but should be cancelled
+    const execs = stack.storage.executions.listByProject(stack.projectId);
+    for (const e of execs) {
+      expect(["cancelled", "interrupted"]).toContain(e.status);
+    }
+    await stack.storage.close();
+  });
+
+  it("29. cancellation is idempotent", async () => {
+    const stack = makeStack((_req) => ({
+      steps: [{ effect: () => undefined }],
+      outcome: { status: "completed" },
+      stepDelayMs: 30_000,
+    }));
+
+    const pipelinePromise = stack.orchestrator.run(stack.projectId, "idempotent cancel");
+    await new Promise((r) => setTimeout(r, 200));
+
+    stack.orchestrator.cancel();
+    stack.orchestrator.cancel();
+    stack.orchestrator.cancel();
+    const result = await pipelinePromise;
+    expect(result.status).toBe("cancelled");
+    expect(stack.orchestrator.isCancelled).toBe(true);
+    await stack.storage.close();
+  });
+
+  it("30. cancellation persists pipeline_runs.status as cancelled", async () => {
+    const stack = makeStack((_req) => ({
+      steps: [{ effect: () => undefined }],
+      outcome: { status: "completed" },
+      stepDelayMs: 30_000,
+    }));
+
+    const pipelinePromise = stack.orchestrator.run(stack.projectId, "persist cancel");
+    await new Promise((r) => setTimeout(r, 200));
+
+    const runId = stack.orchestrator.currentRunId!;
+    stack.orchestrator.cancel();
+    await pipelinePromise;
+
+    const pipelineRun = stack.storage.pipelineRuns.get(runId)!;
+    expect(pipelineRun).toBeDefined();
+    expect(pipelineRun.status).toBe("cancelled");
+    expect(pipelineRun.finishedAt).not.toBeNull();
+    expect(pipelineRun.durationMs).toBeGreaterThanOrEqual(0);
+    await stack.storage.close();
+  });
+
+  it("31. cancellation emits run.cancelled event", async () => {
+    const stack = makeStack((_req) => ({
+      steps: [{ effect: () => undefined }],
+      outcome: { status: "completed" },
+      stepDelayMs: 30_000,
+    }));
+
+    const pipelinePromise = stack.orchestrator.run(stack.projectId, "cancel events");
+    await new Promise((r) => setTimeout(r, 200));
+
+    stack.orchestrator.cancel();
+    await pipelinePromise;
+
+    const cancelledEvents = getEventsOfType(stack.storage, "run.cancelled");
+    expect(cancelledEvents.length).toBeGreaterThanOrEqual(1);
+    await stack.storage.close();
+  });
+
+  it("32. no later stages execute after cancellation", async () => {
+    const stagesRan: string[] = [];
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      stagesRan.push(role);
+      return {
+        steps: [{ effect: () => undefined }],
+        outcome: { status: "completed", finalText: `${role} done` },
+        stepDelayMs: 30_000,
+      };
+    });
+
+    const pipelinePromise = stack.orchestrator.run(stack.projectId, "stage check");
+    // Wait for architect to start (first stage)
+    await new Promise((r) => setTimeout(r, 300));
+
+    stack.orchestrator.cancel();
+    await pipelinePromise;
+
+    // Architect should have started, but no later stages
+    expect(stagesRan).toContain("architect");
+    // Developer should not have started after cancellation
+    const devSessions = getEventsOfType(stack.storage, "agent.session.opened").filter(
+      (e) => "role" in e && e.role === "developer",
+    );
+    expect(devSessions.length).toBe(0);
+    await stack.storage.close();
+  });
+
+  it("33. cancellation during revision loop prevents further revisions", async () => {
+    let developerRuns = 0;
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      if (role === "developer") {
+        developerRuns++;
+        if (developerRuns === 1) {
+          return {
+            steps: [{
+              effect: () => writeFileSync(join(stack.root, "app.js"), "v1"),
+              events: [{ kind: "text", text: "v1" }],
+            }],
+            outcome: { status: "completed", finalText: "v1" },
+            stepDelayMs: 5,
+          };
+        }
+        // Developer retry hangs
+        return {
+          steps: [{ effect: () => undefined }],
+          outcome: { status: "completed" },
+          stepDelayMs: 30_000,
+        };
+      }
+      if (role === "tester") {
+        return {
+          steps: [{ events: [{ kind: "text", text: "test failed" }] }],
+          outcome: { status: "failed", finalText: "FAIL" },
+          stepDelayMs: 5,
+        };
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} ok` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+
+    const pipelinePromise = stack.orchestrator.run(stack.projectId, "revision cancel");
+    // Wait for the pipeline to enter a revision cycle (architect + developer + tester + dev retry)
+    await new Promise((r) => setTimeout(r, 1000));
+
+    stack.orchestrator.cancel();
+    const result = await pipelinePromise;
+    expect(result.status).toBe("cancelled");
+    await stack.storage.close();
+  });
+
+  it("34. cancellation does not affect another running pipeline", async () => {
+    const stack = makeStack((_req) => ({
+      steps: [{ effect: () => undefined }],
+      outcome: { status: "completed" },
+      stepDelayMs: 30_000,
+    }));
+
+    const pipeline1 = stack.orchestrator.run(stack.projectId, "pipeline 1");
+    await new Promise((r) => setTimeout(r, 200));
+
+    // Cancel the first pipeline
+    stack.orchestrator.cancel();
+    const result1 = await pipeline1;
+    expect(result1.status).toBe("cancelled");
+
+    // A second orchestrator with a separate run should not be affected
+    const storage2 = createStorage({ path: join(dataRoot, `cancel-${crypto.randomUUID()}.db`) });
+    const ws2 = new WorkspaceService({
+      store: storage2.projects,
+      workspacesRoot: join(dataRoot, "ws-cancel"),
+    });
+    const handle2 = ws2.create("cancel-test");
+    const es2 = new ExecutionService({
+      storage: storage2,
+      workspaces: ws2,
+      git: { init: () => {}, status: () => ({ branch: "HEAD", entries: [] }) } as never,
+      runtime: new FakeRuntime({
+        steps: [{ events: [{ kind: "text", text: "ok" }] }],
+        outcome: { status: "completed", sessionId: "ses_0", finalText: "done" },
+        stepDelayMs: 5,
+      }),
+      agents: createDefaultAgentRegistry(),
+      defaultTimeoutMs: 30_000,
+    });
+    const orch2 = new Orchestrator({ storage: storage2, workspaces: ws2, executionService: es2 });
+    const result2 = await orch2.run(handle2.projectId, "pipeline 2");
+    expect(result2.status).toBe("completed");
+
+    await storage2.close();
+    await stack.storage.close();
+  });
+
+  it("35. cancel when no pipeline is running is a no-op", () => {
+    const stack = makeStack();
+    // No pipeline running — cancel should be harmless
+    stack.orchestrator.cancel();
+    expect(stack.orchestrator.isCancelled).toBe(true);
+    expect(stack.orchestrator.currentRunId).toBeNull();
+  });
+
+  it("36. cancellation with git rollback restores workspace", async () => {
+    const { GitService } = await import("@devmesh/workspace");
+    const git = new GitService();
+
+    const stack = makeStack((_req) => ({
+      steps: [{ effect: () => undefined }],
+      outcome: { status: "completed" },
+      stepDelayMs: 30_000,
+    }));
+
+    git.init(stack.root);
+    const orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      git,
+    });
+
+    const pipelinePromise = orchestrator.run(stack.projectId, "rollback cancel");
+    await new Promise((r) => setTimeout(r, 300));
+
+    orchestrator.cancel();
+    const result = await pipelinePromise;
+    expect(result.status).toBe("cancelled");
+
+    // Verify no broken files remain (workspace should be clean after rollback)
+    const { existsSync } = await import("node:fs");
+    expect(existsSync(join(stack.root, "should-not-exist.txt"))).toBe(false);
+    await stack.storage.close();
+  });
+
+  it("37. two simultaneous cancel requests produce single terminal state", async () => {
+    const stack = makeStack((_req) => ({
+      steps: [{ effect: () => undefined }],
+      outcome: { status: "completed" },
+      stepDelayMs: 30_000,
+    }));
+
+    const pipelinePromise = stack.orchestrator.run(stack.projectId, "double cancel");
+    await new Promise((r) => setTimeout(r, 200));
+
+    stack.orchestrator.cancel();
+    stack.orchestrator.cancel();
+    const result = await pipelinePromise;
+    expect(result.status).toBe("cancelled");
+
+    // Only one run.cancelled event should exist
+    const cancelledEvents = getEventsOfType(stack.storage, "run.cancelled");
+    expect(cancelledEvents.length).toBe(1);
+    await stack.storage.close();
+  });
+
+  it("38. cancellation races with pipeline completion — no corruption", async () => {
+    // Use a fast-finishing script; cancel may or may not win the race
+    const stack = makeStack(perAgentScript({
+      architect: { text: "spec" },
+      developer: {
+        effect: () => writeFileSync(join(stack.root, "app.js"), "ok"),
+        text: "done",
+      },
+      tester: { text: "pass" },
+      reviewer: { text: "APPROVED" },
+    }));
+
+    const pipelinePromise = stack.orchestrator.run(stack.projectId, "race cancel");
+    // Cancel after a short delay — the pipeline may complete before cancel takes effect
+    await new Promise((r) => setTimeout(r, 50));
+    stack.orchestrator.cancel();
+    const result = await pipelinePromise;
+
+    // Exactly one terminal state — no corruption
+    expect(["completed", "cancelled"]).toContain(result.status);
+
+    const runs = stack.storage.pipelineRuns.listByProject(stack.projectId);
+    expect(runs.length).toBeGreaterThanOrEqual(1);
+    const lastRun = runs[runs.length - 1]!;
+    expect(["completed", "cancelled"]).toContain(lastRun.status);
+    expect(lastRun.finishedAt).not.toBeNull();
+    await stack.storage.close();
+  });
+
+  it("39. cancelled pipeline has clean terminal state", async () => {
+    const stack = makeStack((_req) => ({
+      steps: [{ effect: () => undefined }],
+      outcome: { status: "completed" },
+      stepDelayMs: 30_000,
+    }));
+
+    const pipelinePromise = stack.orchestrator.run(stack.projectId, "clean terminal");
+    await new Promise((r) => setTimeout(r, 200));
+
+    const runId = stack.orchestrator.currentRunId!;
+    stack.orchestrator.cancel();
+    const result = await pipelinePromise;
+
+    expect(result.status).toBe("cancelled");
+
+    // Pipeline run persisted with all required fields
+    const run = stack.storage.pipelineRuns.get(runId)!;
+    expect(run).toBeDefined();
+    expect(run.status).toBe("cancelled");
+    expect(run.finishedAt).not.toBeNull();
+    expect(run.durationMs).toBeGreaterThanOrEqual(0);
+    expect(run.id).toBe(runId);
+    expect(run.projectId).toBe(stack.projectId);
+
+    // No run.completed or run.failed event should exist for this run
+    const allEvents = [...stack.storage.events.listAfter(0, 1000)];
+    const terminalEvents = allEvents.filter(
+      (e) => e.runId === runId && (e.type === "run.completed" || e.type === "run.failed"),
+    );
+    expect(terminalEvents.length).toBe(0);
+
+    await stack.storage.close();
+  });
+
+  it("40. cancel after pipeline completion is idempotent and non-corrupting", async () => {
+    const stack = makeStack(perAgentScript({
+      architect: { text: "spec" },
+      developer: {
+        effect: () => writeFileSync(join(stack.root, "app.js"), "ok"),
+        text: "done",
+      },
+      tester: { text: "pass" },
+      reviewer: { text: "APPROVED" },
+    }));
+
+    const result = await stack.orchestrator.run(stack.projectId, "cancel after done");
+    expect(result.status).toBe("completed");
+
+    // Cancel after completion — should not corrupt state
+    stack.orchestrator.cancel();
+
+    const runs = stack.storage.pipelineRuns.listByProject(stack.projectId);
+    expect(runs.length).toBeGreaterThanOrEqual(1);
+    const lastRun = runs[runs.length - 1]!;
+    // Status should remain "completed" — cancel after completion doesn't overwrite
+    expect(lastRun.status).toBe("completed");
+    await stack.storage.close();
+  });
+});

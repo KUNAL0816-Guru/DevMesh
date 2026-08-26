@@ -78,6 +78,10 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
     defaultModel: opts.config.opencodeModel,
   });
 
+  // In-memory registry of active pipeline runs (runId → Orchestrator).
+  // Cleared on every terminal path; no memory leak on normal operation.
+  const runningPipelines = new Map<string, Orchestrator>();
+
   const publicExecution = (rec: Awaited<ReturnType<ExecutionService["start"]>>) => ({
     id: rec.id,
     runId: rec.runId,
@@ -336,12 +340,19 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
       // Run the pipeline asynchronously; the client can poll task status
       const result = orchestrator.run(parsedId.data, parsedBody.data.instruction);
       // Don't await — let it run in background; return 202 immediately
-      void result.catch((err) => {
-        app.log.error({ err }, "pipeline failed");
-      });
+      let runningPipelineRunId: string | null = null;
+      void result
+        .then(() => { /* terminal — registry cleaned up */ })
+        .catch(() => { /* terminal — registry cleaned up */ })
+        .finally(() => {
+          const rid = orchestrator.currentRunId ?? runningPipelineRunId;
+          if (rid) runningPipelines.delete(rid);
+        });
       // Read the pipeline run created by the orchestrator
       const runId = orchestrator.currentRunId;
+      runningPipelineRunId = runId;
       if (runId) {
+        runningPipelines.set(runId, orchestrator);
         const pipelineRun = opts.storage.pipelineRuns.get(runId);
         return reply.status(202).send({
           pipeline: {
@@ -371,6 +382,40 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         },
       });
     }
+  });
+
+  // -- pipeline cancellation -------------------------------------------------
+  app.post("/pipelines/:runId/cancel", async (req, reply) => {
+    const params = z.strictObject({ runId: z.string() }).safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid run id" },
+      });
+    }
+    const parsedId = runIdSchema.safeParse(params.data.runId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    const rec = opts.storage.pipelineRuns.get(parsedId.data);
+    if (!rec) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    // Already terminal — idempotent response, no corruption.
+    const terminal = rec.status !== "running";
+    const orchestrator = runningPipelines.get(parsedId.data);
+    if (orchestrator) {
+      orchestrator.cancel();
+    }
+    // Re-read to return the most recent state.
+    const updated = opts.storage.pipelineRuns.get(parsedId.data) ?? rec;
+    if (terminal) {
+      return reply.status(200).send({ pipeline: updated });
+    }
+    return reply.status(202).send({ pipeline: updated });
   });
 
   // -- pipeline query routes (read-only) ------------------------------------

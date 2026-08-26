@@ -232,7 +232,7 @@ describe("PipelineEventStream", () => {
     const { runId, projectId } = seedPipeline(storage);
 
     // Create 4 events.
-    const _e1 = appendEvent(storage, runId, projectId, "run.started", { goal: "a" });
+    appendEvent(storage, runId, projectId, "run.started", { goal: "a" });
     const e2 = appendEvent(storage, runId, projectId, "run.started", { goal: "b" });
     const e3 = appendEvent(storage, runId, projectId, "run.started", { goal: "c" });
     const e4 = appendEvent(storage, runId, projectId, "run.completed", { summary: "done" });
@@ -464,7 +464,7 @@ describe("PipelineEventStream", () => {
 
     // Verify no heartbeat events were persisted to the database.
     const dbEvents = storage.events.listByRun(runId);
-    const heartbeatInDb = dbEvents.filter((e) => e.type === "__heartbeat");
+    const heartbeatInDb = dbEvents.filter((e) => (e.type as string) === "__heartbeat");
     expect(heartbeatInDb).toHaveLength(0);
     await storage.close();
   });
@@ -720,5 +720,67 @@ describe("PipelineEventStream", () => {
     await startPromise;
 
     await storage.close();
+  });
+});
+
+describe("PipelineEventStream: cancellation", () => {
+  it("run.cancelled event closes the SSE stream", async () => {
+    const { app, storage } = await buildStack();
+    const { projectId, runId } = seedPipeline(storage);
+
+    const received: DomainEvent[] = [];
+    let closed = false;
+    const stream = new PipelineEventStream({
+      storage,
+      runId,
+      afterSeq: 0,
+      callbacks: {
+        onEvent: (e) => received.push(e),
+        onClose: () => { closed = true; },
+      },
+    });
+
+    const startPromise = stream.start(0);
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Emit run.cancelled event
+    appendEvent(storage, runId, projectId, "run.cancelled", { reason: "user cancelled" });
+    await startPromise;
+
+    expect(closed).toBe(true);
+    const cancelEvents = received.filter((e) => e.type === "run.cancelled");
+    expect(cancelEvents.length).toBe(1);
+    await app.close();
+  });
+
+  it("pipeline in cancelled terminal state closes SSE on reconnect", async () => {
+    const { app, storage } = await buildStack();
+    const { projectId, runId } = seedPipeline(storage);
+
+    // Set pipeline status to cancelled
+    const run = storage.pipelineRuns.get(runId)!;
+    storage.pipelineRuns.update({ ...run, status: "cancelled", finishedAt: new Date().toISOString(), durationMs: 100 });
+
+    // Emit a run.cancelled event
+    appendEvent(storage, runId, projectId, "run.cancelled", { reason: "cancelled" });
+
+    const received: DomainEvent[] = [];
+    let closed = false;
+    const stream = new PipelineEventStream({
+      storage,
+      runId,
+      afterSeq: 0,
+      callbacks: {
+        onEvent: (e) => received.push(e),
+        onClose: () => { closed = true; },
+      },
+    });
+
+    await stream.start(0);
+    // Stream should close because pipeline is in terminal state
+    expect(closed).toBe(true);
+    const cancelEvents = received.filter((e) => e.type === "run.cancelled");
+    expect(cancelEvents.length).toBe(1);
+    await app.close();
   });
 });
