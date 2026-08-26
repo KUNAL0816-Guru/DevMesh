@@ -1160,3 +1160,237 @@ describe("pipelineHealth", () => {
     s.close();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 7B: Pipeline Stage Persistence
+// ---------------------------------------------------------------------------
+
+describe("migration 7 — pipeline_stages", () => {
+  it("creates pipeline_stages table with correct schema", () => {
+    const s = fileStorage();
+    expect(s.schemaVersion).toBeGreaterThanOrEqual(7);
+    const cols = s.db
+      .prepare("PRAGMA table_info(pipeline_stages)")
+      .all() as Array<{ name: string }>;
+    const names = cols.map((c) => c.name);
+    expect(names).toContain("id");
+    expect(names).toContain("run_id");
+    expect(names).toContain("project_id");
+    expect(names).toContain("stage_index");
+    expect(names).toContain("stage_role");
+    expect(names).toContain("status");
+    expect(names).toContain("execution_id");
+    expect(names).toContain("task_id");
+    expect(names).toContain("started_at");
+    expect(names).toContain("completed_at");
+    expect(names).toContain("created_at");
+    s.close();
+  });
+
+  it("is idempotent across reopens", () => {
+    const path = join(dir, "mig7.db");
+    const s1 = createStorage({ path });
+    expect(s1.schemaVersion).toBeGreaterThanOrEqual(7);
+    s1.close();
+
+    const s2 = createStorage({ path });
+    expect(s2.schemaVersion).toBe(s1.schemaVersion);
+    const tables = s2.db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+      .all() as Array<{ name: string }>;
+    expect(tables.map((t) => t.name)).toContain("pipeline_stages");
+    s2.close();
+  });
+});
+
+describe("stages", () => {
+  it("inserts and retrieves a stage record", () => {
+    const s = fileStorage();
+    const projectId = newProjectId();
+    const runId = newRunId();
+    s.projects.insert({ id: projectId, name: "stg", rootPath: "/stg", createdAt: new Date().toISOString() });
+
+    const now = new Date().toISOString();
+    const rec = s.stages.insert({
+      id: crypto.randomUUID(),
+      runId,
+      projectId,
+      stageIndex: 0,
+      stageRole: "architect",
+      status: "pending",
+      executionId: null,
+      taskId: null,
+      startedAt: null,
+      completedAt: null,
+      createdAt: now,
+    });
+    expect(rec.status).toBe("pending");
+    const fetched = s.stages.get(rec.id);
+    expect(fetched).not.toBeNull();
+    expect(fetched!.stageRole).toBe("architect");
+    expect(fetched!.stageIndex).toBe(0);
+    s.close();
+  });
+
+  it("updates a stage record through status transitions", () => {
+    const s = fileStorage();
+    const projectId = newProjectId();
+    const runId = newRunId();
+    s.projects.insert({ id: projectId, name: "stg2", rootPath: "/stg2", createdAt: new Date().toISOString() });
+
+    const now = new Date().toISOString();
+    const rec = s.stages.insert({
+      id: crypto.randomUUID(),
+      runId,
+      projectId,
+      stageIndex: 1,
+      stageRole: "developer",
+      status: "pending",
+      executionId: null,
+      taskId: null,
+      startedAt: null,
+      completedAt: null,
+      createdAt: now,
+    });
+
+    // pending → running
+    s.stages.update({ ...rec, status: "running", startedAt: new Date().toISOString() });
+    const running = s.stages.get(rec.id)!;
+    expect(running.status).toBe("running");
+    expect(running.startedAt).not.toBeNull();
+
+    // running → completed
+    s.stages.update({ ...running, status: "completed", completedAt: new Date().toISOString(), executionId: "exec-1" });
+    const completed = s.stages.get(rec.id)!;
+    expect(completed.status).toBe("completed");
+    expect(completed.executionId).toBe("exec-1");
+    expect(completed.completedAt).not.toBeNull();
+    s.close();
+  });
+
+  it("throws StorageError on update of non-existent stage", () => {
+    const s = fileStorage();
+    expect(() =>
+      s.stages.update({
+        id: crypto.randomUUID(),
+        runId: newRunId(),
+        projectId: newProjectId(),
+        stageIndex: 0,
+        stageRole: "architect",
+        status: "completed",
+        executionId: null,
+        taskId: null,
+        startedAt: null,
+        completedAt: null,
+        createdAt: new Date().toISOString(),
+      }),
+    ).toThrow();
+    s.close();
+  });
+
+  it("listByRun returns stages ordered by stage_index", () => {
+    const s = fileStorage();
+    const projectId = newProjectId();
+    const runId = newRunId();
+    s.projects.insert({ id: projectId, name: "stg3", rootPath: "/stg3", createdAt: new Date().toISOString() });
+
+    const now = new Date().toISOString();
+    const roles = ["architect", "developer", "tester", "reviewer"];
+    for (let i = 0; i < roles.length; i++) {
+      s.stages.insert({
+        id: crypto.randomUUID(),
+        runId,
+        projectId,
+        stageIndex: i,
+        stageRole: roles[i]!,
+        status: "pending",
+        executionId: null,
+        taskId: null,
+        startedAt: null,
+        completedAt: null,
+        createdAt: now,
+      });
+    }
+
+    const stages = s.stages.listByRun(runId);
+    expect(stages).toHaveLength(4);
+    expect(stages[0]!.stageRole).toBe("architect");
+    expect(stages[1]!.stageRole).toBe("developer");
+    expect(stages[2]!.stageRole).toBe("tester");
+    expect(stages[3]!.stageRole).toBe("reviewer");
+    s.close();
+  });
+
+  it("listByRun isolates runs", () => {
+    const s = fileStorage();
+    const projectId = newProjectId();
+    const run1 = newRunId();
+    const run2 = newRunId();
+    s.projects.insert({ id: projectId, name: "stg4", rootPath: "/stg4", createdAt: new Date().toISOString() });
+
+    const now = new Date().toISOString();
+    s.stages.insert({ id: crypto.randomUUID(), runId: run1, projectId, stageIndex: 0, stageRole: "architect", status: "completed", executionId: null, taskId: null, startedAt: null, completedAt: null, createdAt: now });
+    s.stages.insert({ id: crypto.randomUUID(), runId: run1, projectId, stageIndex: 1, stageRole: "developer", status: "completed", executionId: null, taskId: null, startedAt: null, completedAt: null, createdAt: now });
+    s.stages.insert({ id: crypto.randomUUID(), runId: run2, projectId, stageIndex: 0, stageRole: "architect", status: "pending", executionId: null, taskId: null, startedAt: null, completedAt: null, createdAt: now });
+
+    expect(s.stages.listByRun(run1)).toHaveLength(2);
+    expect(s.stages.listByRun(run2)).toHaveLength(1);
+    s.close();
+  });
+
+  it("getLastCompleted returns the last completed stage by stage_index", () => {
+    const s = fileStorage();
+    const projectId = newProjectId();
+    const runId = newRunId();
+    s.projects.insert({ id: projectId, name: "stg5", rootPath: "/stg5", createdAt: new Date().toISOString() });
+
+    const now = new Date().toISOString();
+    // Insert 4 stages: architect=completed, developer=completed, tester=running, reviewer=pending
+    s.stages.insert({ id: "s1", runId, projectId, stageIndex: 0, stageRole: "architect", status: "completed", executionId: "e1", taskId: null, startedAt: now, completedAt: now, createdAt: now });
+    s.stages.insert({ id: "s2", runId, projectId, stageIndex: 1, stageRole: "developer", status: "completed", executionId: "e2", taskId: null, startedAt: now, completedAt: now, createdAt: now });
+    s.stages.insert({ id: "s3", runId, projectId, stageIndex: 2, stageRole: "tester", status: "running", executionId: null, taskId: null, startedAt: now, completedAt: null, createdAt: now });
+    s.stages.insert({ id: "s4", runId, projectId, stageIndex: 3, stageRole: "reviewer", status: "pending", executionId: null, taskId: null, startedAt: null, completedAt: null, createdAt: now });
+
+    const last = s.stages.getLastCompleted(runId);
+    expect(last).not.toBeNull();
+    expect(last!.id).toBe("s2");
+    expect(last!.stageRole).toBe("developer");
+    s.close();
+  });
+
+  it("getLastCompleted returns null when no stages are completed", () => {
+    const s = fileStorage();
+    const projectId = newProjectId();
+    const runId = newRunId();
+    s.projects.insert({ id: projectId, name: "stg6", rootPath: "/stg6", createdAt: new Date().toISOString() });
+
+    const now = new Date().toISOString();
+    s.stages.insert({ id: crypto.randomUUID(), runId, projectId, stageIndex: 0, stageRole: "architect", status: "running", executionId: null, taskId: null, startedAt: now, completedAt: null, createdAt: now });
+
+    expect(s.stages.getLastCompleted(runId)).toBeNull();
+    s.close();
+  });
+
+  it("survives database close/reopen (durability)", () => {
+    const path = join(dir, "stg-dur.db");
+    const s1 = createStorage({ path });
+    const projectId = newProjectId();
+    const runId = newRunId();
+    s1.projects.insert({ id: projectId, name: "dur", rootPath: "/dur", createdAt: new Date().toISOString() });
+
+    const now = new Date().toISOString();
+    s1.stages.insert({ id: "dur-1", runId, projectId, stageIndex: 0, stageRole: "architect", status: "completed", executionId: "e1", taskId: null, startedAt: now, completedAt: now, createdAt: now });
+    s1.stages.insert({ id: "dur-2", runId, projectId, stageIndex: 1, stageRole: "developer", status: "running", executionId: "e2", taskId: null, startedAt: now, completedAt: null, createdAt: now });
+    s1.close();
+
+    const s2 = createStorage({ path });
+    const stages = s2.stages.listByRun(runId);
+    expect(stages).toHaveLength(2);
+    expect(stages[0]!.status).toBe("completed");
+    expect(stages[1]!.status).toBe("running");
+
+    const last = s2.stages.getLastCompleted(runId);
+    expect(last!.id).toBe("dur-1");
+    s2.close();
+  });
+});

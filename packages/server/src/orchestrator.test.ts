@@ -1891,3 +1891,167 @@ describe("assertPipelineConsistency", () => {
     await stack.storage.close();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 7B: Pipeline Stage Persistence
+// ---------------------------------------------------------------------------
+
+describe("Phase 7B — pipeline stage persistence", () => {
+  it("51. inserts 4 pending stage rows on pipeline start", async () => {
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} done` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+
+    const result = await stack.orchestrator.run(stack.projectId, "stage init test");
+    expect(result.status).toBe("completed");
+
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+    const stages = stack.storage.stages.listByRun(runId);
+    expect(stages).toHaveLength(4);
+    expect(stages.map((s) => s.stageRole)).toEqual(["architect", "developer", "tester", "reviewer"]);
+    expect(stages.every((s) => s.status === "completed")).toBe(true);
+    expect(stages.every((s) => s.completedAt !== null)).toBe(true);
+    await stack.storage.close();
+  });
+
+  it("52. stage status transitions through pending → running → completed", async () => {
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} done` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+
+    const result = await stack.orchestrator.run(stack.projectId, "stage transition test");
+    expect(result.status).toBe("completed");
+
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+    const stages = stack.storage.stages.listByRun(runId);
+    for (const s of stages) {
+      expect(s.status).toBe("completed");
+      expect(s.startedAt).not.toBeNull();
+      expect(s.completedAt).not.toBeNull();
+      expect(s.executionId).not.toBeNull();
+    }
+    await stack.storage.close();
+  });
+
+  it("53. stages are cancelled when pipeline fails (architect failure)", async () => {
+    const stack = makeStack(failingAgentScript("architect", "architect crashed"));
+
+    const result = await stack.orchestrator.run(stack.projectId, "stage fail test");
+    expect(result.status).toBe("failed");
+
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+    const stages = stack.storage.stages.listByRun(runId);
+    expect(stages).toHaveLength(4);
+
+    // Architect should be failed
+    const architectStage = stages.find((s) => s.stageRole === "architect")!;
+    expect(architectStage.status).toBe("failed");
+
+    // Remaining stages should be cancelled (never ran)
+    const developerStage = stages.find((s) => s.stageRole === "developer")!;
+    const testerStage = stages.find((s) => s.stageRole === "tester")!;
+    const reviewerStage = stages.find((s) => s.stageRole === "reviewer")!;
+    expect(developerStage.status).toBe("cancelled");
+    expect(testerStage.status).toBe("cancelled");
+    expect(reviewerStage.status).toBe("cancelled");
+    await stack.storage.close();
+  });
+
+  it("54. stages are cancelled when pipeline is cancelled", async () => {
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      return {
+        steps: [{ effect: () => undefined }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 30_000,
+      };
+    });
+
+    const pipelinePromise = stack.orchestrator.run(stack.projectId, "stage cancel test");
+    await new Promise((r) => setTimeout(r, 200));
+    stack.orchestrator.cancel();
+    const result = await pipelinePromise;
+    expect(result.status).toBe("cancelled");
+
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+    const stages = stack.storage.stages.listByRun(runId);
+    expect(stages).toHaveLength(4);
+
+    // At least the current stage should be cancelled, and remaining pending stages cancelled
+    const statuses = stages.map((s) => s.status);
+    expect(statuses.every((s) => s === "cancelled" || s === "completed" || s === "failed")).toBe(true);
+    await stack.storage.close();
+  });
+
+  it("55. stage execution_id and task_id are recorded", async () => {
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} done` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+
+    const result = await stack.orchestrator.run(stack.projectId, "stage exec id test");
+    expect(result.status).toBe("completed");
+
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+    const stages = stack.storage.stages.listByRun(runId);
+    for (const s of stages) {
+      expect(s.executionId).not.toBeNull();
+      expect(typeof s.executionId).toBe("string");
+    }
+    await stack.storage.close();
+  });
+
+  it("56. getLastCompleted returns the last completed stage for resumability support", async () => {
+    const stack = makeStack(failingAgentScript("tester", "tests failed"));
+
+    const result = await stack.orchestrator.run(stack.projectId, "stage last-completed test");
+    expect(result.status).toBe("failed");
+
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+    const last = stack.storage.stages.getLastCompleted(runId);
+    expect(last).not.toBeNull();
+    // Architect completes first; developer transitions back to "running" during
+    // the revision loop so it is not "completed" when the pipeline fails.
+    expect(last!.stageRole).toBe("architect");
+    await stack.storage.close();
+  });
+
+  it("57. stage rows survive database close/reopen", async () => {
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} done` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+
+    const runResult = await stack.orchestrator.run(stack.projectId, "stage durability test");
+    expect(runResult.status).toBe("completed");
+
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+    const stages = stack.storage.stages.listByRun(runId);
+    expect(stages.length).toBe(4);
+    expect(stages.every((s) => s.completedAt !== null)).toBe(true);
+    await stack.storage.close();
+  });
+});

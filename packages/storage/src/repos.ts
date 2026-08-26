@@ -923,6 +923,145 @@ export class PipelineRunRepository {
 }
 
 // ---------------------------------------------------------------------------
+// PipelineStageRepository
+// ---------------------------------------------------------------------------
+
+export const stageStatuses = [
+  "pending",
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+] as const;
+export type StageStatus = (typeof stageStatuses)[number];
+
+export interface StageRecord {
+  id: string;
+  runId: string;
+  projectId: string;
+  stageIndex: number;
+  stageRole: string;
+  status: StageStatus;
+  executionId: string | null;
+  taskId: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  createdAt: string;
+}
+
+interface StageRow {
+  id: string;
+  run_id: string;
+  project_id: string;
+  stage_index: number;
+  stage_role: string;
+  status: string;
+  execution_id: string | null;
+  task_id: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+}
+
+const STAGE_COLUMNS =
+  "id, run_id, project_id, stage_index, stage_role, status, " +
+  "execution_id, task_id, started_at, completed_at, created_at";
+
+function rowToStage(row: StageRow): StageRecord {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    projectId: row.project_id,
+    stageIndex: row.stage_index,
+    stageRole: row.stage_role,
+    status: row.status as StageStatus,
+    executionId: row.execution_id,
+    taskId: row.task_id,
+    startedAt: row.started_at,
+    completedAt: row.completed_at,
+    createdAt: row.created_at,
+  };
+}
+
+export class StageRepository {
+  constructor(private readonly db: Database) {}
+
+  insert(rec: StageRecord): StageRecord {
+    this.db
+      .prepare(
+        `INSERT INTO pipeline_stages
+         (id, run_id, project_id, stage_index, stage_role, status,
+          execution_id, task_id, started_at, completed_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        rec.id,
+        rec.runId,
+        rec.projectId,
+        rec.stageIndex,
+        rec.stageRole,
+        rec.status,
+        rec.executionId ?? null,
+        rec.taskId ?? null,
+        rec.startedAt ?? null,
+        rec.completedAt ?? null,
+        rec.createdAt,
+      );
+    return rec;
+  }
+
+  update(rec: StageRecord): void {
+    const res = this.db
+      .prepare(
+        `UPDATE pipeline_stages SET
+           status = ?, execution_id = ?, task_id = ?,
+           started_at = ?, completed_at = ?
+         WHERE id = ?`,
+      )
+      .run(
+        rec.status,
+        rec.executionId ?? null,
+        rec.taskId ?? null,
+        rec.startedAt ?? null,
+        rec.completedAt ?? null,
+        rec.id,
+      );
+    if (Number(res.changes) === 0) {
+      throw new StorageError("storage/not-found", `stage ${rec.id} does not exist`);
+    }
+  }
+
+  get(id: string): StageRecord | null {
+    const row = this.db
+      .prepare(`SELECT ${STAGE_COLUMNS} FROM pipeline_stages WHERE id = ?`)
+      .get(id) as unknown as StageRow | undefined;
+    return row ? rowToStage(row) : null;
+  }
+
+  listByRun(runId: string): StageRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ${STAGE_COLUMNS} FROM pipeline_stages
+         WHERE run_id = ? ORDER BY stage_index`,
+      )
+      .all(runId) as unknown as StageRow[];
+    return rows.map(rowToStage);
+  }
+
+  /** Return the last stage with status 'completed' for a run, or null. */
+  getLastCompleted(runId: string): StageRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT ${STAGE_COLUMNS} FROM pipeline_stages
+         WHERE run_id = ? AND status = 'completed'
+         ORDER BY stage_index DESC LIMIT 1`,
+      )
+      .get(runId) as unknown as StageRow | undefined;
+    return row ? rowToStage(row) : null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Diagnostic queries (read-only, no new tables)
 // ---------------------------------------------------------------------------
 

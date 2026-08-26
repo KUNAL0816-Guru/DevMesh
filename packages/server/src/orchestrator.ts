@@ -11,7 +11,7 @@ import {
   type Artifact,
   type ArtifactKind,
 } from "@devmesh/contracts";
-import type { Storage, ExecutionRecord } from "@devmesh/storage";
+import type { Storage, ExecutionRecord, StageRecord } from "@devmesh/storage";
 import type { WorkspaceService, GitService } from "@devmesh/workspace";
 import type { ExecutionService } from "./executions/service.js";
 import {
@@ -309,6 +309,35 @@ export class Orchestrator {
 
     const taskChain: TaskCard[] = [architectTask, developerTask, testerTask, reviewerTask];
 
+    // --- Insert initial stage rows (all pending) ---------------------------
+    const stageRoles = ["architect", "developer", "tester", "reviewer"];
+    const stageRows: StageRecord[] = stageRoles.map((role, idx) => ({
+      id: crypto.randomUUID(),
+      runId: pipelineRunId,
+      projectId,
+      stageIndex: idx,
+      stageRole: role,
+      status: "pending" as const,
+      executionId: null,
+      taskId: taskChain[idx]!.id,
+      startedAt: null,
+      completedAt: null,
+      createdAt: new Date().toISOString(),
+    }));
+    try {
+      for (const sr of stageRows) {
+        this.storage.stages.insert(sr);
+      }
+    } catch (err) {
+      // SAFETY: Non-critical side-effect — stage persistence failure does not
+      // block pipeline execution. The pipeline may not be queryable via API
+      // but the agent work still happens.
+      console.warn(
+        "[orchestrator] failed to persist initial stage rows",
+        { runId: pipelineRunId, error: err instanceof Error ? err.message : String(err) },
+      );
+    }
+
     // --- Pipeline execution loop ------------------------------------------
 
     let currentIdx = 0;
@@ -323,6 +352,7 @@ export class Orchestrator {
     while (currentIdx < taskChain.length) {
       // --- Cancellation check at stage boundary ----------------------------
       if (this._cancelled) {
+        this.cancelRemainingStages(stageRows);
         this.emitEvent({
           ts: new Date().toISOString(),
           runId,
@@ -340,6 +370,7 @@ export class Orchestrator {
       // Pipeline-level attempt budget check
       totalAttempts++;
       if (totalAttempts > this.maxTotalAttempts) {
+        this.cancelRemainingStages(stageRows);
         this.emit({
           ts: new Date().toISOString(),
           runId,
@@ -357,6 +388,7 @@ export class Orchestrator {
       // Unready tasks (deps not satisfied) — should not happen with our
       // linear chain, but guard against it.
       if (!this.areDependenciesSatisfied(card)) {
+        this.cancelRemainingStages(stageRows);
         this.transitionTask(card, "blocked");
         return this.result("failed", card.id, projectId,
           `dependencies not satisfied for ${role}`);
@@ -389,6 +421,21 @@ export class Orchestrator {
       }
 
       let rec: ExecutionRecord;
+
+      // --- Update stage to "running" before execution ----------------------
+      const currentStage = stageRows[currentIdx]!;
+      try {
+        currentStage.status = "running";
+        currentStage.startedAt = new Date().toISOString();
+        this.storage.stages.update(currentStage);
+      } catch (err) {
+        // SAFETY: Non-critical side-effect — stage persistence failure does not block execution.
+        console.warn(
+          "[orchestrator] failed to persist stage running",
+          { runId, stageRole: role, error: err instanceof Error ? err.message : String(err) },
+        );
+      }
+
       try {
         rec = await this.executionService.start({
           projectId,
@@ -397,6 +444,8 @@ export class Orchestrator {
           agentId: role,
         });
       } catch (err) {
+        this.finishStage(currentStage, "failed");
+        this.cancelRemainingStages(stageRows);
         this.transitionTask(card, "failed");
         return this.result("failed", card.id, projectId,
           `failed to start ${role}: ${err instanceof Error ? err.message : String(err)}`);
@@ -407,6 +456,8 @@ export class Orchestrator {
 
       // --- Cancellation check after execution completes --------------------
       if (this._cancelled) {
+        this.finishStage(currentStage, "cancelled", rec.id);
+        this.cancelRemainingStages(stageRows);
         this.emitEvent({
           ts: new Date().toISOString(),
           runId,
@@ -424,6 +475,7 @@ export class Orchestrator {
         // Success — advance to next stage.  We intentionally leave the task
         // at "in_review" (not "done") so that revision logic can transition
         // it back to "revising → running" if a downstream agent fails.
+        this.finishStage(currentStage, "completed", rec.id);
         currentIdx++;
         testerRevisions = 0;
         reviewerRevisions = 0;
@@ -475,6 +527,7 @@ export class Orchestrator {
           for (const t of taskChain) {
             this.transitionTask(t, "done");
           }
+          // All stages are already marked completed via finishStage above
           this.emitEvent({
             ts: new Date().toISOString(),
             runId,
@@ -490,6 +543,8 @@ export class Orchestrator {
 
       // Failure/timeout path
       if (terminal === "timeout") {
+        this.finishStage(currentStage, "failed", rec.id);
+        this.cancelRemainingStages(stageRows);
         this.emitEvent({
           ts: new Date().toISOString(),
           runId,
@@ -502,6 +557,8 @@ export class Orchestrator {
       }
 
       if (terminal === "cancelled") {
+        this.finishStage(currentStage, "cancelled", rec.id);
+        this.cancelRemainingStages(stageRows);
         this.emitEvent({
           ts: new Date().toISOString(),
           runId,
@@ -518,6 +575,8 @@ export class Orchestrator {
       if (role === "tester" && refreshed.status === "failed") {
         testerRevisions++;
         if (testerRevisions > this.maxTesterRevisions) {
+          this.finishStage(currentStage, "failed", rec.id);
+          this.cancelRemainingStages(stageRows);
           this.transitionTask(testerTask, "blocked");
           this.emitEvent({
             ts: new Date().toISOString(),
@@ -535,6 +594,8 @@ export class Orchestrator {
         if (lastExec) {
           const sig = computeFailureSignature(lastExec);
           if (this.doomLoop.recordFailure("tester", sig)) {
+            this.finishStage(currentStage, "failed", rec.id);
+            this.cancelRemainingStages(stageRows);
             this.transitionTask(testerTask, "blocked");
             this.emit({
               ts: new Date().toISOString(),
@@ -570,6 +631,8 @@ export class Orchestrator {
       if (role === "reviewer" && refreshed.status === "failed") {
         reviewerRevisions++;
         if (reviewerRevisions > this.maxReviewerRevisions) {
+          this.finishStage(currentStage, "failed", rec.id);
+          this.cancelRemainingStages(stageRows);
           this.transitionTask(reviewerTask, "blocked");
           this.emitEvent({
             ts: new Date().toISOString(),
@@ -587,6 +650,8 @@ export class Orchestrator {
         if (lastExec) {
           const sig = computeFailureSignature(lastExec);
           if (this.doomLoop.recordFailure("reviewer", sig)) {
+            this.finishStage(currentStage, "failed", rec.id);
+            this.cancelRemainingStages(stageRows);
             this.transitionTask(reviewerTask, "blocked");
             this.emit({
               ts: new Date().toISOString(),
@@ -621,6 +686,8 @@ export class Orchestrator {
 
       // Developer failed — block the pipeline
       if (role === "developer" && refreshed.status === "failed") {
+        this.finishStage(currentStage, "failed", rec.id);
+        this.cancelRemainingStages(stageRows);
         this.transitionTask(developerTask, "blocked");
         this.emitEvent({
           ts: new Date().toISOString(),
@@ -636,6 +703,8 @@ export class Orchestrator {
 
       // Architect failed — block the pipeline
       if (role === "architect" && refreshed.status === "failed") {
+        this.finishStage(currentStage, "failed", rec.id);
+        this.cancelRemainingStages(stageRows);
         this.transitionTask(architectTask, "blocked");
         this.emitEvent({
           ts: new Date().toISOString(),
@@ -650,6 +719,8 @@ export class Orchestrator {
       }
 
       // Unexpected state
+      this.finishStage(currentStage, "failed", rec.id);
+      this.cancelRemainingStages(stageRows);
       this.emitEvent({
         ts: new Date().toISOString(),
         runId,
@@ -1242,5 +1313,51 @@ export class Orchestrator {
     }
 
     return projectUnfinished.length;
+  }
+
+  // --- Stage persistence helpers -------------------------------------------
+
+  /**
+   * Update a stage row to a terminal status with execution_id and completed_at.
+   * Non-critical side-effect — failures are logged but do not crash.
+   */
+  private finishStage(
+    stage: StageRecord,
+    status: StageRecord["status"],
+    executionId?: string,
+  ): void {
+    try {
+      stage.status = status;
+      stage.executionId = executionId ?? stage.executionId;
+      stage.completedAt = new Date().toISOString();
+      this.storage.stages.update(stage);
+    } catch (err) {
+      console.warn(
+        "[orchestrator] failed to persist stage completion",
+        { stageId: stage.id, status, error: err instanceof Error ? err.message : String(err) },
+      );
+    }
+  }
+
+  /**
+   * Cancel all stage rows that are still pending or running (non-terminal).
+   * Called when the pipeline reaches a terminal state before all stages complete.
+   */
+  private cancelRemainingStages(stages: StageRecord[], executionId?: string): void {
+    const now = new Date().toISOString();
+    for (const s of stages) {
+      if (s.status === "completed" || s.status === "failed" || s.status === "cancelled") continue;
+      try {
+        s.status = "cancelled";
+        s.executionId = executionId ?? s.executionId;
+        s.completedAt = now;
+        this.storage.stages.update(s);
+      } catch (err) {
+        console.warn(
+          "[orchestrator] failed to persist stage cancellation",
+          { stageId: s.id, error: err instanceof Error ? err.message : String(err) },
+        );
+      }
+    }
   }
 }

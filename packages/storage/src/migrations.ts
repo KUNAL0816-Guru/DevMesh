@@ -166,6 +166,28 @@ const MIGRATIONS: readonly Migration[] = [
        CREATE INDEX idx_pipeline_runs_status ON pipeline_runs(status);`,
     ],
   },
+  {
+    version: 7,
+    name: "stage-progress",
+    up: [
+      `CREATE TABLE pipeline_stages (
+         id           TEXT PRIMARY KEY,
+         run_id       TEXT NOT NULL,
+         project_id   TEXT NOT NULL REFERENCES projects(id),
+         stage_index  INTEGER NOT NULL,
+         stage_role   TEXT NOT NULL,
+         status       TEXT NOT NULL DEFAULT 'pending',
+           -- pending | running | completed | failed | cancelled
+         execution_id TEXT,
+         task_id      TEXT,
+         started_at   TEXT,
+         completed_at TEXT,
+         created_at   TEXT NOT NULL
+       );
+       CREATE INDEX idx_pipeline_stages_run ON pipeline_stages(run_id, stage_index);
+       CREATE INDEX idx_pipeline_stages_status ON pipeline_stages(status);`,
+    ],
+  },
 ];
 
 function currentVersion(db: DatabaseSync): number {

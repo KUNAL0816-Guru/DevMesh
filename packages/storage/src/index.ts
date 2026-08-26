@@ -11,6 +11,7 @@ import {
   PipelineRunRepository,
   ProjectRepository,
   RevisionCycleRepository,
+  StageRepository,
   TaskRepository,
 } from "./repos.js";
 
@@ -24,6 +25,7 @@ export interface Storage {
   readonly executions: ExecutionRepository;
   readonly revisionCycles: RevisionCycleRepository;
   readonly pipelineRuns: PipelineRunRepository;
+  readonly stages: StageRepository;
   /** In-process event bus for SSE fan-out (fires AFTER SQLite persist). */
   readonly eventBus: EventBus;
   /** Applied schema version. */
@@ -37,7 +39,7 @@ export interface CreateStorageOptions {
   path: string;
 }
 
-export type { ExecutionRecord, ExecutionRowStatus, PipelineRunRecord, PipelineRunSummary, PipelineHealth, RevisionCycleRecord, ConsistencyViolation } from "./repos.js";
+export type { ExecutionRecord, ExecutionRowStatus, PipelineRunRecord, PipelineRunSummary, PipelineHealth, RevisionCycleRecord, ConsistencyViolation, StageRecord, StageStatus } from "./repos.js";
 export { pipelineRunSummary, pipelineHealth, assertPipelineConsistency } from "./repos.js";
 export { EventBus } from "./event-bus.js";
 
@@ -66,6 +68,7 @@ export function createStorage(opts: CreateStorageOptions): Storage {
     executions: new ExecutionRepository(db),
     revisionCycles: new RevisionCycleRepository(db),
     pipelineRuns: new PipelineRunRepository(db),
+    stages: new StageRepository(db),
     eventBus,
     close(): void {
       try {
