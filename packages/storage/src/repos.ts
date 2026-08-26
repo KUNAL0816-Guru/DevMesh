@@ -263,6 +263,11 @@ export class EventRepository {
     this.bus = bus;
   }
 
+  /** Detach the in-process event bus; events will no longer be emitted. */
+  detachBus(): void {
+    this.bus = null;
+  }
+
   /** Append a validated event; returns the event with its assigned seq. */
   append(event: EventInput): DomainEvent {
     const evt = parseEvent({ ...event, seq: 0 });
@@ -620,6 +625,16 @@ export class ExecutionRepository {
     return row ? rowToExecution(row) : null;
   }
 
+  listByRun(runId: string, limit = 100): ExecutionRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ${EXECUTION_COLUMNS} FROM executions WHERE run_id = ?
+         ORDER BY started_at DESC LIMIT ?`,
+      )
+      .all(runId, limit) as unknown as ExecutionRow[];
+    return rows.map(rowToExecution);
+  }
+
   listByProject(projectId: string, limit = 100): ExecutionRecord[] {
     const rows = this.db
       .prepare(
@@ -888,4 +903,195 @@ export class PipelineRunRepository {
       .all() as unknown as PipelineRunRow[];
     return rows.map(rowToPipelineRun);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic queries (read-only, no new tables)
+// ---------------------------------------------------------------------------
+
+export interface PipelineRunSummary {
+  id: string;
+  projectId: string;
+  status: PipelineRunStatus;
+  goal: string;
+  errorMessage: string | null;
+  createdAt: string;
+  finishedAt: string | null;
+  durationMs: number | null;
+  eventCount: number;
+  executionCount: number;
+  artifactCount: number;
+  stageTimings: Array<{
+    executionId: string;
+    role: string;
+    status: string;
+    startedAt: string;
+    finishedAt: string | null;
+    durationMs: number | null;
+  }>;
+}
+
+/**
+ * Returns stage timings, total duration, event count, artifact count for
+ * a specific run. Read-only diagnostic; does not introduce new tables.
+ */
+export function pipelineRunSummary(db: Database, runId: string): PipelineRunSummary | null {
+  const row = db
+    .prepare(`SELECT ${PR_COLUMNS} FROM pipeline_runs WHERE id = ?`)
+    .get(runId) as unknown as PipelineRunRow | undefined;
+  if (!row) return null;
+
+  const eventCountRow = db
+    .prepare("SELECT COUNT(*) AS n FROM events WHERE run_id = ?")
+    .get(runId) as { n: number | bigint } | undefined;
+
+  const executionRows = db
+    .prepare(
+      `SELECT id, role, status, started_at, finished_at, duration_ms
+       FROM executions WHERE run_id = ? ORDER BY started_at`,
+    )
+    .all(runId) as unknown as Array<{
+    id: string;
+    role: string;
+    status: string;
+    started_at: string;
+    finished_at: string | null;
+    duration_ms: number | bigint | null;
+  }>;
+
+  const artifactCountRow = db
+    .prepare("SELECT COUNT(*) AS n FROM artifacts WHERE run_id = ?")
+    .get(runId) as { n: number | bigint } | undefined;
+
+  return {
+    ...rowToPipelineRun(row),
+    eventCount: Number(eventCountRow?.n ?? 0),
+    executionCount: executionRows.length,
+    artifactCount: Number(artifactCountRow?.n ?? 0),
+    stageTimings: executionRows.map((r) => ({
+      executionId: r.id,
+      role: r.role,
+      status: r.status,
+      startedAt: r.started_at,
+      finishedAt: r.finished_at,
+      durationMs: r.duration_ms === null ? null : Number(r.duration_ms),
+    })),
+  };
+}
+
+export interface PipelineHealth {
+  projectId: string;
+  totalRuns: number;
+  statusCounts: Record<string, number>;
+  averageDurationMs: number | null;
+  failureRate: number;
+}
+
+/**
+ * Returns counts of runs by status, average duration, failure rate for a
+ * project. Read-only diagnostic; does not introduce new tables.
+ */
+export function pipelineHealth(db: Database, projectId: string): PipelineHealth {
+  const allRuns = db
+    .prepare(`SELECT ${PR_COLUMNS} FROM pipeline_runs WHERE project_id = ?`)
+    .all(projectId) as unknown as PipelineRunRow[];
+
+  const statusCounts: Record<string, number> = {};
+  let totalDuration = 0;
+  let durationCount = 0;
+  let terminalCount = 0;
+  let failureCount = 0;
+
+  for (const row of allRuns) {
+    statusCounts[row.status] = (statusCounts[row.status] ?? 0) + 1;
+    if (row.finished_at) {
+      terminalCount++;
+      if (row.status === "failed") failureCount++;
+    }
+    if (row.duration_ms !== null) {
+      totalDuration += Number(row.duration_ms);
+      durationCount++;
+    }
+  }
+
+  return {
+    projectId,
+    totalRuns: allRuns.length,
+    statusCounts,
+    averageDurationMs: durationCount > 0 ? totalDuration / durationCount : null,
+    failureRate: terminalCount > 0 ? failureCount / terminalCount : 0,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Cross-entity consistency check (test utility)
+// ---------------------------------------------------------------------------
+
+export interface ConsistencyViolation {
+  check: string;
+  message: string;
+}
+
+/**
+ * Verify cross-entity consistency for a pipeline run. Returns an array of
+ * violations (empty = consistent). Used in tests to catch schema drift or
+ * inconsistent writes.
+ */
+export function assertPipelineConsistency(db: Database, runId: string): ConsistencyViolation[] {
+  const violations: ConsistencyViolation[] = [];
+
+  const run = db
+    .prepare(`SELECT id, status, finished_at, duration_ms FROM pipeline_runs WHERE id = ?`)
+    .get(runId) as { id: string; status: string; finished_at: string | null; duration_ms: number | null } | undefined;
+
+  if (!run) {
+    return [{ check: "pipeline_run_exists", message: `pipeline run ${runId} not found` }];
+  }
+
+  const tasks = db
+    .prepare("SELECT id, run_id FROM tasks WHERE run_id = ?")
+    .all(runId) as Array<{ id: string; run_id: string }>;
+
+  const taskIds = new Set(tasks.map((t) => t.id));
+
+  // Executions are linked to pipeline runs via task_id (each execution gets
+  // its own run_id from the ExecutionService, not the pipeline run id).
+  const executions = db
+    .prepare("SELECT id, run_id, task_id FROM executions WHERE task_id IN (SELECT id FROM tasks WHERE run_id = ?)")
+    .all(runId) as Array<{ id: string; run_id: string; task_id: string | null }>;
+
+  for (const t of tasks) {
+    const match = executions.find((e) => e.task_id === t.id);
+    if (!match) {
+      violations.push({ check: "task_execution_link", message: `task ${t.id} has no matching execution` });
+    }
+  }
+
+  const events = db
+    .prepare("SELECT run_id FROM events WHERE run_id = ?")
+    .all(runId) as Array<{ run_id: string }>;
+  if (events.length > 0 && events[0]!.run_id !== runId) {
+    violations.push({ check: "event_run_reference", message: `events reference non-existent run ${runId}` });
+  }
+
+  const artifacts = db
+    .prepare("SELECT id, task_id FROM artifacts WHERE run_id = ?")
+    .all(runId) as Array<{ id: string; task_id: string | null }>;
+  for (const a of artifacts) {
+    if (a.task_id && !taskIds.has(a.task_id)) {
+      violations.push({ check: "artifact_task_reference", message: `artifact ${a.id} references non-existent task ${a.task_id}` });
+    }
+  }
+
+  const terminalStatuses = ["completed", "failed", "cancelled", "timeout"];
+  if (terminalStatuses.includes(run.status)) {
+    if (!run.finished_at) {
+      violations.push({ check: "terminal_finished_at", message: `terminal run ${runId} has null finished_at` });
+    }
+    if (run.duration_ms === null) {
+      violations.push({ check: "terminal_duration_ms", message: `terminal run ${runId} has null duration_ms` });
+    }
+  }
+
+  return violations;
 }
