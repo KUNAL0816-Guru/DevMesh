@@ -17,6 +17,8 @@ import { GitService } from "@devmesh/workspace";
 import { ExecutionService } from "./executions/service.js";
 import { VERIFICATION_COMMAND_PATTERN } from "./executions/commands.js";
 import { Orchestrator } from "./orchestrator.js";
+import type { DomainEvent } from "@devmesh/contracts";
+import { PipelineEventStream } from "./pipeline-sse.js";
 
 export const APP_VERSION = "0.1.0";
 
@@ -471,6 +473,79 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
     const hasMore = events.length > limit;
     if (hasMore) events.pop();
     return { events, hasMore };
+  });
+
+  // GET /pipelines/:runId/events/stream (SSE)
+  app.get("/pipelines/:runId/events/stream", async (req, reply) => {
+    const params = z.strictObject({ runId: z.string() }).safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid run id" },
+      });
+    }
+    const parsedId = runIdSchema.safeParse(params.data.runId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    const rec = opts.storage.pipelineRuns.get(parsedId.data);
+    if (!rec) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+
+    // Parse Last-Event-ID for reconnection (defaults to 0 = start from beginning).
+    const lastEventIdRaw = req.headers["last-event-id"];
+    const lastEventId = Number(lastEventIdRaw);
+    const afterSeq = Number.isFinite(lastEventId) && lastEventId >= 0 ? Math.floor(lastEventId) : 0;
+
+    // Hijack the response to write SSE frames directly to the raw socket.
+    reply.hijack();
+    const raw = reply.raw;
+    raw.setHeader("Content-Type", "text/event-stream");
+    raw.setHeader("Cache-Control", "no-cache");
+    raw.setHeader("Connection", "keep-alive");
+    raw.setHeader("X-Accel-Buffering", "no");
+    raw.flushHeaders();
+
+    const sendSSE = (event: DomainEvent): void => {
+      try {
+        const id = String(event.seq);
+        const data = JSON.stringify(event);
+        raw.write(`id: ${id}\nevent: ${event.type}\ndata: ${data}\n\n`);
+      } catch {
+        // Write failed — client likely disconnected; stream will be cleaned up.
+      }
+    };
+
+    const stream = new PipelineEventStream({
+      storage: opts.storage,
+      runId: parsedId.data,
+      afterSeq,
+      callbacks: {
+        onEvent: (event) => {
+          // Heartbeats are sent as SSE comments, not as DomainEvents.
+          if ((event as { type?: string }).type === "__heartbeat") {
+            try { raw.write(": keepalive\n\n"); } catch { /* client gone */ }
+            return;
+          }
+          sendSSE(event);
+        },
+        onClose: () => {
+          try { raw.end(); } catch { /* already closed */ }
+        },
+      },
+    });
+
+    // Clean up on client disconnect.
+    req.raw.once("close", () => stream.stop());
+    req.raw.once("aborted", () => stream.stop());
+
+    // Start replay + live streaming (does not block the route handler
+    // because reply.hijack() already took ownership of the response).
+    void stream.start(afterSeq);
   });
 
   // GET /pipelines/:runId/artifacts

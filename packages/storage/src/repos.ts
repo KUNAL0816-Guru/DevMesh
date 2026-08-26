@@ -18,6 +18,7 @@ import {
   type TaskId,
 } from "@devmesh/contracts";
 import { StorageError, type Database } from "./db.js";
+import type { EventBus } from "./event-bus.js";
 
 // ---------------------------------------------------------------------------
 // Row shapes (snake_case DB columns)
@@ -253,7 +254,14 @@ export class TaskRepository {
 }
 
 export class EventRepository {
+  private bus: EventBus | null = null;
+
   constructor(private readonly db: Database) {}
+
+  /** Attach an in-process event bus for SSE fan-out (optional). */
+  attachBus(bus: EventBus): void {
+    this.bus = bus;
+  }
 
   /** Append a validated event; returns the event with its assigned seq. */
   append(event: EventInput): DomainEvent {
@@ -268,7 +276,10 @@ export class EventRepository {
     if (!Number.isSafeInteger(seq) || seq <= 0) {
       throw new StorageError("storage/insert-failed", `event append returned invalid seq ${seq}`);
     }
-    return { ...evt, seq };
+    const persisted = { ...evt, seq };
+    // Notify in-process subscribers AFTER SQLite persist (SQLite is source of truth).
+    this.bus?.emitEvent(persisted);
+    return persisted;
   }
 
   /** Events with seq strictly greater than `afterSeq`, ascending. */
