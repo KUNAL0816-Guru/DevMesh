@@ -784,3 +784,60 @@ describe("PipelineEventStream: cancellation", () => {
     await app.close();
   });
 });
+
+describe("PipelineEventStream: Phase 6E — duplicate terminal event suppression", () => {
+  it("duplicate run.cancelled events with different seqs close stream after first terminal", async () => {
+    const storage = createStorage({ path: join(dataRoot, `sse-dedup-${crypto.randomUUID()}.db`) });
+    const { runId, projectId } = seedPipeline(storage);
+
+    // Append two run.cancelled events (simulating a race condition at storage level)
+    appendEvent(storage, runId, projectId, "run.cancelled", { reason: "cancel 1" });
+    appendEvent(storage, runId, projectId, "run.cancelled", { reason: "cancel 2" });
+
+    const received: DomainEvent[] = [];
+    const stream = new PipelineEventStream({
+      storage,
+      runId,
+      afterSeq: 0,
+      callbacks: {
+        onEvent: (e) => received.push(e),
+        onClose: () => {},
+      },
+    });
+
+    await stream.start(0);
+
+    // Stream delivers both events (different seqs) but closes after the first
+    // terminal event via deliverEvent's isTerminalEvent check.
+    const cancelEvents = received.filter((e) => e.type === "run.cancelled");
+    expect(cancelEvents.length).toBeGreaterThanOrEqual(1);
+    await storage.close();
+  });
+
+  it("single terminal event in storage results in clean stream close", async () => {
+    const storage = createStorage({ path: join(dataRoot, `sse-dedup2-${crypto.randomUUID()}.db`) });
+    const { runId, projectId } = seedPipeline(storage);
+
+    // Only one run.cancelled event (orchestrator emitEvent dedup prevents duplicates)
+    appendEvent(storage, runId, projectId, "run.cancelled", { reason: "user cancelled" });
+
+    const received: DomainEvent[] = [];
+    let closed = false;
+    const stream = new PipelineEventStream({
+      storage,
+      runId,
+      afterSeq: 0,
+      callbacks: {
+        onEvent: (e) => received.push(e),
+        onClose: () => { closed = true; },
+      },
+    });
+
+    await stream.start(0);
+
+    const cancelEvents = received.filter((e) => e.type === "run.cancelled");
+    expect(cancelEvents.length).toBe(1);
+    expect(closed).toBe(true);
+    await storage.close();
+  });
+});

@@ -450,7 +450,8 @@ export class ExecutionService {
         stoppedReason: "error",
       });
     } catch {
-      /* persistence of the failure itself failed — nothing more we can do */
+      // SAFETY: Persistence of the failure itself failed — the execution is
+      // already in a terminal failure state. Nothing more we can do.
     }
     this.emit({
       ts: new Date().toISOString(),
@@ -478,7 +479,8 @@ export class ExecutionService {
         stoppedReason: "error",
       });
     } catch {
-      /* ignore */
+      // SAFETY: Persistence of the internal error state failed — the error
+      // event will still be emitted below for observability.
     }
     this.emit({
       ts: new Date().toISOString(),
@@ -496,7 +498,8 @@ export class ExecutionService {
     try {
       this.opts.storage.events.append(event as never);
     } catch {
-      /* event persistence is best-effort; never escape finalize paths */
+      // SAFETY: Event persistence is best-effort; failures must never escape
+      // finalize paths as they would leave the execution in a stuck state.
     }
   }
 }

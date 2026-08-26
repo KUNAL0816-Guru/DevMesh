@@ -2,6 +2,7 @@ import {
   canTransition,
   makeTaskCard,
   newRunId,
+  TerminalStateError,
   type TaskCard,
   type TaskId,
   type ProjectId,
@@ -169,6 +170,10 @@ export class Orchestrator {
   private _userTask = "";
   private _currentPipelineRunId: string | null = null;
   private _cancelled = false;
+  /** Tracks terminal events emitted for the current run to prevent duplicates. */
+  private _emittedTerminalEvents = new Set<string>();
+  /** Whether git rollback has already been performed for the current run. */
+  private _rollbackPerformed = false;
 
   constructor(opts: OrchestratorOptions) {
     this.storage = opts.storage;
@@ -211,13 +216,32 @@ export class Orchestrator {
       const execs = this.storage.executions.listByProject(projectId);
       for (const exec of execs) {
         if (exec.status === "running") {
+          // SAFETY: Fire-and-forget — the `_cancelled` flag already prevents further
+          // stages from starting. Cancel failure is non-critical.
           void this.executionService.cancel(exec.id, "pipeline cancelled").catch(() => {});
           break;
         }
       }
-    } catch {
-      // Best-effort: if we can't find/cancel the execution, the cancellation
-      // flag will still prevent further stages from starting.
+    } catch (err) {
+      // SAFETY: Non-critical side-effect — the `_cancelled` flag will still
+      // prevent further stages from starting. Logging for observability but
+      // not failing the pipeline.
+      try {
+        this.storage.events.append({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "error.raised",
+          scope: "orchestrator/cancel-exec",
+          message: `failed to cancel active execution: ${err instanceof Error ? err.message : String(err)}`,
+          fatal: false,
+        } as never);
+      } catch {
+        // SAFETY: If event persistence also fails after a cancel failure,
+        // the pipeline cancellation flag is still set and no further stages
+        // will start. Nothing more we can do.
+      }
     }
   }
 
@@ -232,6 +256,10 @@ export class Orchestrator {
     this._userTask = userTask;
     const handle = this.workspaces.get(projectId);
     const runId = newRunId();
+
+    // --- Reset per-run state -----------------------------------------------
+    this._emittedTerminalEvents.clear();
+    this._rollbackPerformed = false;
 
     // --- Persist pipeline run identity ------------------------------------
     const pipelineRunId = runId;
@@ -248,8 +276,14 @@ export class Orchestrator {
         finishedAt: null,
         durationMs: null,
       });
-    } catch {
-      /* persistence best-effort */
+    } catch (err) {
+      // SAFETY: Non-critical side-effect — pipeline execution proceeds even
+      // if persistence fails. The pipeline may not be queryable via API but
+      // the agent work still happens.
+      console.warn(
+        "[orchestrator] failed to persist pipeline run start",
+        { runId: pipelineRunId, error: err instanceof Error ? err.message : String(err) },
+      );
     }
 
     this.emit({
@@ -289,7 +323,7 @@ export class Orchestrator {
     while (currentIdx < taskChain.length) {
       // --- Cancellation check at stage boundary ----------------------------
       if (this._cancelled) {
-        this.emit({
+        this.emitEvent({
           ts: new Date().toISOString(),
           runId,
           projectId,
@@ -335,7 +369,7 @@ export class Orchestrator {
       if (role === "developer" && this.git && card.attempts <= 1) {
         try {
           const cp = this.git.checkpoint(handle.root, `pre-developer-${card.attempts}`);
-          this.emit({
+          this.emitEvent({
             ts: new Date().toISOString(),
             runId,
             projectId,
@@ -343,8 +377,14 @@ export class Orchestrator {
             type: "run.started",
             goal: `git checkpoint created: ${cp.label}`,
           });
-        } catch {
-          // Checkpoint failure is non-fatal — pipeline continues
+        } catch (err) {
+          // SAFETY: Non-critical side-effect — checkpoint failure does not block
+          // the pipeline. Git rollback on failure will be a no-op if no checkpoint
+          // was created.
+          console.warn(
+            "[orchestrator] git checkpoint failed",
+            { runId, error: err instanceof Error ? err.message : String(err) },
+          );
         }
       }
 
@@ -367,7 +407,7 @@ export class Orchestrator {
 
       // --- Cancellation check after execution completes --------------------
       if (this._cancelled) {
-        this.emit({
+        this.emitEvent({
           ts: new Date().toISOString(),
           runId,
           projectId,
@@ -412,8 +452,14 @@ export class Orchestrator {
             this.storage.artifacts.insert(rv);
             this.emitArtifact(rv, "reviewer");
           }
-        } catch {
-          // Artifact creation failure is non-fatal — pipeline continues
+        } catch (err) {
+          // SAFETY: Non-critical side-effect — artifact creation failure does not
+          // block the pipeline. The agent reply text is still available via the
+          // execution record for downstream context assembly.
+          console.warn(
+            "[orchestrator] artifact creation failed",
+            { runId, role, error: err instanceof Error ? err.message : String(err) },
+          );
         }
 
         // Capture the changeSetId from the latest execution for reviewer
@@ -429,7 +475,7 @@ export class Orchestrator {
           for (const t of taskChain) {
             this.transitionTask(t, "done");
           }
-          this.emit({
+          this.emitEvent({
             ts: new Date().toISOString(),
             runId,
             projectId,
@@ -444,7 +490,7 @@ export class Orchestrator {
 
       // Failure/timeout path
       if (terminal === "timeout") {
-        this.emit({
+        this.emitEvent({
           ts: new Date().toISOString(),
           runId,
           projectId,
@@ -456,7 +502,7 @@ export class Orchestrator {
       }
 
       if (terminal === "cancelled") {
-        this.emit({
+        this.emitEvent({
           ts: new Date().toISOString(),
           runId,
           projectId,
@@ -473,7 +519,7 @@ export class Orchestrator {
         testerRevisions++;
         if (testerRevisions > this.maxTesterRevisions) {
           this.transitionTask(testerTask, "blocked");
-          this.emit({
+          this.emitEvent({
             ts: new Date().toISOString(),
             runId,
             projectId,
@@ -525,7 +571,7 @@ export class Orchestrator {
         reviewerRevisions++;
         if (reviewerRevisions > this.maxReviewerRevisions) {
           this.transitionTask(reviewerTask, "blocked");
-          this.emit({
+          this.emitEvent({
             ts: new Date().toISOString(),
             runId,
             projectId,
@@ -576,7 +622,7 @@ export class Orchestrator {
       // Developer failed — block the pipeline
       if (role === "developer" && refreshed.status === "failed") {
         this.transitionTask(developerTask, "blocked");
-        this.emit({
+        this.emitEvent({
           ts: new Date().toISOString(),
           runId,
           projectId,
@@ -591,7 +637,7 @@ export class Orchestrator {
       // Architect failed — block the pipeline
       if (role === "architect" && refreshed.status === "failed") {
         this.transitionTask(architectTask, "blocked");
-        this.emit({
+        this.emitEvent({
           ts: new Date().toISOString(),
           runId,
           projectId,
@@ -604,7 +650,7 @@ export class Orchestrator {
       }
 
       // Unexpected state
-      this.emit({
+      this.emitEvent({
         ts: new Date().toISOString(),
         runId,
         projectId,
@@ -984,8 +1030,9 @@ export class Orchestrator {
     projectId: ProjectId,
     errorMessage?: string,
   ): PipelineResult {
-    // Attempt rollback on fatal failures if git is available
-    if ((status === "failed" || status === "cancelled" || status === "timeout") && this.git) {
+    // Attempt rollback on fatal failures if git is available (idempotent).
+    if ((status === "failed" || status === "cancelled" || status === "timeout") && this.git && !this._rollbackPerformed) {
+      this._rollbackPerformed = true;
       try {
         const handle = this.workspaces.get(projectId);
         const checkpoints = this.git.listCheckpoints(handle.root);
@@ -995,42 +1042,110 @@ export class Orchestrator {
           this.git.run(handle.root, ["clean", "-fd"]);
           this.git.rollbackTo(handle.root, checkpoints[0]!.sha);
         }
-      } catch {
-        // Rollback failure is non-fatal — the pipeline status is what matters
+      } catch (err) {
+        // SAFETY: Non-critical side-effect — git rollback failure does not affect
+        // the pipeline status. The workspace may be dirty but the pipeline result
+        // is what matters.
+        console.warn(
+          "[orchestrator] git rollback failed",
+          { runId: this._currentPipelineRunId, error: err instanceof Error ? err.message : String(err) },
+        );
       }
     }
 
-    // --- Update pipeline run persistence ----------------------------------
-    if (this._currentPipelineRunId) {
-      const now = new Date().toISOString();
-      const existing = this.storage.pipelineRuns.get(this._currentPipelineRunId);
-      if (existing) {
-        const finishedAt = now;
-        const durationMs = new Date(now).getTime() - new Date(existing.createdAt).getTime();
-        try {
-          this.storage.pipelineRuns.update({
-            ...existing,
-            status,
-            errorMessage: errorMessage ?? existing.errorMessage,
-            finishedAt,
-            durationMs,
-          });
-        } catch {
-          /* persistence best-effort */
-        }
+    // --- Update pipeline run persistence (centralized choke-point) -----------
+    try {
+      this.updateStatus(status, errorMessage);
+    } catch (err) {
+      // SAFETY: TerminalStateError means the pipeline is already in a terminal
+      // state (race between cancel and completion). This is expected and
+      // idempotent — the first writer wins.
+      if (!(err instanceof TerminalStateError)) {
+        throw err;
       }
-      this._currentPipelineRunId = null;
     }
 
     return { status, taskId, projectId, errorMessage };
   }
 
+  /**
+   * Single choke-point for pipeline_runs.status writes. Performs a read-then-
+   * write with an optimistic check: if the current status is already terminal,
+   * the update is rejected with a TerminalStateError. Terminal event emission
+   * is deduplicated per (runId, eventType).
+   */
+  private updateStatus(status: PipelineStatus, errorMessage?: string): void {
+    const runId = this._currentPipelineRunId;
+    if (!runId) return;
+
+    const existing = this.storage.pipelineRuns.get(runId);
+    if (!existing) return;
+
+    // If already terminal, reject the update — no overwrite.
+    const TERMINAL: ReadonlySet<string> = new Set(["completed", "failed", "cancelled", "timeout"]);
+    if (TERMINAL.has(existing.status)) {
+      throw new TerminalStateError({
+        runId,
+        currentStatus: existing.status,
+        attemptedStatus: status,
+      });
+    }
+
+    const now = new Date().toISOString();
+    const finishedAt = now;
+    const durationMs = new Date(now).getTime() - new Date(existing.createdAt).getTime();
+    try {
+      this.storage.pipelineRuns.update({
+        ...existing,
+        status,
+        errorMessage: errorMessage ?? existing.errorMessage,
+        finishedAt,
+        durationMs,
+      });
+    } catch (err) {
+      // SAFETY: Non-critical side-effect — the in-memory pipeline state is
+      // authoritative; persistence failure is logged but does not crash.
+      console.warn(
+        "[orchestrator] failed to persist pipeline status update",
+        { runId, status, error: err instanceof Error ? err.message : String(err) },
+      );
+    }
+    this._currentPipelineRunId = null;
+  }
+
   private emit(event: Record<string, unknown>): void {
     try {
       this.storage.events.append(event as never);
-    } catch {
-      /* event persistence is best-effort */
+    } catch (err) {
+      // SAFETY: Non-critical side-effect — event persistence is best-effort.
+      // Observability via console.warn but not fatal to the pipeline.
+      console.warn(
+        "[orchestrator] event persistence failed",
+        { type: event.type, error: err instanceof Error ? err.message : String(err) },
+      );
     }
+  }
+
+  /**
+   * Emit an event with deduplication for terminal events. A second
+   * `run.completed`, `run.failed`, or `run.cancelled` for the same runId
+   * is suppressed (no-op) to prevent duplicate terminal events on the SSE
+   * stream.
+   */
+  private emitEvent(event: Record<string, unknown>): void {
+    const isTerminal =
+      event.type === "run.completed" ||
+      event.type === "run.failed" ||
+      event.type === "run.cancelled";
+    if (isTerminal) {
+      const runId = String(event.runId ?? "");
+      const key = `${runId}:${event.type}`;
+      if (this._emittedTerminalEvents.has(key)) {
+        return; // deduplicate
+      }
+      this._emittedTerminalEvents.add(key);
+    }
+    this.emit(event);
   }
 
   private emitArtifact(artifact: Artifact, role: string): void {
@@ -1105,7 +1220,7 @@ export class Orchestrator {
       } as never);
     }
 
-    // Attempt to roll back workspace to last checkpoint
+    // Attempt to roll back workspace to last checkpoint (idempotent).
     if (this.git) {
       try {
         const handle = this.workspaces.get(projectId);
@@ -1115,8 +1230,14 @@ export class Orchestrator {
           this.git.run(handle.root, ["clean", "-fd"]);
           this.git.rollbackTo(handle.root, checkpoints[0]!.sha);
         }
-      } catch {
-        // Rollback failure is non-fatal
+      } catch (err) {
+        // SAFETY: Non-critical side-effect — rollback failure during recovery
+        // does not prevent interrupted executions from being marked. The workspace
+        // may be dirty but the pipeline state is correct.
+        console.warn(
+          "[orchestrator] recovery rollback failed",
+          { projectId, error: err instanceof Error ? err.message : String(err) },
+        );
       }
     }
 

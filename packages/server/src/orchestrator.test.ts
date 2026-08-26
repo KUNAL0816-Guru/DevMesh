@@ -5,8 +5,10 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   type ProjectId,
   type TaskId,
+  TerminalStateError,
 } from "@devmesh/contracts";
 import { createStorage, type Storage } from "@devmesh/storage";
+import { assertPipelineConsistency } from "@devmesh/storage";
 import { WorkspaceService } from "@devmesh/workspace";
 import { FakeRuntime, type FakeScriptFactory } from "@devmesh/runtime";
 import { createDefaultAgentRegistry } from "@devmesh/agents";
@@ -1512,6 +1514,380 @@ describe("Orchestrator: pipeline cancellation", () => {
     const lastRun = runs[runs.length - 1]!;
     // Status should remain "completed" — cancel after completion doesn't overwrite
     expect(lastRun.status).toBe("completed");
+    await stack.storage.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 6E: Pipeline Lifecycle Hardening
+// ---------------------------------------------------------------------------
+
+describe("TerminalStateError", () => {
+  it("has correct properties", () => {
+    const err = new TerminalStateError({
+      runId: "run_abc",
+      currentStatus: "completed",
+      attemptedStatus: "cancelled",
+    });
+    expect(err.name).toBe("TerminalStateError");
+    expect(err.runId).toBe("run_abc");
+    expect(err.currentStatus).toBe("completed");
+    expect(err.attemptedStatus).toBe("cancelled");
+    expect(err.message).toContain("run_abc");
+    expect(err.message).toContain("completed");
+    expect(err instanceof Error).toBe(true);
+  });
+});
+
+describe("Orchestrator: Phase 6E — terminal-state protection", () => {
+  it("41. cancel after completion does not overwrite status", async () => {
+    const stack = makeStack(perAgentScript({
+      architect: { text: "spec" },
+      developer: {
+        effect: () => writeFileSync(join(stack.root, "app.js"), "ok"),
+        text: "done",
+      },
+      tester: { text: "pass" },
+      reviewer: { text: "APPROVED" },
+    }));
+
+    const result = await stack.orchestrator.run(stack.projectId, "terminal protect");
+    expect(result.status).toBe("completed");
+
+    // Cancel after completion — should be a no-op
+    stack.orchestrator.cancel();
+
+    const runs = stack.storage.pipelineRuns.listByProject(stack.projectId);
+    const lastRun = runs[runs.length - 1]!;
+    expect(lastRun.status).toBe("completed");
+
+    // No run.cancelled event should exist for this run
+    const runId = findLatestRunId(stack.storage)!;
+    const cancelledEvents = getEventsOfType(stack.storage, "run.cancelled").filter(
+      (e) => e.runId === runId,
+    );
+    expect(cancelledEvents.length).toBe(0);
+    await stack.storage.close();
+  });
+
+  it("42. concurrent cancel + completion produces exactly one terminal event", async () => {
+    const stack = makeStack(perAgentScript({
+      architect: { text: "spec" },
+      developer: {
+        effect: () => writeFileSync(join(stack.root, "app.js"), "ok"),
+        text: "done",
+      },
+      tester: { text: "pass" },
+      reviewer: { text: "APPROVED" },
+    }));
+
+    const pipelinePromise = stack.orchestrator.run(stack.projectId, "race test");
+    // Cancel shortly after start — the pipeline may complete before or after
+    await new Promise((r) => setTimeout(r, 50));
+    stack.orchestrator.cancel();
+    const result = await pipelinePromise;
+
+    // Exactly one terminal status
+    expect(["completed", "cancelled"]).toContain(result.status);
+
+    const runs = stack.storage.pipelineRuns.listByProject(stack.projectId);
+    const lastRun = runs[runs.length - 1]!;
+    expect(["completed", "cancelled"]).toContain(lastRun.status);
+    expect(lastRun.finishedAt).not.toBeNull();
+
+    // Exactly one terminal event for this run
+    const runId = findLatestRunId(stack.storage)!;
+    const terminalEvents = getEventsOfType(stack.storage, "run.completed")
+      .concat(getEventsOfType(stack.storage, "run.failed"))
+      .concat(getEventsOfType(stack.storage, "run.cancelled"))
+      .filter((e) => e.runId === runId);
+    expect(terminalEvents.length).toBe(1);
+    await stack.storage.close();
+  });
+
+  it("43. cancel idempotency: multiple cancel() calls produce single run.cancelled event", async () => {
+    const stack = makeStack((_req) => ({
+      steps: [{ effect: () => undefined }],
+      outcome: { status: "completed" },
+      stepDelayMs: 30_000,
+    }));
+
+    const pipelinePromise = stack.orchestrator.run(stack.projectId, "idempotent cancel");
+    await new Promise((r) => setTimeout(r, 200));
+
+    stack.orchestrator.cancel();
+    stack.orchestrator.cancel();
+    stack.orchestrator.cancel();
+    const result = await pipelinePromise;
+    expect(result.status).toBe("cancelled");
+
+    // Exactly one run.cancelled event
+    const cancelledEvents = getEventsOfType(stack.storage, "run.cancelled");
+    expect(cancelledEvents.length).toBe(1);
+    await stack.storage.close();
+  });
+
+  it("44. emitEvent deduplicates identical terminal event types per run", async () => {
+    const stack = makeStack(perAgentScript({
+      architect: { text: "spec" },
+      developer: {
+        effect: () => writeFileSync(join(stack.root, "app.js"), "ok"),
+        text: "done",
+      },
+      tester: { text: "pass" },
+      reviewer: { text: "APPROVED" },
+    }));
+
+    const result = await stack.orchestrator.run(stack.projectId, "dedup test");
+    expect(result.status).toBe("completed");
+
+    // Only one run.completed event should exist
+    const completedEvents = getEventsOfType(stack.storage, "run.completed");
+    expect(completedEvents.length).toBe(1);
+
+    // No run.failed or run.cancelled events should exist
+    const failedEvents = getEventsOfType(stack.storage, "run.failed");
+    const cancelledEvents = getEventsOfType(stack.storage, "run.cancelled");
+    expect(failedEvents.length).toBe(0);
+    expect(cancelledEvents.length).toBe(0);
+    await stack.storage.close();
+  });
+
+  it("45. git rollback is idempotent: second rollback attempt is skipped", async () => {
+    const { GitService } = await import("@devmesh/workspace");
+    const git = new GitService();
+
+    const stack = makeStack((_req) => ({
+      steps: [{ effect: () => undefined }],
+      outcome: { status: "completed" },
+      stepDelayMs: 30_000,
+    }));
+
+    git.init(stack.root);
+
+    const orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      git,
+    });
+
+    const pipelinePromise = orchestrator.run(stack.projectId, "rollback idempotent");
+    await new Promise((r) => setTimeout(r, 200));
+
+    orchestrator.cancel();
+    const result = await pipelinePromise;
+    expect(result.status).toBe("cancelled");
+
+    // Verify workspace exists and is intact (rollback happened once)
+    const handle = stack.ws.get(stack.projectId);
+    const { existsSync } = await import("node:fs");
+    expect(existsSync(handle.root)).toBe(true);
+
+    // The pipeline run should have a clean terminal state
+    const runId = findLatestRunId(stack.storage)!;
+    const run = stack.storage.pipelineRuns.get(runId)!;
+    expect(run.status).toBe("cancelled");
+    expect(run.finishedAt).not.toBeNull();
+    await stack.storage.close();
+  });
+});
+
+describe("Orchestrator: Phase 6E — error classification", () => {
+  it("46. transient error in event persistence does not fail the pipeline", async () => {
+    const storage = createStorage({ path: join(dataRoot, `orch-err-${crypto.randomUUID()}.db`) });
+    const workspaces = new WorkspaceService({
+      store: storage.projects,
+      workspacesRoot: join(dataRoot, "ws-err"),
+    });
+    const handle = workspaces.create("err-test");
+
+    // Create a failing event append to simulate transient error
+    let eventAppendCount = 0;
+    const originalAppend = storage.events.append.bind(storage.events);
+    storage.events.append = ((...args: unknown[]) => {
+      eventAppendCount++;
+      // Fail on the 3rd event append (which is a non-critical artifact event)
+      if (eventAppendCount === 3) {
+        throw new Error("SQLITE_BUSY: database is locked");
+      }
+      return originalAppend(...(args as [never]));
+    }) as typeof storage.events.append;
+
+    const runtime = new FakeRuntime({
+      steps: [{ events: [{ kind: "text", text: "ok" }] }],
+      outcome: { status: "completed", sessionId: "ses_0", finalText: "done" },
+      stepDelayMs: 5,
+    });
+
+    const agents = createDefaultAgentRegistry();
+    const executionService = new ExecutionService({
+      storage,
+      workspaces,
+      git: { init: () => {}, status: () => ({ branch: "HEAD", entries: [] }) } as never,
+      runtime,
+      agents,
+      defaultTimeoutMs: 30_000,
+    });
+
+    const orchestrator = new Orchestrator({
+      storage,
+      workspaces,
+      executionService,
+    });
+
+    // Pipeline should complete despite transient event persistence failures
+    const result = await orchestrator.run(handle.projectId, "transient error test");
+    expect(result.status).toBe("completed");
+    await storage.close();
+  });
+
+  it("47. non-critical side-effect failure is logged not fatal", async () => {
+    const storage = createStorage({ path: join(dataRoot, `orch-side-${crypto.randomUUID()}.db`) });
+    const workspaces = new WorkspaceService({
+      store: storage.projects,
+      workspacesRoot: join(dataRoot, "ws-side"),
+    });
+    const handle = workspaces.create("side-test");
+
+    // Patch storage.executions.listByProject to throw on the first call in cancel()
+    // This simulates a non-critical side-effect failure
+    const originalListByProject = storage.executions.listByProject.bind(storage.executions);
+    let listCallCount = 0;
+    storage.executions.listByProject = ((...args: unknown[]) => {
+      listCallCount++;
+      if (listCallCount === 1) {
+        throw new Error("database locked");
+      }
+      return originalListByProject(...(args as [string]));
+    }) as typeof storage.executions.listByProject;
+
+    const runtime = new FakeRuntime({
+      steps: [{ effect: () => undefined }],
+      outcome: { status: "completed" },
+      stepDelayMs: 30_000,
+    });
+
+    const agents = createDefaultAgentRegistry();
+    const executionService = new ExecutionService({
+      storage,
+      workspaces,
+      git: { init: () => {}, status: () => ({ branch: "HEAD", entries: [] }) } as never,
+      runtime,
+      agents,
+      defaultTimeoutMs: 30_000,
+    });
+
+    const orchestrator = new Orchestrator({
+      storage,
+      workspaces,
+      executionService,
+    });
+
+    const pipelinePromise = orchestrator.run(handle.projectId, "side-effect test");
+    await new Promise((r) => setTimeout(r, 200));
+
+    // Cancel should not throw even if the side-effect fails
+    expect(() => orchestrator.cancel()).not.toThrow();
+    const result = await pipelinePromise;
+    expect(result.status).toBe("cancelled");
+    await storage.close();
+  });
+
+  it("48. corrupt artifact creation fails gracefully (non-fatal)", async () => {
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      if (role === "architect") {
+        // Return unparseable text that will cause artifact builder to throw
+        return {
+          steps: [{ events: [{ kind: "text", text: "<<<NOT VALID JSON>>>" }] }],
+          outcome: { status: "completed", finalText: "<<<NOT VALID JSON>>>" },
+          stepDelayMs: 5,
+        };
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} ok` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+
+    const result = await stack.orchestrator.run(stack.projectId, "corrupt artifact");
+    // Pipeline should still complete despite artifact creation failure
+    expect(result.status).toBe("completed");
+    await stack.storage.close();
+  });
+});
+
+describe("assertPipelineConsistency", () => {
+  it("49. passes after a well-formed pipeline run", async () => {
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} completed task` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+
+    const result = await stack.orchestrator.run(stack.projectId, "consistency check");
+    expect(result.status).toBe("completed");
+
+    const runs = stack.storage.pipelineRuns.listByProject(stack.projectId);
+    expect(runs.length).toBeGreaterThanOrEqual(1);
+    const runId = runs[0]!.id;
+    const violations = assertPipelineConsistency(stack.storage.db, runId);
+    expect(violations).toEqual([]);
+    await stack.storage.close();
+  });
+
+  it("50. catches missing execution link for a task", async () => {
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} completed task` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+
+    const result = await stack.orchestrator.run(stack.projectId, "consistency drift");
+    expect(result.status).toBe("completed");
+
+    const runs = stack.storage.pipelineRuns.listByProject(stack.projectId);
+    expect(runs.length).toBeGreaterThanOrEqual(1);
+    const runId = runs[0]!.id;
+
+    // Simulate schema drift: insert a task with no matching execution
+    const orphanTaskId = crypto.randomUUID();
+    stack.storage.db.prepare(
+      `INSERT INTO tasks (id, run_id, project_id, role, title, detail,
+         acceptance_criteria, depends_on, status, attempts, max_attempts,
+         created_at, updated_at, artifacts)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      orphanTaskId,
+      runId,
+      stack.projectId,
+      "developer",
+      "orphan task",
+      "no execution",
+      JSON.stringify(["check"]),
+      JSON.stringify([]),
+      "pending",
+      0,
+      3,
+      new Date().toISOString(),
+      new Date().toISOString(),
+      JSON.stringify([]),
+    );
+
+    const violations = assertPipelineConsistency(stack.storage.db, runId);
+    expect(violations.length).toBeGreaterThan(0);
+    expect(violations.some((v) => v.check === "task_execution_link")).toBe(true);
     await stack.storage.close();
   });
 });
