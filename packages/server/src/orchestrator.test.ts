@@ -2055,3 +2055,478 @@ describe("Phase 7B — pipeline stage persistence", () => {
     await stack.storage.close();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 7C: Resumable Pipelines
+// ---------------------------------------------------------------------------
+
+describe("Phase 7C — resumable pipelines", () => {
+  it("58. resume after failure skips completed stages and runs remaining", async () => {
+    let testerCallCount = 0;
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      if (role === "tester") {
+        testerCallCount++;
+        if (testerCallCount <= 2) {
+          return {
+            steps: [{ events: [{ kind: "text", text: "tests failed" }] }],
+            outcome: { status: "failed", finalText: "tests failed" },
+            stepDelayMs: 5,
+          };
+        }
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} done` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+    stack.orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      maxTesterRevisions: 1,
+    });
+
+    const result1 = await stack.orchestrator.run(stack.projectId, "resume test");
+    expect(result1.status).toBe("failed");
+
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+    const stages1 = stack.storage.stages.listByRun(runId);
+    expect(stages1).toHaveLength(4);
+    const architectStage = stages1.find((s) => s.stageRole === "architect")!;
+    expect(architectStage.status).toBe("completed");
+
+    const result2 = await stack.orchestrator.resume(runId);
+    expect(result2.status).toBe("completed");
+
+    const stages2 = stack.storage.stages.listByRun(runId);
+    expect(stages2.length).toBeGreaterThanOrEqual(5);
+    await stack.storage.close();
+  });
+
+  it("59. resume after cancellation succeeds", async () => {
+    let callCount = 0;
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      callCount++;
+      if (callCount <= 1) {
+        return {
+          steps: [{ effect: () => undefined }],
+          outcome: { status: "completed", finalText: `${role} ok` },
+          stepDelayMs: 60_000,
+        };
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} done` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+
+    const pipelinePromise = stack.orchestrator.run(stack.projectId, "cancel resume test");
+    await new Promise((r) => setTimeout(r, 200));
+    stack.orchestrator.cancel();
+    const result1 = await pipelinePromise;
+    expect(result1.status).toBe("cancelled");
+
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+
+    const result2 = await stack.orchestrator.resume(runId);
+    expect(result2.status).toBe("completed");
+
+    await stack.storage.close();
+  });
+
+  it("60. resume after timeout succeeds", async () => {
+    let callCount = 0;
+    const stack = makeStack(
+      (req) => {
+        const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+        const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+        callCount++;
+        if (callCount <= 1) {
+          return {
+            steps: [{ effect: () => undefined }],
+            outcome: { status: "completed", finalText: `${role} ok` },
+            stepDelayMs: 600_000,
+          };
+        }
+        return {
+          steps: [{ events: [{ kind: "text", text: `${role} done` }] }],
+          outcome: { status: "completed", finalText: `${role} ok` },
+          stepDelayMs: 5,
+        };
+      },
+      { execTimeoutMs: 500 },
+    );
+
+    const result1 = await stack.orchestrator.run(stack.projectId, "timeout resume test");
+    expect(result1.status).toBe("timeout");
+
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+
+    const result2 = await stack.orchestrator.resume(runId);
+    expect(result2.status).toBe("completed");
+
+    await stack.storage.close();
+  });
+
+  it("61. resume rejects running pipeline (409)", async () => {
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      return {
+        steps: [{ effect: () => undefined }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 60_000,
+      };
+    });
+
+    const pipelinePromise = stack.orchestrator.run(stack.projectId, "running resume test");
+    await new Promise((r) => setTimeout(r, 200));
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+
+    await expect(stack.orchestrator.resume(runId))
+      .rejects.toThrow(/terminal state/);
+
+    stack.orchestrator.cancel();
+    await pipelinePromise;
+    await stack.storage.close();
+  });
+
+  it("62. resume rejects completed pipeline (409)", async () => {
+    const stack = makeStack();
+
+    const result = await stack.orchestrator.run(stack.projectId, "completed resume test");
+    expect(result.status).toBe("completed");
+
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+
+    await expect(stack.orchestrator.resume(runId))
+      .rejects.toThrow(/terminal state/);
+
+    await stack.storage.close();
+  });
+
+  it("63. task cards are created only for remaining stages", async () => {
+    let devCallCount = 0;
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      if (role === "developer") {
+        devCallCount++;
+        if (devCallCount <= 1) {
+          return {
+            steps: [{ events: [{ kind: "text", text: "dev failed" }] }],
+            outcome: { status: "failed", finalText: "dev failed" },
+            stepDelayMs: 5,
+          };
+        }
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} done` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+
+    const result1 = await stack.orchestrator.run(stack.projectId, "task card test");
+    expect(result1.status).toBe("failed");
+
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+    const tasksBefore = stack.storage.tasks.listByRun(runId as never);
+    expect(tasksBefore.length).toBe(4);
+
+    const result2 = await stack.orchestrator.resume(runId);
+    expect(result2.status).toBe("completed");
+
+    const tasksAfter = stack.storage.tasks.listByRun(runId as never);
+    expect(tasksAfter.length).toBe(7);
+
+    const newTasks = tasksAfter.slice(4);
+    expect(newTasks.map((t) => t.role)).toEqual(["developer", "tester", "reviewer"]);
+
+    await stack.storage.close();
+  });
+
+  it("64. context entry records resume origin", async () => {
+    let devCallCount = 0;
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      if (role === "developer") {
+        devCallCount++;
+        if (devCallCount <= 1) {
+          return {
+            steps: [{ events: [{ kind: "text", text: "dev failed" }] }],
+            outcome: { status: "failed", finalText: "dev failed" },
+            stepDelayMs: 5,
+          };
+        }
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} done` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+
+    const result1 = await stack.orchestrator.run(stack.projectId, "context resume test");
+    expect(result1.status).toBe("failed");
+
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+
+    const result2 = await stack.orchestrator.resume(runId);
+    expect(result2.status).toBe("completed");
+
+    const contextEntries = stack.storage.context.latestByKey("decision");
+    expect(contextEntries.size).toBe(1);
+    const entry = contextEntries.get("resumed_from")!;
+    expect(entry.namespace).toBe("decision");
+    expect(entry.key).toBe("resumed_from");
+    const value = entry.value as { runId: string; stageIndex: number };
+    expect(value.runId).toBe(runId);
+    expect(value.stageIndex).toBe(1);
+
+    await stack.storage.close();
+  });
+
+  it("65. resume emits run.started event", async () => {
+    let devCallCount = 0;
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      if (role === "developer") {
+        devCallCount++;
+        if (devCallCount <= 1) {
+          return {
+            steps: [{ events: [{ kind: "text", text: "dev failed" }] }],
+            outcome: { status: "failed", finalText: "dev failed" },
+            stepDelayMs: 5,
+          };
+        }
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} done` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+
+    const result1 = await stack.orchestrator.run(stack.projectId, "event resume test");
+    expect(result1.status).toBe("failed");
+
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+    const eventsBefore = getEventsOfType(stack.storage, "run.started").length;
+
+    const result2 = await stack.orchestrator.resume(runId);
+    expect(result2.status).toBe("completed");
+
+    const eventsAfter = getEventsOfType(stack.storage, "run.started");
+    expect(eventsAfter.length).toBe(eventsBefore + 1);
+
+    await stack.storage.close();
+  });
+
+  it("66. resume is idempotent — second resume on now-completed run rejects", async () => {
+    let devCallCount = 0;
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      if (role === "developer") {
+        devCallCount++;
+        if (devCallCount <= 1) {
+          return {
+            steps: [{ events: [{ kind: "text", text: "dev failed" }] }],
+            outcome: { status: "failed", finalText: "dev failed" },
+            stepDelayMs: 5,
+          };
+        }
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} done` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+
+    const result1 = await stack.orchestrator.run(stack.projectId, "idempotent resume test");
+    expect(result1.status).toBe("failed");
+
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+
+    const result2 = await stack.orchestrator.resume(runId);
+    expect(result2.status).toBe("completed");
+
+    await expect(stack.orchestrator.resume(runId))
+      .rejects.toThrow(/terminal state/);
+
+    await stack.storage.close();
+  });
+
+  it("67. resumed pipeline supports revision loops", async () => {
+    let devCallCount = 0;
+    let testerCallCount = 0;
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      if (role === "developer") {
+        devCallCount++;
+        if (devCallCount <= 1) {
+          return {
+            steps: [{ events: [{ kind: "text", text: "dev failed" }] }],
+            outcome: { status: "failed", finalText: "dev failed" },
+            stepDelayMs: 5,
+          };
+        }
+      }
+      if (role === "tester") {
+        testerCallCount++;
+        if (testerCallCount <= 1) {
+          return {
+            steps: [{ events: [{ kind: "text", text: "tests failed" }] }],
+            outcome: { status: "failed", finalText: "tests failed" },
+            stepDelayMs: 5,
+          };
+        }
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} done` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+
+    const result1 = await stack.orchestrator.run(stack.projectId, "revision resume test");
+    expect(result1.status).toBe("failed");
+
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+
+    const result2 = await stack.orchestrator.resume(runId);
+    expect(result2.status).toBe("completed");
+
+    await stack.storage.close();
+  });
+
+  it("68. resumed pipeline supports cancellation", async () => {
+    const stack = makeStack(
+      () => {
+        return {
+          steps: [{ effect: () => undefined }],
+          outcome: { status: "completed", finalText: "ok" },
+          stepDelayMs: 60_000,
+        };
+      },
+      { execTimeoutMs: 500 },
+    );
+
+    const pipelinePromise = stack.orchestrator.run(stack.projectId, "cancel resumed test");
+    await new Promise((r) => setTimeout(r, 200));
+    stack.orchestrator.cancel();
+    const result1 = await pipelinePromise;
+    expect(result1.status).toBe("cancelled");
+
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+
+    const resumePromise = stack.orchestrator.resume(runId);
+    await new Promise((r) => setTimeout(r, 200));
+    stack.orchestrator.cancel();
+    const result2 = await resumePromise;
+    expect(result2.status).toBe("cancelled");
+
+    await stack.storage.close();
+  });
+
+  it("69. pipeline_runs.status transitions back to running then terminal", async () => {
+    let testerCallCount = 0;
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      if (role === "tester") {
+        testerCallCount++;
+        if (testerCallCount <= 2) {
+          return {
+            steps: [{ events: [{ kind: "text", text: "tests failed" }] }],
+            outcome: { status: "failed", finalText: "tests failed" },
+            stepDelayMs: 5,
+          };
+        }
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} done` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+
+    const result1 = await stack.orchestrator.run(stack.projectId, "status transition test");
+    expect(result1.status).toBe("failed");
+
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+    const rec1 = stack.storage.pipelineRuns.get(runId);
+    expect(rec1!.status).toBe("failed");
+
+    const result2 = await stack.orchestrator.resume(runId);
+    expect(result2.status).toBe("completed");
+
+    const rec2 = stack.storage.pipelineRuns.get(runId);
+    expect(rec2!.status).toBe("completed");
+    expect(rec2!.finishedAt).not.toBeNull();
+    expect(rec2!.durationMs).not.toBeNull();
+
+    await stack.storage.close();
+  });
+
+  it("70. resume skips all completed stages when all but last are done", async () => {
+    let reviewerCallCount = 0;
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+      if (role === "reviewer") {
+        reviewerCallCount++;
+        if (reviewerCallCount <= 1) {
+          return {
+            steps: [{ events: [{ kind: "text", text: "reviewer rejected" }] }],
+            outcome: { status: "failed", finalText: "reviewer rejected" },
+            stepDelayMs: 5,
+          };
+        }
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} done` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+    stack.orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      maxReviewerRevisions: 0,
+    });
+
+    const result1 = await stack.orchestrator.run(stack.projectId, "last stage resume test");
+    expect(result1.status).toBe("failed");
+
+    const runId = stack.storage.pipelineRuns.listByProject(stack.projectId)[0]!.id;
+    const stages1 = stack.storage.stages.listByRun(runId);
+    const completedStages = stages1.filter((s) => s.status === "completed");
+    expect(completedStages.length).toBe(3);
+
+    const result2 = await stack.orchestrator.resume(runId);
+    expect(result2.status).toBe("completed");
+
+    const stages2 = stack.storage.stages.listByRun(runId);
+    expect(stages2.length).toBe(5);
+
+    const newReviewerStage = stages2.find(
+      (s) => s.stageRole === "reviewer" && s.status === "completed" && s.startedAt !== null,
+    );
+    expect(newReviewerStage).toBeDefined();
+
+    await stack.storage.close();
+  });
+});

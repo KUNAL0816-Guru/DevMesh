@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -978,6 +978,253 @@ describe("context project ownership enforcement", () => {
       payload: { namespace: "spec", key: "k", value: "v", createdBy: "system" },
     });
     expect(res4.statusCode).toBe(404);
+
+    await app.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 7C: POST /pipelines/:runId/resume
+// ---------------------------------------------------------------------------
+
+describe("POST /pipelines/:runId/resume", () => {
+  function seedFailedPipeline(storage: Storage) {
+    const projectId = newProjectId();
+    const runId = newRunId();
+    const now = "2026-08-01T10:00:00.000Z";
+
+    storage.projects.insert({
+      id: projectId,
+      name: "resume-test",
+      rootPath: "/tmp/resume-test",
+      createdAt: now,
+    });
+
+    // Ensure the workspace directory exists on disk so resume can access it.
+    mkdirSync("/tmp/resume-test", { recursive: true });
+
+    storage.pipelineRuns.insert({
+      id: runId,
+      projectId,
+      status: "failed",
+      goal: "implement feature X",
+      errorMessage: "tester failed",
+      createdAt: now,
+      finishedAt: now,
+      durationMs: 5000,
+    });
+
+    return { projectId, runId };
+  }
+
+  function seedRunningPipeline(storage: Storage) {
+    const projectId = newProjectId();
+    const runId = newRunId();
+    const now = "2026-08-01T10:00:00.000Z";
+
+    storage.projects.insert({
+      id: projectId,
+      name: "running-test",
+      rootPath: "/tmp/running-test",
+      createdAt: now,
+    });
+
+    storage.pipelineRuns.insert({
+      id: runId,
+      projectId,
+      status: "running",
+      goal: "implement feature Y",
+      errorMessage: null,
+      createdAt: now,
+      finishedAt: null,
+      durationMs: null,
+    });
+
+    return { projectId, runId };
+  }
+
+  function seedCompletedPipeline(storage: Storage) {
+    const projectId = newProjectId();
+    const runId = newRunId();
+    const now = "2026-08-01T10:00:00.000Z";
+
+    storage.projects.insert({
+      id: projectId,
+      name: "completed-test",
+      rootPath: "/tmp/completed-test",
+      createdAt: now,
+    });
+
+    storage.pipelineRuns.insert({
+      id: runId,
+      projectId,
+      status: "completed",
+      goal: "implement feature Z",
+      errorMessage: null,
+      createdAt: now,
+      finishedAt: now,
+      durationMs: 3000,
+    });
+
+    return { projectId, runId };
+  }
+
+  it("returns 202 for valid resume of failed pipeline", async () => {
+    const config = testConfig();
+    const storage = createStorage({ path: join(config.dataRoot, "test.db") });
+    const workspaces = new WorkspaceService({
+      store: storage.projects,
+      workspacesRoot: join(config.dataRoot, "workspaces"),
+    });
+    const runtime = new FakeRuntime({
+      steps: [{ events: [{ kind: "text", text: "done" }] }],
+      outcome: { status: "completed", sessionId: "ses_0", finalText: "ok" },
+      stepDelayMs: 5,
+    });
+    const app = buildApp({
+      config: { ...config, runtime: "opencode" } as typeof config,
+      storage,
+      workspaces,
+      runtime,
+      agents: createDefaultAgentRegistry(),
+    });
+
+    const { projectId, runId } = seedFailedPipeline(storage);
+
+    // Create stages for the pipeline
+    const stageRoles = ["architect", "developer", "tester", "reviewer"];
+    for (let i = 0; i < stageRoles.length; i++) {
+      storage.stages.insert({
+        id: crypto.randomUUID(),
+        runId,
+        projectId,
+        stageIndex: i,
+        stageRole: stageRoles[i]!,
+        status: i < 3 ? "completed" : "failed",
+        executionId: null,
+        taskId: null,
+        startedAt: i < 3 ? "2026-08-01T10:00:01.000Z" : "2026-08-01T10:00:04.000Z",
+        completedAt: i < 3 ? "2026-08-01T10:00:02.000Z" : null,
+        createdAt: "2026-08-01T10:00:00.000Z",
+      });
+    }
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/pipelines/${runId}/resume`,
+    });
+    expect(res.statusCode).toBe(202);
+    const body = res.json() as { pipeline: { runId: string; status: string; goal: string } };
+    expect(body.pipeline).toBeDefined();
+    expect(body.pipeline.runId).toBe(runId);
+    expect(body.pipeline.status).toBe("running");
+    expect(body.pipeline.goal).toBe("implement feature X");
+
+    await app.close();
+  });
+
+  it("returns 404 for missing pipeline", async () => {
+    const { app } = await buildStack();
+    const missingId = "00000000-0000-4000-8000-000000000000";
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/pipelines/${missingId}/resume`,
+    });
+    expect(res.statusCode).toBe(404);
+    const body = res.json() as { error: { code: string } };
+    expect(body.error.code).toBe("pipeline/not-found");
+
+    await app.close();
+  });
+
+  it("returns 409 for running pipeline", async () => {
+    const config = testConfig();
+    const storage = createStorage({ path: join(config.dataRoot, "test.db") });
+    const workspaces = new WorkspaceService({
+      store: storage.projects,
+      workspacesRoot: join(config.dataRoot, "workspaces"),
+    });
+    const runtime = new FakeRuntime({
+      steps: [{ effect: () => undefined }],
+      outcome: { status: "completed", sessionId: "ses_0", finalText: "ok" },
+      stepDelayMs: 60_000,
+    });
+    const app = buildApp({
+      config: { ...config, runtime: "opencode" } as typeof config,
+      storage,
+      workspaces,
+      runtime,
+      agents: createDefaultAgentRegistry(),
+    });
+
+    const { runId } = seedRunningPipeline(storage);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/pipelines/${runId}/resume`,
+    });
+    expect(res.statusCode).toBe(409);
+    const body = res.json() as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("pipeline/not-resumable");
+    expect(body.error.message).toContain("running");
+
+    await app.close();
+  });
+
+  it("returns 409 for completed pipeline", async () => {
+    const config = testConfig();
+    const storage = createStorage({ path: join(config.dataRoot, "test.db") });
+    const workspaces = new WorkspaceService({
+      store: storage.projects,
+      workspacesRoot: join(config.dataRoot, "workspaces"),
+    });
+    const app = buildApp({
+      config: { ...config, runtime: "opencode" } as typeof config,
+      storage,
+      workspaces,
+      agents: createDefaultAgentRegistry(),
+    });
+
+    const { runId } = seedCompletedPipeline(storage);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/pipelines/${runId}/resume`,
+    });
+    expect(res.statusCode).toBe(409);
+    const body = res.json() as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("pipeline/not-resumable");
+    expect(body.error.message).toContain("completed");
+
+    await app.close();
+  });
+
+  it("returns 503 when no runtime is wired", async () => {
+    const config = testConfig();
+    const storage = createStorage({ path: join(config.dataRoot, "test.db") });
+    const workspaces = new WorkspaceService({
+      store: storage.projects,
+      workspacesRoot: join(config.dataRoot, "workspaces"),
+    });
+    const app = buildApp({
+      config: { ...config, runtime: "opencode" } as typeof config,
+      storage,
+      workspaces,
+      agents: createDefaultAgentRegistry(),
+    });
+
+    // Seed a resumable (failed) pipeline — resume validation passes, but no
+    // runtime is wired to actually perform the resume.
+    const { runId } = seedFailedPipeline(storage);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/pipelines/${runId}/resume`,
+    });
+    expect(res.statusCode).toBe(503);
+    const body = res.json() as { error: { code: string } };
+    expect(body.error.code).toBe("runtime/not-configured");
 
     await app.close();
   });

@@ -427,6 +427,87 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
     return reply.status(202).send({ pipeline: updated });
   });
 
+  // -- pipeline resume ------------------------------------------------------
+  app.post("/pipelines/:runId/resume", async (req, reply) => {
+    const params = z.strictObject({ runId: z.string() }).safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid run id" },
+      });
+    }
+    const parsedId = runIdSchema.safeParse(params.data.runId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    const rec = opts.storage.pipelineRuns.get(parsedId.data);
+    if (!rec) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    // Already running or completed — 409 Conflict.
+    if (rec.status === "running" || rec.status === "completed") {
+      return reply.status(409).send({
+        error: { code: "pipeline/not-resumable", message: `pipeline is ${rec.status}` },
+      });
+    }
+    // Resumable (failed/cancelled/timeout) — a runtime is required to perform
+    // the actual resume.
+    if (!executions.configured) {
+      return reply.status(503).send({
+        error: { code: "runtime/not-configured", message: "no agent runtime wired" },
+      });
+    }
+    const orchestrator = new Orchestrator({
+      storage: opts.storage,
+      workspaces: opts.workspaces,
+      executionService: executions,
+    });
+    try {
+      const result = orchestrator.resume(parsedId.data);
+      const runningPipelineRunId: string | null = parsedId.data;
+      void result
+        .then(() => { /* terminal */ })
+        .catch(() => { /* terminal */ })
+        .finally(() => {
+          if (runningPipelineRunId) runningPipelines.delete(runningPipelineRunId);
+        });
+      runningPipelines.set(parsedId.data, orchestrator);
+      const pipelineRun = opts.storage.pipelineRuns.get(parsedId.data);
+      return reply.status(202).send({
+        pipeline: {
+          runId: parsedId.data,
+          projectId: rec.projectId,
+          status: pipelineRun?.status ?? "running",
+          goal: rec.goal,
+          createdAt: rec.createdAt,
+        },
+      });
+    } catch (err) {
+      // TerminalStateError for "not-found" → 404, for "running/completed" → 409
+      if (err instanceof Error && err.name === "TerminalStateError") {
+        const tsErr = err as unknown as { currentStatus: string };
+        if (tsErr.currentStatus === "not-found") {
+          return reply.status(404).send({
+            error: { code: "pipeline/not-found", message: "no such pipeline run" },
+          });
+        }
+        return reply.status(409).send({
+          error: { code: "pipeline/not-resumable", message: `pipeline is ${tsErr.currentStatus}` },
+        });
+      }
+      const problem = normalizeError(err);
+      return reply.status(problem.status).send({
+        error: {
+          code: (err as { code?: string }).code ?? problem.code,
+          message: problem.message,
+        },
+      });
+    }
+  });
+
   // -- pipeline query routes (read-only) ------------------------------------
 
   // GET /projects/:projectId/pipelines

@@ -1,5 +1,6 @@
 import {
   canTransition,
+  makeContextEntry,
   makeTaskCard,
   newRunId,
   TerminalStateError,
@@ -731,6 +732,567 @@ export class Orchestrator {
       });
       return this.result("failed", card.id, projectId,
         `unexpected state for ${role}: ${refreshed.status}`);
+    }
+
+    // Should not reach here
+    return this.result("failed", taskChain[taskChain.length - 1]!.id, projectId,
+      "pipeline fell through");
+  }
+
+  /**
+   * Resume a failed, cancelled, or timed-out pipeline from the last completed
+   * stage.  Skips already-completed stages, creates new task cards for
+   * remaining stages, and runs the orchestration loop for the tail of the
+   * pipeline.
+   */
+  async resume(runId: string): Promise<PipelineResult> {
+    // --- 1. Validate pipeline_runs.status ----------------------------------
+    const pipelineRun = this.storage.pipelineRuns.get(runId as never);
+    if (!pipelineRun) {
+      throw new TerminalStateError({
+        runId,
+        currentStatus: "not-found",
+        attemptedStatus: "running",
+      });
+    }
+    const RESUMABLE: ReadonlySet<string> = new Set(["failed", "cancelled", "timeout"]);
+    if (!RESUMABLE.has(pipelineRun.status)) {
+      throw new TerminalStateError({
+        runId,
+        currentStatus: pipelineRun.status,
+        attemptedStatus: "running",
+      });
+    }
+
+    const projectId = pipelineRun.projectId as ProjectId;
+    const handle = this.workspaces.get(projectId);
+
+    // --- 2. Read stages and find last completed -----------------------------
+    const stages = this.storage.stages.listByRun(runId);
+    const lastCompleted = this.storage.stages.getLastCompleted(runId);
+    const startIndex = lastCompleted ? lastCompleted.stageIndex + 1 : 0;
+
+    if (startIndex >= stages.length) {
+      // All stages already completed — nothing to resume.
+      this.updateStatus("completed");
+      return this.result("completed", "" as TaskId, projectId);
+    }
+
+    // --- 3. Classify stages ------------------------------------------------
+    const STAGE_ROLES = ["architect", "developer", "tester", "reviewer"];
+    const skippedIndices = new Set<number>();
+    for (let i = 0; i < startIndex; i++) skippedIndices.add(i);
+
+    // Look up original task cards for skipped stages (already persisted).
+    const originalTasks: (TaskCard | null)[] = stages.map((s) => {
+      const task = this.storage.tasks.get(s.taskId as TaskId);
+      return task ?? null;
+    });
+
+    // Artifact IDs from completed stages (for downstream context assembly).
+    let latestChangeSetId: ArtifactId | undefined;
+    let latestTestReportId: ArtifactId | undefined;
+    for (const idx of skippedIndices) {
+      const task = originalTasks[idx];
+      if (!task) continue;
+      const role = STAGE_ROLES[idx];
+      if (role === "developer") {
+        const exec = this.getTaskExecution(task);
+        if (exec?.resultArtifactId) latestChangeSetId = exec.resultArtifactId as ArtifactId;
+      } else if (role === "tester") {
+        const exec = this.getTaskExecution(task);
+        if (exec?.resultArtifactId) latestTestReportId = exec.resultArtifactId as ArtifactId;
+      }
+    }
+
+    // --- 4. Prepare orchestrator state for this run -------------------------
+    this._userTask = pipelineRun.goal;
+    this._currentPipelineRunId = runId;
+    this._emittedTerminalEvents.clear();
+    this._rollbackPerformed = false;
+    this._cancelled = false;
+    this.doomLoop.recordSuccess("architect");
+    this.doomLoop.recordSuccess("developer");
+    this.doomLoop.recordSuccess("tester");
+    this.doomLoop.recordSuccess("reviewer");
+
+    // --- 5. Transition skipped tasks to "done" (satisfies downstream deps) -
+    for (const idx of skippedIndices) {
+      const task = originalTasks[idx];
+      if (task && canTransition(task.status, "done")) {
+        this.transitionTask(task, "done");
+      } else if (task) {
+        console.warn(`[orchestrator/resume] cannot transition ${task.role} from ${task.status} to done`);
+      }
+    }
+
+    // --- 6. Create new task cards for remaining stages ---------------------
+    // Original dependency structure: architect=[], developer=[0], tester=[1], reviewer=[1,2]
+    const STAGE_DEPS: readonly (readonly number[])[] = [[], [0], [1], [1, 2]];
+    const newTasks: TaskCard[] = [];
+    for (let idx = startIndex; idx < stages.length; idx++) {
+      const role = STAGE_ROLES[idx] as TaskCard["role"];
+      const depIds: TaskId[] = [];
+
+      for (const depIdx of STAGE_DEPS[idx] ?? []) {
+        if (depIdx < startIndex) {
+          // Dependency was skipped — use original task (already transitioned to "done")
+          if (originalTasks[depIdx]) depIds.push(originalTasks[depIdx]!.id as TaskId);
+        } else {
+          // Dependency is also being resumed — use the corresponding new task
+          const newTaskIdx = depIdx - startIndex;
+          if (newTasks[newTaskIdx]) depIds.push(newTasks[newTaskIdx]!.id as TaskId);
+        }
+      }
+
+      const detail =
+        role === "architect" ? pipelineRun.goal.slice(0, 4000)
+        : role === "developer" ? "Implement the approved plan"
+        : role === "tester" ? "Verify the implementation"
+        : "Review the changes and test results";
+
+      const title =
+        role === "architect" ? "Architecture analysis"
+        : role === "developer" ? "Implementation"
+        : role === "tester" ? "Test verification"
+        : "Code review";
+
+      const card = this.createTask(runId as never, projectId, role, title, detail, depIds);
+      newTasks.push(card);
+    }
+
+    // --- 7. Insert new stage rows for resumed stages -----------------------
+    const newStageRows: StageRecord[] = [];
+    for (let i = 0; i < newTasks.length; i++) {
+      const idx = startIndex + i;
+      const sr: StageRecord = {
+        id: crypto.randomUUID(),
+        runId,
+        projectId,
+        stageIndex: idx,
+        stageRole: STAGE_ROLES[idx]!,
+        status: "pending",
+        executionId: null,
+        taskId: newTasks[i]!.id,
+        startedAt: null,
+        completedAt: null,
+        createdAt: new Date().toISOString(),
+      };
+      try {
+        this.storage.stages.insert(sr);
+        newStageRows.push(sr);
+      } catch (err) {
+        console.warn(
+          "[orchestrator] failed to persist resumed stage row",
+          { stageId: sr.id, error: err instanceof Error ? err.message : String(err) },
+        );
+        newStageRows.push(sr);
+      }
+    }
+
+    // Mark skipped stage rows as completed (they were already completed in
+    // the original run — the rows should already have that status, but this
+    // is defensive).
+    for (const idx of skippedIndices) {
+      const sr = stages[idx];
+      if (sr && sr.status !== "completed") {
+        try {
+          sr.status = "completed";
+          sr.completedAt = sr.completedAt ?? new Date().toISOString();
+          this.storage.stages.update(sr);
+        } catch { /* non-critical */ }
+      }
+    }
+
+    // --- 8. Transition new tasks to "ready" --------------------------------
+    for (const card of newTasks) {
+      this.transitionTask(card, "ready");
+    }
+
+    // --- 9. Update pipeline_runs to running --------------------------------
+    try {
+      this.storage.pipelineRuns.update({
+        ...pipelineRun,
+        status: "running",
+        errorMessage: null,
+        finishedAt: null,
+        durationMs: null,
+      });
+    } catch (err) {
+      console.warn(
+        "[orchestrator] failed to persist pipeline resume",
+        { runId, error: err instanceof Error ? err.message : String(err) },
+      );
+    }
+
+    // --- 10. Emit run.started with context entry ----------------------------
+    this.emit({
+      ts: new Date().toISOString(),
+      runId,
+      projectId,
+      actor: "system",
+      type: "run.started",
+      goal: pipelineRun.goal.slice(0, 8000),
+    });
+
+    const resumeContext = makeContextEntry({
+      namespace: "decision",
+      key: "resumed_from",
+      value: { runId, stageIndex: startIndex },
+      createdBy: "system",
+    });
+    try {
+      this.storage.context.put(resumeContext);
+    } catch (err) {
+      console.warn(
+        "[orchestrator] failed to persist resume context entry",
+        { runId, error: err instanceof Error ? err.message : String(err) },
+      );
+    }
+
+    // --- 11. Execute remaining stages (loop over newStageRows) -------------
+    const taskChain: TaskCard[] = newTasks;
+    const stageRows: StageRecord[] = newStageRows;
+    let currentIdx = 0;
+    let testerRevisions = 0;
+    let reviewerRevisions = 0;
+    let totalAttempts = 0;
+
+    while (currentIdx < taskChain.length) {
+      if (this._cancelled) {
+        this.cancelRemainingStages(stageRows);
+        this.emitEvent({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "run.cancelled",
+          reason: "pipeline cancelled",
+        });
+        return this.result("cancelled", taskChain[currentIdx]!.id, projectId, "pipeline cancelled");
+      }
+
+      const card = taskChain[currentIdx]!;
+      const role = card.role;
+
+      totalAttempts++;
+      if (totalAttempts > this.maxTotalAttempts) {
+        this.cancelRemainingStages(stageRows);
+        this.emit({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "error.raised",
+          scope: "orchestrator/pipeline-budget",
+          message: `pipeline total attempt budget exhausted (${this.maxTotalAttempts})`,
+          fatal: true,
+        });
+        return this.result("failed", card.id, projectId, "pipeline total attempt budget exhausted");
+      }
+
+      if (!this.areDependenciesSatisfied(card)) {
+        this.cancelRemainingStages(stageRows);
+        this.transitionTask(card, "blocked");
+        return this.result("failed", card.id, projectId, `dependencies not satisfied for ${role}`);
+      }
+
+      this.transitionTask(card, "ready");
+      const instruction = this.assembleInstruction(card, taskChain, handle.root);
+
+      let rec: ExecutionRecord;
+
+      const currentStage = stageRows[currentIdx]!;
+      try {
+        currentStage.status = "running";
+        currentStage.startedAt = new Date().toISOString();
+        this.storage.stages.update(currentStage);
+      } catch (err) {
+        console.warn(
+          "[orchestrator] failed to persist stage running",
+          { runId, stageRole: role, error: err instanceof Error ? err.message : String(err) },
+        );
+      }
+
+      try {
+        rec = await this.executionService.start({
+          projectId,
+          instruction,
+          taskId: card.id,
+          agentId: role,
+        });
+      } catch (err) {
+        this.finishStage(currentStage, "failed");
+        this.cancelRemainingStages(stageRows);
+        this.transitionTask(card, "failed");
+        return this.result("failed", card.id, projectId,
+          `failed to start ${role}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      const terminal = await this.waitForTerminal(card.id, rec.id);
+
+      if (this._cancelled) {
+        this.finishStage(currentStage, "cancelled", rec.id);
+        this.cancelRemainingStages(stageRows);
+        this.emitEvent({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "run.cancelled",
+          reason: "pipeline cancelled",
+        });
+        return this.result("cancelled", card.id, projectId, "pipeline cancelled");
+      }
+
+      const refreshed = this.storage.tasks.get(card.id as TaskId)!;
+
+      if (refreshed.status === "in_review") {
+        this.finishStage(currentStage, "completed", rec.id);
+        currentIdx++;
+        testerRevisions = 0;
+        reviewerRevisions = 0;
+        this.doomLoop.recordSuccess(role);
+
+        const replyText = this.getTaskReplyText(card) ?? "";
+        try {
+          const actx = { runId: runId as never, projectId, taskId: card.id as TaskId, producedBy: role as AgentRole };
+          if (role === "architect" && replyText) {
+            const spec = buildSpecArtifact(replyText, actx);
+            const plan = buildPlanArtifact(replyText, actx);
+            this.storage.artifacts.insert(spec);
+            this.storage.artifacts.insert(plan);
+            this.emitArtifact(spec, "architect");
+            this.emitArtifact(plan, "architect");
+          } else if (role === "tester") {
+            const tr = buildTestReportArtifact(replyText || "Tests completed successfully.", actx);
+            this.storage.artifacts.insert(tr);
+            this.emitArtifact(tr, "tester");
+            latestTestReportId = tr.id;
+          } else if (role === "reviewer" && replyText) {
+            const rv = buildReviewArtifact(
+              replyText, latestChangeSetId ?? ("" as ArtifactId), latestTestReportId, actx,
+            );
+            this.storage.artifacts.insert(rv);
+            this.emitArtifact(rv, "reviewer");
+          }
+        } catch (err) {
+          console.warn(
+            "[orchestrator] artifact creation failed",
+            { runId, role, error: err instanceof Error ? err.message : String(err) },
+          );
+        }
+
+        if (role === "developer") {
+          const execRec = this.getTaskExecution(card);
+          if (execRec?.resultArtifactId) {
+            latestChangeSetId = execRec.resultArtifactId as ArtifactId;
+          }
+        }
+
+        if (role === "reviewer") {
+          for (const t of taskChain) {
+            this.transitionTask(t, "done");
+          }
+          this.emitEvent({
+            ts: new Date().toISOString(),
+            runId,
+            projectId,
+            actor: "system",
+            type: "run.completed",
+            summary: "pipeline completed successfully",
+          });
+          return this.result("completed", card.id, projectId);
+        }
+        continue;
+      }
+
+      // Failure/timeout path
+      if (terminal === "timeout") {
+        this.finishStage(currentStage, "failed", rec.id);
+        this.cancelRemainingStages(stageRows);
+        this.emitEvent({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "run.failed",
+          reason: `${role} timed out`,
+        });
+        return this.result("timeout", card.id, projectId, `${role} timed out`);
+      }
+
+      if (terminal === "cancelled") {
+        this.finishStage(currentStage, "cancelled", rec.id);
+        this.cancelRemainingStages(stageRows);
+        this.emitEvent({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "run.cancelled",
+          reason: `${role} was cancelled`,
+        });
+        return this.result("cancelled", card.id, projectId, `${role} was cancelled`);
+      }
+
+      // --- Revision logic ---------------------------------------------------
+
+      if (role === "tester" && refreshed.status === "failed") {
+        testerRevisions++;
+        if (testerRevisions > this.maxTesterRevisions) {
+          this.finishStage(currentStage, "failed", rec.id);
+          this.cancelRemainingStages(stageRows);
+          this.transitionTask(card, "blocked");
+          this.emitEvent({
+            ts: new Date().toISOString(),
+            runId,
+            projectId,
+            actor: "system",
+            type: "run.failed",
+            reason: "tester revision budget exhausted",
+          });
+          return this.result("failed", card.id, projectId, "tester revision budget exhausted");
+        }
+        const lastExec = this.getLatestTaskExecution(card);
+        if (lastExec) {
+          const sig = computeFailureSignature(lastExec);
+          if (this.doomLoop.recordFailure("tester", sig)) {
+            this.finishStage(currentStage, "failed", rec.id);
+            this.cancelRemainingStages(stageRows);
+            this.transitionTask(card, "blocked");
+            this.emitEvent({
+              ts: new Date().toISOString(),
+              runId,
+              projectId,
+              actor: "system",
+              type: "run.failed",
+              reason: `tester doom-loop detected (identical failure ${this.doomLoop.getCount("tester")}×)`,
+            });
+            return this.result("failed", card.id, projectId, "tester doom-loop detected");
+          }
+        }
+        // Retry developer
+        const devIdx = taskChain.findIndex((c) => c.role === "developer");
+        if (devIdx >= 0) {
+          currentIdx = devIdx;
+          this.finishStage(currentStage, "failed", rec.id);
+          this.transitionTask(card, "revising");
+          continue;
+        }
+        this.finishStage(currentStage, "failed", rec.id);
+        this.cancelRemainingStages(stageRows);
+        this.transitionTask(card, "blocked");
+        this.emitEvent({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "run.failed",
+          reason: "tester failed, no developer to retry",
+        });
+        return this.result("failed", card.id, projectId, "tester failed, no developer to retry");
+      }
+
+      if (role === "reviewer" && refreshed.status === "failed") {
+        reviewerRevisions++;
+        if (reviewerRevisions > this.maxReviewerRevisions) {
+          this.finishStage(currentStage, "failed", rec.id);
+          this.cancelRemainingStages(stageRows);
+          this.transitionTask(card, "blocked");
+          this.emitEvent({
+            ts: new Date().toISOString(),
+            runId,
+            projectId,
+            actor: "system",
+            type: "run.failed",
+            reason: "reviewer revision budget exhausted",
+          });
+          return this.result("failed", card.id, projectId, "reviewer revision budget exhausted");
+        }
+        const lastExec = this.getLatestTaskExecution(card);
+        if (lastExec) {
+          const sig = computeFailureSignature(lastExec);
+          if (this.doomLoop.recordFailure("reviewer", sig)) {
+            this.finishStage(currentStage, "failed", rec.id);
+            this.cancelRemainingStages(stageRows);
+            this.transitionTask(card, "blocked");
+            this.emitEvent({
+              ts: new Date().toISOString(),
+              runId,
+              projectId,
+              actor: "system",
+              type: "run.failed",
+              reason: `reviewer doom-loop detected (identical failure ${this.doomLoop.getCount("reviewer")}×)`,
+            });
+            return this.result("failed", card.id, projectId, "reviewer doom-loop detected");
+          }
+        }
+        const devIdx = taskChain.findIndex((c) => c.role === "developer");
+        if (devIdx >= 0) {
+          currentIdx = devIdx;
+          this.finishStage(currentStage, "failed", rec.id);
+          this.transitionTask(card, "revising");
+          continue;
+        }
+        this.finishStage(currentStage, "failed", rec.id);
+        this.cancelRemainingStages(stageRows);
+        this.transitionTask(card, "blocked");
+        this.emitEvent({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "run.failed",
+          reason: "reviewer failed, no developer to retry",
+        });
+        return this.result("failed", card.id, projectId, "reviewer failed, no developer to retry");
+      }
+
+      if (role === "developer" && refreshed.status === "failed") {
+        this.finishStage(currentStage, "failed", rec.id);
+        this.cancelRemainingStages(stageRows);
+        this.transitionTask(card, "blocked");
+        this.emitEvent({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "run.failed",
+          reason: "developer failed",
+        });
+        return this.result("failed", card.id, projectId, "developer failed");
+      }
+
+      if (role === "architect" && refreshed.status === "failed") {
+        this.finishStage(currentStage, "failed", rec.id);
+        this.cancelRemainingStages(stageRows);
+        this.transitionTask(card, "blocked");
+        this.emitEvent({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "run.failed",
+          reason: "architect failed",
+        });
+        return this.result("failed", card.id, projectId, "architect failed");
+      }
+
+      // Unknown terminal status — fail the pipeline
+      this.finishStage(currentStage, "failed", rec.id);
+      this.cancelRemainingStages(stageRows);
+      this.transitionTask(card, "failed");
+      this.emitEvent({
+        ts: new Date().toISOString(),
+        runId,
+        projectId,
+        actor: "system",
+        type: "run.failed",
+        reason: `agent ${role} ended in unexpected status: ${refreshed.status}`,
+      });
+      return this.result("failed", card.id, projectId,
+        `agent ${role} ended in unexpected status: ${refreshed.status}`);
     }
 
     // Should not reach here

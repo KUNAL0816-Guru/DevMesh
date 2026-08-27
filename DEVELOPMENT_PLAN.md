@@ -1,9 +1,9 @@
 # DevMesh Development Plan
 
 > Status: active
-> Last updated: 2026-08-26 (post Phase 6F)
+> Last updated: 2026-08-27 (post Phase 7C)
 > Reference: docs/adr/0001-approved-architecture.md
-> Test baseline: 282 passed, 5 skipped, 0 failed
+> Test baseline: 382 passed, 5 skipped, 0 failed
 
 ---
 
@@ -321,15 +321,61 @@ inconsistent writes.
 
 ---
 
+### Phase 7A: Context API
+
+**Commit:** `8557715`
+
+| Deliverable | Status |
+|---|---|
+| `GET /projects/:projectId/context` — latest entries grouped by namespace | done |
+| `GET /projects/:projectId/context/:namespace` — entries filtered by namespace | done |
+| `GET /projects/:projectId/context/:namespace/history/:key` — full version chain chronologically | done |
+| `POST /projects/:projectId/context` — create entry with server-assigned id/timestamp | done |
+| Superseded entries excluded from default GET but included in history | done |
+| Project ownership enforcement, 404 for missing project, 400 for invalid namespace/body | done |
+| ~10 context API tests in `app.test.ts` | done |
+
+### Phase 7B: Pipeline Stage Persistence
+
+**Commit:** `300d8fb`
+
+| Deliverable | Status |
+|---|---|
+| Migration 7 creates `pipeline_stages` table (idempotent) | done |
+| `StageRepository` (insert, update, listByRun, getLastCompleted) | done |
+| Orchestrator inserts 4 stage rows on pipeline start | done |
+| Stage transitions persisted (pending→running→completed/failed/cancelled) | done |
+| `execution_id`/`task_id` recorded per stage | done |
+| `getLastCompleted()` returns last completed stage | done |
+| Stage rows survive close/reopen (durability) | done |
+| ~10 stage persistence tests in `storage.test.ts` + `orchestrator.test.ts` | done |
+
+### Phase 7C: Resumable Pipelines
+
+**Status:** implemented — uncommitted (working tree)
+
+| Deliverable | Status |
+|---|---|
+| `POST /pipelines/:runId/resume` — resume from last completed stage (202) | done |
+| `Orchestrator.resume(runId)` — validates resumable status, skips completed stages, rebuilds task cards + stage rows, re-runs orchestration loop | done |
+| 404 for missing pipeline; 409 for running/completed; 503 when no runtime wired | done |
+| `run.started` emitted on resume with `decision/resumed_from` context entry | done |
+| Resume after failure, cancellation, and timeout | done |
+| Resume is idempotent (second resume on now-completed run rejects) | done |
+| Resumed pipelines support revision loops, doom-loop detection, and cancellation | done |
+| 13 resumable-pipeline tests in `orchestrator.test.ts` + 5 resume endpoint tests in `app.test.ts` | done |
+
+---
+
 ## ADR Gaps (requirements from 0001 not yet met)
 
 | ADR Ref | Requirement | Current Status |
 |---|---|---|
 | Amendment 5a | Test reports reference an exact invocation; DevMesh replays it | ❌ Only via optional `verificationCommand` on execution endpoint; not automatic from `test_report` artifacts |
 | Amendment 5b | Unverifiable claims fail the task | ⚠️ Partial — file hash verification works; test replay not enforced in pipeline flow |
-| Consequence | Resumable runs | ❌ Failed/cancelled pipelines must restart from scratch |
+| Consequence | Resumable runs | ✅ Resolved — Phase 7C `POST /pipelines/:runId/resume` |
 | Consequence | Budget enforcement (token/cost) | ❌ Attempt limits only; no token or cost tracking |
-| Context | Context entries as derived facts | ⚠️ Write-only — orchestrator populates but no REST API to read |
+| Context | Context entries as derived facts | ✅ Resolved — Phase 7A REST read API |
 
 ---
 
