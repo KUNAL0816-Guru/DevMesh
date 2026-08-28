@@ -6,9 +6,11 @@ import {
   newArtifactBase,
   newArtifactId,
   type Artifact,
+  type ArtifactId,
   type FileEvidence,
 } from "@devmesh/contracts";
 import type { GitStatus } from "@devmesh/workspace";
+import type { CommandReplayOutcome } from "./commands.js";
 
 /** SHA-256 of a file, hex encoded — computed by DevMesh, never by an agent. */
 export function sha256File(absPath: string): string {
@@ -156,4 +158,78 @@ export function buildVerificationArtifacts(input: {
   });
 
   return { changeSet, verification, failingChecks };
+}
+
+// ---------------------------------------------------------------------------
+// Independent test-report replay (ADR amendment 5)
+// ---------------------------------------------------------------------------
+
+export type ReplayClassification = "consistent" | "contradiction" | "inconclusive";
+
+/**
+ * Decide whether an independent DevMesh replay of the tester's claimed command
+ * agrees with the tester's claimed verdict.
+ *
+ * - consistent: exit code matches the claim (0 for pass, non-zero for fail/error)
+ * - contradiction: exit code contradicts the claim (tester said pass but replay
+ *   failed, or tester said fail but replay passed)
+ * - inconclusive: the replay could not be definitively run (missing binary,
+ *   framework not installed, timeout, or unsafe command) — DevMesh neither
+ *   confirms nor refutes the claim.
+ */
+export function classifyReplay(
+  claim: { verdict: "pass" | "fail" | "error" },
+  replay: CommandReplayOutcome,
+): ReplayClassification {
+  if (replay.inconclusive) return "inconclusive";
+  const claimedPass = claim.verdict === "pass";
+  const matches = claimedPass ? replay.exitCode === 0 : replay.exitCode !== 0;
+  return matches ? "consistent" : "contradiction";
+}
+
+/**
+ * Build a standalone verification.v1 artifact targeting a test_report artifact
+ * from an independent test-command replay. Unlike `buildVerificationArtifacts`,
+ * a command_replay check alone does not require any workspace files, so this is
+ * used for tester stages that produce no change_set but still need their test
+ * claim independently verified.
+ *
+ * An inconclusive classification is recorded as an accepted (pass-through)
+ * check with `detail: "replay inconclusive: ..."` so the stage is not failed.
+ */
+export function buildTestReportReplayVerification(input: {
+  ctx: { runId: string; projectId: string; taskId?: string };
+  targetArtifactId: ArtifactId;
+  replay: CommandReplayOutcome;
+  classification: ReplayClassification;
+}): Artifact {
+  const { ctx, targetArtifactId } = input;
+  const contradiction = input.classification === "contradiction";
+  const check: Record<string, unknown> = {
+    kind: "command_replay",
+    command: input.replay.command,
+    exitCode: input.replay.exitCode,
+    passed: !contradiction,
+    detail:
+      input.classification === "inconclusive"
+        ? `replay inconclusive: ${input.replay.detail}`
+        : input.replay.detail,
+  };
+
+  const verification = artifactSchema.parse({
+    kind: "verification",
+    ...newArtifactBase({
+      runId: ctx.runId as never,
+      projectId: ctx.projectId as never,
+      taskId: ctx.taskId as never,
+      producedBy: "system",
+    }),
+    id: newArtifactId(),
+    payload: {
+      target: { artifactId: targetArtifactId },
+      checks: [check],
+      verdict: contradiction ? "rejected" : "verified",
+    },
+  });
+  return verification;
 }

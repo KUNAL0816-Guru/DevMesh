@@ -16,6 +16,15 @@ export interface CommandReplayOutcome {
   exitCode: number;
   passed: boolean;
   detail: string;
+  /**
+   * True when the command could not be definitively replayed: the binary was
+   * missing (ENOENT), the spawn failed for another reason (EACCES, signal,
+   * timeout), or the command was rejected by the safety policy. In these cases
+   * DevMesh cannot confirm or refute the operator/tester claim, so callers that
+   * care (e.g. independent test-report replay) treat it as inconclusive rather
+   * than a hard failure.
+   */
+  inconclusive?: boolean;
 }
 
 const MAX_REPLAY_MS = 120_000;
@@ -37,6 +46,7 @@ export function runVerificationCommand(
       command,
       exitCode: 126,
       passed: false,
+      inconclusive: true,
       detail: "verification command rejected by safety policy",
     });
   }
@@ -55,19 +65,21 @@ export function runVerificationCommand(
       },
       (err, stdout, stderr) => {
         const durationMs = Date.now() - startedAt;
+        const e = err as { code?: unknown; killed?: boolean } | null;
+        const hasNumericCode = typeof e?.code === "number";
+        // Definitive result only when the process actually ran and exited with
+        // a numeric code. Any spawn-level error (ENOENT/EACCES/timeout/signal)
+        // leaves the outcome inconclusive.
+        const inconclusive = Boolean(err) && !hasNumericCode;
         // execFile yields an error for non-zero exits; code may still be present
-        const code =
-          typeof (err as { code?: unknown })?.code === "number"
-            ? ((err as { code: number }).code)
-            : err
-              ? 127
-              : 0;
+        const code = hasNumericCode ? (e!.code as number) : err ? 127 : 0;
         const tail = (text: string): string =>
           text.replace(/\s+/g, " ").trim().slice(-400);
         resolve({
           command,
           exitCode: code,
           passed: code === 0,
+          inconclusive: inconclusive || undefined,
           detail:
             `replayed by devmesh in ${durationMs}ms` +
             (code !== 0 ? `; stderr: ${tail(stderr)}; stdout: ${tail(stdout)}` : ""),

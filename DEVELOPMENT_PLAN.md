@@ -703,17 +703,17 @@ step after the tester stage:
 
 #### Acceptance Criteria
 
-- [ ] After tester stage, orchestrator extracts test command from `test_report`
+- [x] After tester stage, orchestrator extracts test command from `test_report`
       artifact
-- [ ] Command is replayed in the workspace root
-- [ ] `verification.v1` artifact is produced with `command_replay` check
-- [ ] If replay contradicts tester verdict, pipeline enters revision loop
-- [ ] If replay command cannot execute (missing binary), recorded as
+- [x] Command is replayed in the workspace root
+- [x] `verification.v1` artifact is produced with `command_replay` check
+- [x] If replay contradicts tester verdict, pipeline enters revision loop
+- [x] If replay command cannot execute (missing binary), recorded as
       inconclusive and does not fail the stage
-- [ ] Replay timeout is bounded (configurable, default 60s)
-- [ ] Replay does not execute destructive commands (reuses existing safety
+- [x] Replay timeout is bounded (configurable, default 60s)
+- [x] Replay does not execute destructive commands (reuses existing safety
       patterns from `verify.ts`)
-- [ ] All existing orchestrator tests pass
+- [x] All existing orchestrator tests pass
 
 #### Required Tests
 

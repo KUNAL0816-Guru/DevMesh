@@ -2596,7 +2596,16 @@ describe("Orchestrator: Phase 7D — structured output", () => {
           structured: { spec: specPayload, plan: planPayload },
         },
         developer: {
-          effect: () => writeFileSync(join(stack.root, "app.js"), "export const x = 1;\n"),
+          effect: () => {
+            writeFileSync(join(stack.root, "app.js"), "export const x = 1;\n");
+            // Provide a passing test script so the independent test replay of
+            // the structured invocation command ("npm test") reproduces the
+            // tester's claimed "pass" verdict instead of contradicting it.
+            writeFileSync(
+              join(stack.root, "package.json"),
+              JSON.stringify({ name: "calc", scripts: { test: "true" } }),
+            );
+          },
           text: "implemented",
         },
         tester: { text: "all green", structured: testReportPayload },
@@ -2710,6 +2719,335 @@ describe("Orchestrator: Phase 7D — structured output", () => {
     expect(spec).toBeDefined();
     expect(plan).toBeDefined();
     expect(testReport).toBeDefined();
+
+    await stack.storage.close();
+  });
+});
+
+describe("Orchestrator: Phase 7E — independent test replay", () => {
+  const architectPayload = {
+    spec: {
+      title: "Calc",
+      summary: "s",
+      goals: ["g"],
+      nonGoals: [],
+      constraints: [],
+      techStack: [],
+      risks: [],
+      openQuestions: [],
+    },
+    plan: {
+      tasks: [
+        {
+          refKey: "calc",
+          role: "developer",
+          title: "Implement",
+          detail: "impl",
+          acceptanceCriteria: ["works"],
+          dependsOn: [],
+        },
+      ],
+    },
+  };
+
+  const passClaim = (command: string) => ({
+    invocation: { command, exitCode: 0, durationMs: 100 },
+    verdict: "pass" as const,
+    totals: { passed: 1, failed: 0, skipped: 0 },
+    failures: [],
+  });
+
+  function replayVerificationArtifacts(stack: Stack) {
+    const runId = findLatestRunId(stack.storage)!;
+    return stack.storage.artifacts
+      .listByRun(runId as never)
+      .filter((a) => a.kind === "verification");
+  }
+
+  it("extracts the tester's command and replays it, producing a verification.v1 artifact", async () => {
+    const stack = makeStack(
+      perAgentScript({
+        architect: { text: "plan", structured: architectPayload },
+        developer: {
+          effect: () => {
+            writeFileSync(join(stack.root, "app.js"), "export const x = 1;\n");
+            writeFileSync(
+              join(stack.root, "package.json"),
+              JSON.stringify({ name: "c", scripts: { test: "true" } }),
+            );
+          },
+          text: "implemented",
+        },
+        tester: { text: "all green", structured: passClaim("npm test") },
+        reviewer: { text: "APPROVED" },
+      }),
+    );
+
+    const result = await stack.orchestrator.run(stack.projectId, "build a calculator");
+    expect(result.status).toBe("completed");
+
+    const verifications = replayVerificationArtifacts(stack);
+    const replay = verifications.find(
+      (v) =>
+        v.kind === "verification" &&
+        v.payload.checks.some((c) => c.kind === "command_replay"),
+    );
+    expect(replay).toBeDefined();
+    if (replay && replay.kind === "verification") {
+      expect(replay.payload.verdict).toBe("verified");
+      const check = replay.payload.checks.find((c) => c.kind === "command_replay") as
+        | { command: string; exitCode: number; passed: boolean }
+        | undefined;
+      expect(check?.command).toBe("npm test");
+      expect(check?.exitCode).toBe(0);
+      expect(check?.passed).toBe(true);
+    }
+
+    await stack.storage.close();
+  });
+
+  it("contradicting replay (tester says pass, replay fails) triggers developer revision", async () => {
+    let devRuns = 0;
+    const stack = makeStack((req) => {
+      const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+
+      if (role === "tester") {
+        return {
+          steps: [{ events: [{ kind: "text", text: "all green" }] }],
+          outcome: {
+            status: "completed",
+            finalText: "all green",
+            structured: passClaim("npm test"),
+          },
+          stepDelayMs: 5,
+        };
+      }
+      if (role === "developer") {
+        devRuns++;
+        // First developer run ships tests that fail; the retry (after the
+        // contradiction) fixes them so the replay eventually agrees.
+        const failing = devRuns === 1;
+        return {
+          steps: [
+            {
+              effect: () => {
+                writeFileSync(join(stack.root, "app.js"), "export const x = 1;\n");
+                writeFileSync(
+                  join(stack.root, "package.json"),
+                  JSON.stringify({
+                    name: "c",
+                    scripts: { test: failing ? "false" : "true" },
+                  }),
+                );
+              },
+              events: [{ kind: "text", text: "implemented" }],
+            },
+          ],
+          outcome: { status: "completed", finalText: "implemented" },
+          stepDelayMs: 5,
+        };
+      }
+      if (role === "architect") {
+        return {
+          steps: [{ events: [{ kind: "text", text: "plan" }] }],
+          outcome: {
+            status: "completed",
+            finalText: "plan",
+            structured: architectPayload,
+          },
+          stepDelayMs: 5,
+        };
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: "APPROVED" }] }],
+        outcome: { status: "completed", finalText: "APPROVED" },
+        stepDelayMs: 5,
+      };
+    });
+
+    const result = await stack.orchestrator.run(stack.projectId, "fix tests");
+    // The tester's false claim triggered a revision; the developer retry fixed
+    // the tests, so the replay eventually agreed and the pipeline completed.
+    expect(result.status).toBe("completed");
+
+    // Developer should have run twice (initial + revision).
+    const devSessions = getEventsOfType(stack.storage, "agent.session.opened").filter(
+      (e) => "role" in e && e.role === "developer",
+    );
+    expect(devSessions.length).toBeGreaterThanOrEqual(2);
+
+    // A contradiction should have been recorded as a revision_cycles row
+    // carrying the replay_contradiction signature.
+    const revisions = stack.storage.revisionCycles.listByRun(
+      findLatestRunId(stack.storage)! as never,
+    );
+    expect(revisions.some((r) => r.failureSignature === "replay_contradiction")).toBe(true);
+
+    await stack.storage.close();
+  });
+
+  it("inconclusive replay (missing binary) does not fail the stage", async () => {
+    const stack = makeStack(
+      perAgentScript({
+        architect: { text: "plan", structured: architectPayload },
+        developer: {
+          effect: () => writeFileSync(join(stack.root, "app.js"), "export const x = 1;\n"),
+          text: "implemented",
+        },
+        tester: { text: "ran", structured: passClaim("no-such-tool-xyz-98765") },
+        reviewer: { text: "APPROVED" },
+      }),
+    );
+
+    const result = await stack.orchestrator.run(stack.projectId, "build x");
+    // A missing binary must not fail the stage — recorded as inconclusive.
+    expect(result.status).toBe("completed");
+
+    const verifications = replayVerificationArtifacts(stack);
+    const replay = verifications.find(
+      (v) =>
+        v.kind === "verification" &&
+        v.payload.checks.some((c) => c.kind === "command_replay"),
+    );
+    expect(replay).toBeDefined();
+    if (replay && replay.kind === "verification") {
+      // Inconclusive is a pass-through: verdict stays verified, detail notes it.
+      expect(replay.payload.verdict).toBe("verified");
+      const check = replay.payload.checks.find(
+        (c) => c.kind === "command_replay",
+      ) as { detail: string } | undefined;
+      expect(check?.detail).toContain("replay inconclusive");
+    }
+
+    // No revision loop was entered.
+    const devSessions = getEventsOfType(stack.storage, "agent.session.opened").filter(
+      (e) => "role" in e && e.role === "developer",
+    );
+    expect(devSessions).toHaveLength(1);
+
+    await stack.storage.close();
+  });
+
+  it("replay timeout is bounded and yields inconclusive rather than a failure", async () => {
+    const storage = createStorage({ path: join(dataRoot, `orch-replay-t-${crypto.randomUUID()}.db`) });
+    const workspaces = new WorkspaceService({
+      store: storage.projects,
+      workspacesRoot: join(dataRoot, "ws-replay-t"),
+    });
+    const handle = workspaces.create("replay-timeout");
+    const agents = createDefaultAgentRegistry();
+    const executionService = new ExecutionService({
+      storage,
+      workspaces,
+      git: { init: () => {}, status: () => ({ branch: "HEAD", entries: [] }) } as never,
+      runtime: new FakeRuntime(
+        (req) => {
+          const roleMatch = req.instruction.match(/You are the (\w+) agent/i);
+          const role = roleMatch?.[1]?.toLowerCase() ?? "unknown";
+          if (role === "tester") {
+            return {
+              steps: [{ events: [{ kind: "text", text: "ran" }] }],
+              outcome: {
+                status: "completed",
+                finalText: "ran",
+                structured: passClaim("sleep 30"),
+              },
+              stepDelayMs: 5,
+            };
+          }
+          if (role === "developer") {
+            return {
+              steps: [
+                {
+                  effect: () =>
+                    writeFileSync(join(handle.root, "app.js"), "export const x = 1;\n"),
+                  events: [{ kind: "text", text: "implemented" }],
+                },
+              ],
+              outcome: { status: "completed", finalText: "implemented" },
+              stepDelayMs: 5,
+            };
+          }
+          if (role === "architect") {
+            return {
+              steps: [{ events: [{ kind: "text", text: "plan" }] }],
+              outcome: {
+                status: "completed",
+                finalText: "plan",
+                structured: architectPayload,
+              },
+              stepDelayMs: 5,
+            };
+          }
+          return {
+            steps: [{ events: [{ kind: "text", text: "APPROVED" }] }],
+            outcome: { status: "completed", finalText: "APPROVED" },
+            stepDelayMs: 5,
+          };
+        },
+      ),
+      agents,
+      defaultTimeoutMs: 30_000,
+    });
+    const orchestrator = new Orchestrator({
+      storage,
+      workspaces,
+      executionService,
+      // Tiny replay budget so `sleep 30` is killed almost immediately.
+      testReplayTimeoutMs: 1_000,
+    });
+
+    const result = await orchestrator.run(handle.projectId, "timeout replay");
+    // A hanging replay is treated as inconclusive, not a stage failure.
+    expect(result.status).toBe("completed");
+
+    const runId = findLatestRunId(storage)!;
+    const verifications = storage.artifacts
+      .listByRun(runId as never)
+      .filter((a) => a.kind === "verification");
+    const replay = verifications.find(
+      (v) =>
+        v.kind === "verification" &&
+        v.payload.checks.some((c) => c.kind === "command_replay"),
+    );
+    expect(replay).toBeDefined();
+    if (replay && replay.kind === "verification") {
+      const check = replay.payload.checks.find(
+        (c) => c.kind === "command_replay",
+      ) as { detail: string } | undefined;
+      expect(check?.detail).toContain("replay inconclusive");
+    }
+
+    await storage.close();
+  }, 15_000);
+
+  it("replays the command in the workspace root as cwd", async () => {
+    const stack = makeStack(
+      perAgentScript({
+        architect: { text: "plan", structured: architectPayload },
+        developer: {
+          effect: () => {
+            // A marker + a script that only succeeds if cwd is the workspace
+            // root (marker.txt lives there).
+            writeFileSync(join(stack.root, "marker.txt"), "present\n");
+            writeFileSync(
+              join(stack.root, "check.sh"),
+              "test -f marker.txt\n",
+            );
+          },
+          text: "implemented",
+        },
+        tester: { text: "checked", structured: passClaim("sh check.sh") },
+        reviewer: { text: "APPROVED" },
+      }),
+    );
+
+    const result = await stack.orchestrator.run(stack.projectId, "cwd check");
+    // If the replay ran outside the workspace root, `test -f marker.txt` would
+    // fail and trigger a contradiction. A completed run proves the cwd was the
+    // workspace root.
+    expect(result.status).toBe("completed");
 
     await stack.storage.close();
   });

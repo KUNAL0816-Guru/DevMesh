@@ -15,6 +15,11 @@ import {
 import type { Storage, ExecutionRecord, StageRecord } from "@devmesh/storage";
 import type { WorkspaceService, GitService } from "@devmesh/workspace";
 import type { ExecutionService } from "./executions/service.js";
+import { runVerificationCommand } from "./executions/commands.js";
+import {
+  buildTestReportReplayVerification,
+  classifyReplay,
+} from "./executions/verify.js";
 import {
   buildSpecArtifact,
   buildPlanArtifact,
@@ -146,6 +151,12 @@ export interface OrchestratorOptions {
    * Default: Infinity (no pipeline-level cap).
    */
   maxTotalAttempts?: number;
+  /**
+   * Wall-clock budget (ms) for each independent test-command replay that
+   * DevMesh runs to verify a tester's test_report claim. Default 60_000.
+   * Clamped to the commands module's hard replay ceiling (120s).
+   */
+  testReplayTimeoutMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +184,7 @@ export class Orchestrator {
   private readonly doomLoop: DoomLoopDetector;
   private readonly taskMaxAttempts: Partial<Record<TaskCard["role"], number>>;
   private readonly maxTotalAttempts: number;
+  private readonly testReplayTimeoutMs: number;
   private _userTask = "";
   private _currentPipelineRunId: string | null = null;
   private _cancelled = false;
@@ -191,6 +203,7 @@ export class Orchestrator {
     this.doomLoop = new DoomLoopDetector(opts.doomLoopThreshold ?? DEFAULT_DOOM_LOOP_THRESHOLD);
     this.taskMaxAttempts = opts.taskMaxAttempts ?? {};
     this.maxTotalAttempts = opts.maxTotalAttempts ?? Infinity;
+    this.testReplayTimeoutMs = opts.testReplayTimeoutMs ?? 60_000;
   }
 
   /** Return the runId of the most recently started pipeline, or null. */
@@ -481,18 +494,9 @@ export class Orchestrator {
       const refreshed = this.storage.tasks.get(card.id as TaskId)!;
 
       if (refreshed.status === "in_review") {
-        // Success — advance to next stage.  We intentionally leave the task
-        // at "in_review" (not "done") so that revision logic can transition
-        // it back to "revising → running" if a downstream agent fails.
-        this.finishStage(currentStage, "completed", rec.id);
-        currentIdx++;
-        testerRevisions = 0;
-        reviewerRevisions = 0;
-        this.doomLoop.recordSuccess(role);
-
-        // --- Produce structured artifacts from agent output ---------------
-        // Prefer the agent's structured output (outputFormat) when valid;
-        // otherwise fall back to parsing the free-text reply.
+        // Success path.  We intentionally leave the task at "in_review" (not
+        // "done") so that revision logic can transition it back to
+        // "revising → running" if a downstream agent fails.
         const replyText = this.getTaskReplyText(card) ?? "";
         const produced = this.produceStageArtifacts(
           card,
@@ -512,6 +516,71 @@ export class Orchestrator {
             latestChangeSetId = execRec.resultArtifactId as ArtifactId;
           }
         }
+
+        // Independent test replay (ADR amendment 5): replay the tester's claimed
+        // command and confirm it reproduces the claimed verdict. Only replayed
+        // when the command came from structured output (an exact invocation the
+        // agent genuinely claimed); the free-text parser's fallback command is
+        // not an exact invocation and is never replayed. A contradicting replay
+        // routes back to the developer as if the tester had failed.
+        if (role === "tester" && produced.testReportId && produced.testReportFromStructured) {
+          const classification = await this.replayTestReport({
+            card,
+            runId,
+            projectId,
+            workspaceRoot: handle.root,
+            testReportId: produced.testReportId,
+            timeoutMs: this.testReplayTimeoutMs,
+          });
+          if (classification === "contradiction") {
+            this.finishStage(currentStage, "failed", rec.id);
+            testerRevisions++;
+            if (testerRevisions > this.maxTesterRevisions) {
+              this.cancelRemainingStages(stageRows);
+              this.transitionTask(card, "blocked");
+              this.emitEvent({
+                ts: new Date().toISOString(),
+                runId,
+                projectId,
+                actor: "system",
+                type: "run.failed",
+                reason: "tester claim contradicted by DevMesh replay (budget exhausted)",
+              });
+              return this.result("failed", testerTask.id, projectId,
+                "tester revision budget exhausted (independent replay contradiction)");
+            }
+            try {
+              this.storage.revisionCycles.insert({
+                runId,
+                projectId,
+                taskId: testerTask.id,
+                cycleType: "tester_failure",
+                attemptNumber: testerRevisions,
+                failureKind: "verification_failed",
+                failureSignature: "replay_contradiction",
+              });
+            } catch (err) {
+              // SAFETY: Non-critical side-effect — revision-cycle persistence
+              // failure does not block the retry routing.
+              console.warn(
+                "[orchestrator] failed to record replay-contradiction revision",
+                { runId, error: err instanceof Error ? err.message : String(err) },
+              );
+            }
+            this.transitionTask(card, "failed");
+            this.transitionTask(developerTask, "revising");
+            this.transitionTask(developerTask, "running");
+            currentIdx = taskChain.indexOf(developerTask);
+            continue;
+          }
+        }
+
+        // Advance to next stage.
+        this.finishStage(currentStage, "completed", rec.id);
+        currentIdx++;
+        testerRevisions = 0;
+        reviewerRevisions = 0;
+        this.doomLoop.recordSuccess(role);
 
         if (role === "reviewer") {
           // Pipeline complete — transition all tasks to "done"
@@ -1041,12 +1110,6 @@ export class Orchestrator {
       const refreshed = this.storage.tasks.get(card.id as TaskId)!;
 
       if (refreshed.status === "in_review") {
-        this.finishStage(currentStage, "completed", rec.id);
-        currentIdx++;
-        testerRevisions = 0;
-        reviewerRevisions = 0;
-        this.doomLoop.recordSuccess(role);
-
         const replyText = this.getTaskReplyText(card) ?? "";
         const produced = this.produceStageArtifacts(
           card,
@@ -1065,6 +1128,67 @@ export class Orchestrator {
             latestChangeSetId = execRec.resultArtifactId as ArtifactId;
           }
         }
+
+        // Independent test replay for resumed pipelines — same as the initial
+        // run: verify the tester's claimed command reproduces its verdict.
+        if (role === "tester" && produced.testReportId && produced.testReportFromStructured) {
+          const classification = await this.replayTestReport({
+            card,
+            runId,
+            projectId,
+            workspaceRoot: handle.root,
+            testReportId: produced.testReportId,
+            timeoutMs: this.testReplayTimeoutMs,
+          });
+          if (classification === "contradiction") {
+            this.finishStage(currentStage, "failed", rec.id);
+            testerRevisions++;
+            const devIdx = taskChain.findIndex((c) => c.role === "developer");
+            if (testerRevisions > this.maxTesterRevisions || devIdx < 0) {
+              this.cancelRemainingStages(stageRows);
+              this.transitionTask(card, "blocked");
+              this.emitEvent({
+                ts: new Date().toISOString(),
+                runId,
+                projectId,
+                actor: "system",
+                type: "run.failed",
+                reason: "tester claim contradicted by DevMesh replay (budget exhausted)",
+              });
+              return this.result("failed", card.id, projectId,
+                "tester revision budget exhausted (independent replay contradiction)");
+            }
+            try {
+              this.storage.revisionCycles.insert({
+                runId: runId as never,
+                projectId,
+                taskId: card.id,
+                cycleType: "tester_failure",
+                attemptNumber: testerRevisions,
+                failureKind: "verification_failed",
+                failureSignature: "replay_contradiction",
+              });
+            } catch (err) {
+              // SAFETY: Non-critical side-effect — revision-cycle persistence
+              // failure does not block the retry routing.
+              console.warn(
+                "[orchestrator] failed to record replay-contradiction revision",
+                { runId, error: err instanceof Error ? err.message : String(err) },
+              );
+            }
+            this.transitionTask(card, "failed");
+            this.transitionTask(taskChain[devIdx]!, "revising");
+            this.transitionTask(taskChain[devIdx]!, "running");
+            currentIdx = devIdx;
+            continue;
+          }
+        }
+
+        this.finishStage(currentStage, "completed", rec.id);
+        currentIdx++;
+        testerRevisions = 0;
+        reviewerRevisions = 0;
+        this.doomLoop.recordSuccess(role);
 
         if (role === "reviewer") {
           for (const t of taskChain) {
@@ -1787,6 +1911,66 @@ export class Orchestrator {
   }
 
   /**
+   * Independent test-report replay (ADR amendment 5). After the tester stage
+   * produces a test_report.v1 artifact, DevMesh extracts the claimed
+   * invocation command, replays it itself inside the workspace root (never
+   * trusting the agent's claim), records a verification.v1 artifact with a
+   * command_replay check, and classifies the outcome.
+   *
+   * Returns "contradiction" when the replay disproves the tester's verdict,
+   * "consistent" when it confirms it, and "inconclusive" when the command
+   * could not be definitively replayed (missing binary, timeout, unsafe).
+   */
+  private async replayTestReport(opts: {
+    card: TaskCard;
+    runId: string;
+    projectId: ProjectId;
+    workspaceRoot: string;
+    testReportId: ArtifactId;
+    timeoutMs: number;
+  }): Promise<"consistent" | "contradiction" | "inconclusive"> {
+    const tr = this.storage.artifacts.get(opts.testReportId as never);
+    if (!tr || tr.kind !== "test_report") return "inconclusive";
+    const payload = tr.payload;
+    const command = payload.invocation.command;
+    const claimedVerdict = payload.verdict;
+
+    // Replay in the workspace root using the shared safe command runner
+    // (argv-vector only, no shell, bounded timeout — no destructive shell builtins).
+    const replay = await runVerificationCommand(
+      opts.workspaceRoot,
+      command,
+      opts.timeoutMs,
+    );
+    const classification = classifyReplay({ verdict: claimedVerdict }, replay);
+
+    try {
+      const verification = buildTestReportReplayVerification({
+        ctx: {
+          runId: opts.runId as never,
+          projectId: opts.projectId,
+          taskId: opts.card.id as TaskId,
+        },
+        targetArtifactId: opts.testReportId,
+        replay,
+        classification,
+      });
+      this.storage.artifacts.insert(verification);
+      this.emitArtifact(verification, "system");
+    } catch (err) {
+      // SAFETY: Non-critical side-effect — verification-artifact creation
+      // failure does not block the pipeline; the replay classification still
+      // governs whether the stage passes.
+      console.warn(
+        "[orchestrator] failed to record test-report replay verification",
+        { runId: opts.runId, error: err instanceof Error ? err.message : String(err) },
+      );
+    }
+
+    return classification;
+  }
+
+  /**
    * Produce and persist the structured artifacts for a completed stage.
    * Prefers the agent's structured output (validated against the artifact
    * schema); falls back to text-parsing (artifact-builder.ts) when structured
@@ -1801,7 +1985,7 @@ export class Orchestrator {
     replyText: string,
     latestChangeSetId?: ArtifactId,
     latestTestReportId?: ArtifactId,
-  ): { testReportId?: ArtifactId } {
+  ): { testReportId?: ArtifactId; testReportFromStructured?: boolean } {
     const actx = {
       runId: runId as never,
       projectId,
@@ -1814,6 +1998,7 @@ export class Orchestrator {
         ? (structured as Record<string, unknown>)
         : null;
     const toInsert: Artifact[] = [];
+    let testReportFromStructured = false;
     // Build each artifact defensively: a failure to build one artifact (from
     // structured or from free text) is logged and skipped, never fatal.
     const build = (fn: () => Artifact): void => {
@@ -1861,6 +2046,11 @@ export class Orchestrator {
         });
       }
       if (!built) build(() => buildTestReportArtifact(replyText || "Tests completed successfully.", actx));
+      // Track whether the test_report came from structured agent output so the
+      // orchestrator only replays a command the agent genuinely claimed (ADR
+      // amendment 5: replay exact invocations). Free-text parsing can only
+      // fabricate a fallback command (e.g. "test"), which must not be replayed.
+      testReportFromStructured = built;
     } else if (role === "reviewer" && (replyText || structuredRecord)) {
       let built = false;
       if (structuredRecord) {
@@ -1898,7 +2088,9 @@ export class Orchestrator {
     }
 
     const tr = toInsert.find((a) => a.kind === "test_report");
-    return tr ? { testReportId: tr.id } : {};
+    return tr
+      ? { testReportId: tr.id, testReportFromStructured }
+      : {};
   }
 
   private getTaskExecution(task: TaskCard): ExecutionRecord | null {
