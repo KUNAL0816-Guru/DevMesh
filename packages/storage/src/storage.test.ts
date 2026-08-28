@@ -546,6 +546,7 @@ function makeExec(overrides: Partial<ExecutionRecord> = {}): ExecutionRecord {
     durationMs: null,
     resultArtifactId: null,
     verificationArtifactId: null,
+    structured: null,
     ...overrides,
   };
 }

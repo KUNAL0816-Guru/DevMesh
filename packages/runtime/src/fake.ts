@@ -22,6 +22,8 @@ export interface FakeOutcome {
   finalText?: string;
   stderrTail?: string;
   failureReason?: string;
+  /** Structured JSON output surfaced on result.structured (see outputFormat). */
+  structured?: unknown;
 }
 
 export interface FakeScript {
@@ -167,6 +169,7 @@ export class FakeRuntime implements AgentRuntime {
         finalText: o.finalText ?? "",
         stderrTail: o.stderrTail ?? "",
         failureReason: o.failureReason,
+        structured: o.structured,
       });
     };
 

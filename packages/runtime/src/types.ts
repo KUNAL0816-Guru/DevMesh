@@ -16,6 +16,17 @@ export interface AgentExecutionRequest {
   timeoutMs: number;
   /** Optional runtime-specific model selector, e.g. "anthropic/claude-...". */
   model?: string;
+  /**
+   * Request that the agent emit structured JSON for this execution.
+   * The runtime relays the `name`/`schema` to the underlying agent so it
+   * produces machine-parseable output; when present, the parsed JSON is
+   * surfaced on `AgentExecutionResult.structured`.
+   */
+  outputFormat?: {
+    name: string;
+    /** JSON Schema the structured output should conform to. */
+    schema: Record<string, unknown>;
+  };
 }
 
 export type AgentStreamEvent =
@@ -34,6 +45,12 @@ export interface AgentExecutionResult {
   stderrTail: string;
   durationMs: number;
   failureReason?: string;
+  /**
+   * Parsed structured JSON output when the request carried an `outputFormat`
+   * and the agent produced it. Optional: absent when the agent did not emit
+   * structured output or it could not be parsed.
+   */
+  structured?: unknown;
 }
 
 /**

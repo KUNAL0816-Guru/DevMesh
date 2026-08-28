@@ -24,6 +24,212 @@ interface ArtifactCtx {
   producedBy: AgentRole;
 }
 
+// ---------------------------------------------------------------------------
+// outputFormat JSON Schemas
+// ---------------------------------------------------------------------------
+//
+// These are sent to the agent (via AgentExecutionRequest.outputFormat.schema)
+// to shape its structured output. They describe the expected payload shape;
+// DevMesh validates the produced payload against the authoritative Zod
+// artifact schemas before accepting it.
+
+const specOutputSchema: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    title: { type: "string" },
+    summary: { type: "string" },
+    goals: { type: "array", items: { type: "string" } },
+    nonGoals: { type: "array", items: { type: "string" } },
+    constraints: { type: "array", items: { type: "string" } },
+    techStack: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: { name: { type: "string" }, rationale: { type: "string" } },
+        required: ["name"],
+      },
+    },
+    risks: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: { description: { type: "string" }, mitigation: { type: "string" } },
+        required: ["description"],
+      },
+    },
+    openQuestions: { type: "array", items: { type: "string" } },
+  },
+  required: ["title", "summary", "goals"],
+};
+
+const planOutputSchema: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    tasks: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          refKey: { type: "string" },
+          role: { type: "string", enum: ["architect", "developer", "tester", "reviewer"] },
+          title: { type: "string" },
+          detail: { type: "string" },
+          acceptanceCriteria: { type: "array", items: { type: "string" } },
+          dependsOn: { type: "array", items: { type: "string" } },
+        },
+        required: ["refKey", "role", "title", "detail", "acceptanceCriteria"],
+      },
+    },
+  },
+  required: ["tasks"],
+};
+
+const testReportOutputSchema: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    invocation: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        command: { type: "string" },
+        cwd: { type: "string" },
+        exitCode: { type: "integer" },
+        durationMs: { type: "integer" },
+        outputDigest: { type: "string" },
+      },
+      required: ["command", "exitCode", "durationMs"],
+    },
+    framework: { type: "string" },
+    verdict: { type: "string", enum: ["pass", "fail", "error"] },
+    totals: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        passed: { type: "integer" },
+        failed: { type: "integer" },
+        skipped: { type: "integer" },
+      },
+      required: ["passed", "failed", "skipped"],
+    },
+    failures: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          name: { type: "string" },
+          message: { type: "string" },
+        },
+        required: ["name"],
+      },
+    },
+  },
+  required: ["invocation", "verdict", "totals"],
+};
+
+const reviewOutputSchema: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    subject: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        changeSetId: { type: "string" },
+        testReportId: { type: "string" },
+      },
+      required: ["changeSetId"],
+    },
+    verdict: { type: "string", enum: ["approved", "changes_requested"] },
+    findings: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          severity: { type: "string", enum: ["info", "minor", "major", "critical"] },
+          file: { type: "string" },
+          line: { type: "integer" },
+          message: { type: "string" },
+        },
+        required: ["severity", "message"],
+      },
+    },
+    summary: { type: "string" },
+  },
+  required: ["subject", "verdict", "findings", "summary"],
+};
+
+/**
+ * Per-role outputFormat schema. The architect emits a container holding both
+ * the spec and the plan payloads; the tester and reviewer emit their single
+ * artifact payload. These are passed to AgentExecutionRequest.outputFormat.
+ */
+export const ARTIFACT_OUTPUT_FORMATS: Record<
+  "architect" | "tester" | "reviewer",
+  { name: string; schema: Record<string, unknown> }
+> = {
+  architect: {
+    name: "architecture-plan",
+    schema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        spec: specOutputSchema,
+        plan: planOutputSchema,
+      },
+      required: ["spec", "plan"],
+    },
+  },
+  tester: { name: "test-report", schema: testReportOutputSchema },
+  reviewer: { name: "review", schema: reviewOutputSchema },
+};
+
+// ---------------------------------------------------------------------------
+// Structured-payload builders
+// ---------------------------------------------------------------------------
+//
+// Build a full artifact envelope from a validated structured payload. These
+// throw ZodError when the payload does not match the artifact schema; callers
+// catch and fall back to text parsing.
+
+function envelope(actx: ArtifactCtx) {
+  return {
+    id: newArtifactId(),
+    schemaVersion: 1,
+    runId: actx.runId,
+    projectId: actx.projectId,
+    taskId: actx.taskId,
+    producedBy: actx.producedBy,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+export function buildSpecArtifactFromPayload(payload: unknown, actx: ArtifactCtx): Artifact {
+  return artifactSchema.parse({ ...envelope(actx), kind: "spec", payload });
+}
+
+export function buildPlanArtifactFromPayload(payload: unknown, actx: ArtifactCtx): Artifact {
+  return artifactSchema.parse({ ...envelope(actx), kind: "plan", payload });
+}
+
+export function buildTestReportArtifactFromPayload(
+  payload: unknown,
+  actx: ArtifactCtx,
+): Artifact {
+  return artifactSchema.parse({ ...envelope(actx), kind: "test_report", payload });
+}
+
+export function buildReviewArtifactFromPayload(payload: unknown, actx: ArtifactCtx): Artifact {
+  return artifactSchema.parse({ ...envelope(actx), kind: "review", payload });
+}
+
 function extractSection(text: string, heading: string): string {
   const re = new RegExp(
     `(?:^|\\n)\\s*(?:#{1,4}|\\*\\*?)\\s*${escapeRegex(heading)}\\s*(?:\\*\\*)?\\s*\\n([\\s\\S]*?)(?=\\n\\s*(?:#{1,4}|\\*\\*?)|$)`,

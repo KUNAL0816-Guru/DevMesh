@@ -84,4 +84,30 @@ describe("FakeRuntime", () => {
     const result = await rt.start({ ...baseRequest(), timeoutMs: 150 }).result;
     expect(result.status).toBe("timeout");
   });
+
+  it("returns structured output from the scripted outcome", async () => {
+    const rt = new FakeRuntime({
+      steps: [{ events: [{ kind: "text", text: "done" }] }],
+      outcome: {
+        status: "completed",
+        finalText: "done",
+        structured: { verdict: "pass", totals: { passed: 3, failed: 0, skipped: 0 } },
+      },
+      stepDelayMs: 1,
+    });
+    const result = await rt.start({ ...baseRequest(), outputFormat: { name: "test-report", schema: {} } }).result;
+    expect(result.structured).toEqual({
+      verdict: "pass",
+      totals: { passed: 3, failed: 0, skipped: 0 },
+    });
+  });
+
+  it("omits structured output when the outcome has none", async () => {
+    const rt = new FakeRuntime({
+      outcome: { status: "completed", finalText: "plain text only" },
+      stepDelayMs: 1,
+    });
+    const result = await rt.start({ ...baseRequest(), outputFormat: { name: "test-report", schema: {} } }).result;
+    expect(result.structured).toBeUndefined();
+  });
 });

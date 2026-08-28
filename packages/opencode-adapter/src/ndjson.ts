@@ -13,6 +13,8 @@ export interface NdjsonParserResult {
   sessionId?: string;
   finalText: string;
   failureReasons: string[];
+  /** Structured JSON payload from a `structured` event, when present. */
+  structured?: unknown;
 }
 
 export function createOpencodeEventMapper(
@@ -21,6 +23,7 @@ export function createOpencodeEventMapper(
   const textParts: string[] = [];
   const failureReasons: string[] = [];
   let sessionId: string | undefined;
+  let structured: unknown;
 
   const handleLine = (line: string): void => {
     const trimmed = line.trim();
@@ -62,6 +65,12 @@ export function createOpencodeEventMapper(
         emit({ kind: "error", message });
         return;
       }
+      case "structured": {
+        if ("structured" in evt) {
+          structured = evt.structured;
+        }
+        return;
+      }
       default:
         return; // step_start / step_finish / reasoning / unknown types
     }
@@ -73,6 +82,7 @@ export function createOpencodeEventMapper(
       sessionId,
       finalText: textParts.join("\n"),
       failureReasons,
+      structured,
     }),
   };
 }

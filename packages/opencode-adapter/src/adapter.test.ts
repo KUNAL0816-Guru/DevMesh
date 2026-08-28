@@ -21,14 +21,21 @@ beforeEach(() => {
     stubPath,
     `#!/usr/bin/env node
 const instruction = process.argv[process.argv.indexOf("--") + 1] ?? "{}";
+const hasOutputSchema = process.argv.includes("--output-schema");
+const schemaArg = hasOutputSchema ? process.argv[process.argv.indexOf("--output-schema") + 1] : undefined;
 let action = {};
 try { action = JSON.parse(instruction); } catch {}
 const sid = "ses_stub_1234";
 const line = (obj) => process.stdout.write(JSON.stringify({ timestamp: Date.now(), sessionID: sid, ...obj }) + "\\n");
 line({ type: "step_start" });
+if (hasOutputSchema) {
+  const { writeFileSync } = await import("node:fs");
+  writeFileSync("output-schema.json", schemaArg ?? "");
+}
 if (action.emitError) line({ type: "error", error: { message: action.emitError } });
 line({ type: "text", part: { type: "text", text: action.say ?? "stub reply" }, time: { end: Date.now() } });
 line({ type: "tool_use", part: { tool: "write", state: { status: "completed" } } });
+if (action.emitStructured) line({ type: "structured", structured: action.emitStructured });
 if (action.writeFile) {
   const { writeFileSync, mkdirSync } = await import("node:fs");
   const { dirname } = await import("node:path");
@@ -121,5 +128,41 @@ describe("OpencodeAdapter (stub binary)", () => {
     await expect(adapter.start(request()).result).rejects.toMatchObject({
       code: "runtime/unavailable",
     });
+  });
+
+  it("passes outputFormat to the CLI as --output-schema", async () => {
+    const adapter = new OpencodeAdapter({ binaryPath: stubPath });
+    const schema = { type: "object", properties: { verdict: { type: "string" } } };
+    const result = await adapter
+      .start(
+        request({
+          outputFormat: { name: "test-report", schema },
+          instruction: JSON.stringify({ say: "done" }),
+        }),
+      )
+      .result;
+
+    expect(result.status).toBe("completed");
+    // Stub wrote the schema arg to output-schema.json in the workspace cwd
+    const { readFileSync, existsSync } = await import("node:fs");
+    expect(existsSync(join(dir, "output-schema.json"))).toBe(true);
+    const written = readFileSync(join(dir, "output-schema.json"), "utf8");
+    expect(JSON.parse(written)).toEqual(schema);
+  });
+
+  it("parses a structured output event into result.structured", async () => {
+    const adapter = new OpencodeAdapter({ binaryPath: stubPath });
+    const structured = { verdict: "pass", totals: { passed: 2, failed: 0, skipped: 1 } };
+    const result = await adapter
+      .start(
+        request({
+          outputFormat: { name: "test-report", schema: {} },
+          instruction: JSON.stringify({ emitStructured: structured }),
+        }),
+      )
+      .result;
+
+    expect(result.status).toBe("completed");
+    expect(result.structured).toEqual(structured);
   });
 });

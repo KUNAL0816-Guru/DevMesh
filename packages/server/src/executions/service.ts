@@ -31,6 +31,15 @@ export interface StartExecutionInput {
    * (never model-supplied); recorded as a command_replay verification check.
    */
   verificationCommand?: string;
+  /**
+   * Ask the agent to produce structured JSON for this execution. When set,
+   * it is forwarded to the runtime and the parsed result is stored on the
+   * execution record's `structured` field.
+   */
+  outputFormat?: {
+    name: string;
+    schema: Record<string, unknown>;
+  };
 }
 
 export interface ExecutionServiceOptions {
@@ -175,6 +184,7 @@ export class ExecutionService {
       durationMs: null,
       resultArtifactId: null,
       verificationArtifactId: null,
+      structured: null,
     });
 
     // Optional TaskCard integration: ready -> running.
@@ -199,6 +209,7 @@ export class ExecutionService {
         instruction: fullInstruction,
         timeoutMs,
         model,
+        ...(input.outputFormat ? { outputFormat: input.outputFormat } : {}),
       });
     } catch (err) {
       this.finalizeRuntimeFailure(rec, err);
@@ -406,6 +417,7 @@ export class ExecutionService {
         durationMs: result.durationMs,
         resultArtifactId: changeSetId,
         verificationArtifactId: verificationId,
+        structured: result.structured ?? null,
       });
 
       this.emit({

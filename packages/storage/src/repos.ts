@@ -494,6 +494,8 @@ export interface ExecutionRecord {
   durationMs: number | null;
   resultArtifactId: string | null;
   verificationArtifactId: string | null;
+  /** Parsed structured JSON output from the agent (outputFormat), or null. */
+  structured: unknown;
 }
 
 interface ExecutionRow {
@@ -519,13 +521,24 @@ interface ExecutionRow {
   duration_ms: number | null;
   result_artifact_id: string | null;
   verification_artifact_id: string | null;
+  structured: string | null;
 }
 
 const EXECUTION_COLUMNS =
   "id, run_id, project_id, task_id, agent_id, role, runtime, status, " +
   "failure_kind, instruction, session_ref, exit_code, stopped_reason, " +
   "error_message, stdout_tail, stderr_tail, reply_text, started_at, finished_at, " +
-  "duration_ms, result_artifact_id, verification_artifact_id";
+  "duration_ms, result_artifact_id, verification_artifact_id, structured";
+
+/** Parse a stored JSON structured value; malformed JSON degrades to null. */
+function parseStructured(raw: string | null): unknown {
+  if (raw === null || raw === "") return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
 
 function rowToExecution(r: ExecutionRow): ExecutionRecord {
   return {
@@ -551,6 +564,7 @@ function rowToExecution(r: ExecutionRow): ExecutionRecord {
     durationMs: r.duration_ms === null ? null : Number(r.duration_ms),
     resultArtifactId: r.result_artifact_id,
     verificationArtifactId: r.verification_artifact_id,
+    structured: parseStructured(r.structured),
   };
 }
 
@@ -565,8 +579,8 @@ export class ExecutionRepository {
            id, run_id, project_id, task_id, agent_id, role, runtime, status,
            failure_kind, instruction, session_ref, exit_code, stopped_reason,
            error_message, stdout_tail, stderr_tail, reply_text, started_at, finished_at,
-           duration_ms, result_artifact_id, verification_artifact_id
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           duration_ms, result_artifact_id, verification_artifact_id, structured
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         row.id,
@@ -591,6 +605,9 @@ export class ExecutionRepository {
         row.durationMs,
         row.resultArtifactId,
         row.verificationArtifactId,
+        row.structured === null || row.structured === undefined
+          ? null
+          : JSON.stringify(row.structured),
       );
     return row;
   }
@@ -603,7 +620,7 @@ export class ExecutionRepository {
            runtime = ?, status = ?, failure_kind = ?, instruction = ?,
            session_ref = ?, exit_code = ?, stopped_reason = ?, error_message = ?,
            stdout_tail = ?, stderr_tail = ?, reply_text = ?, started_at = ?, finished_at = ?,
-           duration_ms = ?, result_artifact_id = ?, verification_artifact_id = ?
+           duration_ms = ?, result_artifact_id = ?, verification_artifact_id = ?, structured = ?
          WHERE id = ?`,
       )
       .run(
@@ -628,6 +645,9 @@ export class ExecutionRepository {
         rec.durationMs,
         rec.resultArtifactId,
         rec.verificationArtifactId,
+        rec.structured === null || rec.structured === undefined
+          ? null
+          : JSON.stringify(rec.structured),
         rec.id,
       );
     if (Number(res.changes) === 0) {

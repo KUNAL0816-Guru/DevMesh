@@ -20,6 +20,11 @@ import {
   buildPlanArtifact,
   buildTestReportArtifact,
   buildReviewArtifact,
+  buildSpecArtifactFromPayload,
+  buildPlanArtifactFromPayload,
+  buildTestReportArtifactFromPayload,
+  buildReviewArtifactFromPayload,
+  ARTIFACT_OUTPUT_FORMATS,
 } from "./artifact-builder.js";
 
 // ---------------------------------------------------------------------------
@@ -443,6 +448,9 @@ export class Orchestrator {
           instruction,
           taskId: card.id,
           agentId: role,
+          ...(role === "architect" || role === "tester" || role === "reviewer"
+            ? { outputFormat: ARTIFACT_OUTPUT_FORMATS[role] }
+            : {}),
         });
       } catch (err) {
         this.finishStage(currentStage, "failed");
@@ -482,38 +490,20 @@ export class Orchestrator {
         reviewerRevisions = 0;
         this.doomLoop.recordSuccess(role);
 
-        // --- Produce structured artifacts from agent text reply -----------
+        // --- Produce structured artifacts from agent output ---------------
+        // Prefer the agent's structured output (outputFormat) when valid;
+        // otherwise fall back to parsing the free-text reply.
         const replyText = this.getTaskReplyText(card) ?? "";
-        const actx = { runId, projectId, taskId: card.id as TaskId, producedBy: role as AgentRole };
-        try {
-          if (role === "architect" && replyText) {
-            const spec = buildSpecArtifact(replyText, actx);
-            const plan = buildPlanArtifact(replyText, actx);
-            this.storage.artifacts.insert(spec);
-            this.storage.artifacts.insert(plan);
-            this.emitArtifact(spec, "architect");
-            this.emitArtifact(plan, "architect");
-          } else if (role === "tester") {
-            const tr = buildTestReportArtifact(replyText || "Tests completed successfully.", actx);
-            this.storage.artifacts.insert(tr);
-            this.emitArtifact(tr, "tester");
-            latestTestReportId = tr.id;
-          } else if (role === "reviewer" && replyText) {
-            const rv = buildReviewArtifact(
-              replyText, latestChangeSetId ?? ("" as ArtifactId), latestTestReportId, actx,
-            );
-            this.storage.artifacts.insert(rv);
-            this.emitArtifact(rv, "reviewer");
-          }
-        } catch (err) {
-          // SAFETY: Non-critical side-effect — artifact creation failure does not
-          // block the pipeline. The agent reply text is still available via the
-          // execution record for downstream context assembly.
-          console.warn(
-            "[orchestrator] artifact creation failed",
-            { runId, role, error: err instanceof Error ? err.message : String(err) },
-          );
-        }
+        const produced = this.produceStageArtifacts(
+          card,
+          runId,
+          projectId,
+          role,
+          replyText,
+          latestChangeSetId,
+          latestTestReportId,
+        );
+        if (produced.testReportId) latestTestReportId = produced.testReportId;
 
         // Capture the changeSetId from the latest execution for reviewer
         if (role === "developer") {
@@ -1020,6 +1010,9 @@ export class Orchestrator {
           instruction,
           taskId: card.id,
           agentId: role,
+          ...(role === "architect" || role === "tester" || role === "reviewer"
+            ? { outputFormat: ARTIFACT_OUTPUT_FORMATS[role] }
+            : {}),
         });
       } catch (err) {
         this.finishStage(currentStage, "failed");
@@ -1055,33 +1048,16 @@ export class Orchestrator {
         this.doomLoop.recordSuccess(role);
 
         const replyText = this.getTaskReplyText(card) ?? "";
-        try {
-          const actx = { runId: runId as never, projectId, taskId: card.id as TaskId, producedBy: role as AgentRole };
-          if (role === "architect" && replyText) {
-            const spec = buildSpecArtifact(replyText, actx);
-            const plan = buildPlanArtifact(replyText, actx);
-            this.storage.artifacts.insert(spec);
-            this.storage.artifacts.insert(plan);
-            this.emitArtifact(spec, "architect");
-            this.emitArtifact(plan, "architect");
-          } else if (role === "tester") {
-            const tr = buildTestReportArtifact(replyText || "Tests completed successfully.", actx);
-            this.storage.artifacts.insert(tr);
-            this.emitArtifact(tr, "tester");
-            latestTestReportId = tr.id;
-          } else if (role === "reviewer" && replyText) {
-            const rv = buildReviewArtifact(
-              replyText, latestChangeSetId ?? ("" as ArtifactId), latestTestReportId, actx,
-            );
-            this.storage.artifacts.insert(rv);
-            this.emitArtifact(rv, "reviewer");
-          }
-        } catch (err) {
-          console.warn(
-            "[orchestrator] artifact creation failed",
-            { runId, role, error: err instanceof Error ? err.message : String(err) },
-          );
-        }
+        const produced = this.produceStageArtifacts(
+          card,
+          runId,
+          projectId,
+          role,
+          replyText,
+          latestChangeSetId,
+          latestTestReportId,
+        );
+        if (produced.testReportId) latestTestReportId = produced.testReportId;
 
         if (role === "developer") {
           const execRec = this.getTaskExecution(card);
@@ -1617,6 +1593,22 @@ export class Orchestrator {
     return null;
   }
 
+  /** Read the agent's structured output (outputFormat) from the execution record. */
+  private getTaskStructured(task: TaskCard): unknown {
+    const recs = this.storage.executions.listByProject(task.projectId);
+    for (const rec of recs) {
+      if (
+        rec.taskId === task.id &&
+        rec.status === "completed" &&
+        rec.structured !== null &&
+        rec.structured !== undefined
+      ) {
+        return rec.structured;
+      }
+    }
+    return null;
+  }
+
   private getLatestTextArtifact(task: TaskCard): string | null {
     // Find the most recent text-type artifact for this task
     if (!task.runId) return null;
@@ -1792,6 +1784,121 @@ export class Orchestrator {
       kind: artifact.kind,
       producedBy: role,
     });
+  }
+
+  /**
+   * Produce and persist the structured artifacts for a completed stage.
+   * Prefers the agent's structured output (validated against the artifact
+   * schema); falls back to text-parsing (artifact-builder.ts) when structured
+   * output is absent or fails validation. Returns the test_report artifact id
+   * when a tester stage produced one (for downstream review context).
+   */
+  private produceStageArtifacts(
+    card: TaskCard,
+    runId: string,
+    projectId: ProjectId,
+    role: AgentRole,
+    replyText: string,
+    latestChangeSetId?: ArtifactId,
+    latestTestReportId?: ArtifactId,
+  ): { testReportId?: ArtifactId } {
+    const actx = {
+      runId: runId as never,
+      projectId,
+      taskId: card.id as TaskId,
+      producedBy: role,
+    };
+    const structured = this.getTaskStructured(card);
+    const structuredRecord =
+      typeof structured === "object" && structured !== null
+        ? (structured as Record<string, unknown>)
+        : null;
+    const toInsert: Artifact[] = [];
+    // Build each artifact defensively: a failure to build one artifact (from
+    // structured or from free text) is logged and skipped, never fatal.
+    const build = (fn: () => Artifact): void => {
+      try {
+        toInsert.push(fn());
+      } catch (err) {
+        // SAFETY: Non-critical side-effect — a single artifact build failure
+        // does not block the pipeline. The agent reply text / structured
+        // output is still available via the execution record.
+        console.warn(
+          "[orchestrator] artifact build skipped",
+          { runId, role, error: err instanceof Error ? err.message : String(err) },
+        );
+      }
+    };
+
+    if (role === "architect" && (replyText || structuredRecord)) {
+      let specBuilt = false;
+      let planBuilt = false;
+      if (structuredRecord) {
+        if ("spec" in structuredRecord) {
+          build(() => {
+            const a = buildSpecArtifactFromPayload(structuredRecord.spec, actx);
+            specBuilt = true;
+            return a;
+          });
+        }
+        if ("plan" in structuredRecord) {
+          build(() => {
+            const a = buildPlanArtifactFromPayload(structuredRecord.plan, actx);
+            planBuilt = true;
+            return a;
+          });
+        }
+      }
+      if (!specBuilt && replyText) build(() => buildSpecArtifact(replyText, actx));
+      if (!planBuilt && replyText) build(() => buildPlanArtifact(replyText, actx));
+    } else if (role === "tester") {
+      let built = false;
+      if (structuredRecord) {
+        build(() => {
+          const a = buildTestReportArtifactFromPayload(structuredRecord, actx);
+          built = true;
+          return a;
+        });
+      }
+      if (!built) build(() => buildTestReportArtifact(replyText || "Tests completed successfully.", actx));
+    } else if (role === "reviewer" && (replyText || structuredRecord)) {
+      let built = false;
+      if (structuredRecord) {
+        build(() => {
+          const a = buildReviewArtifactFromPayload(structuredRecord, actx);
+          built = true;
+          return a;
+        });
+      }
+      if (!built && replyText) {
+        build(() =>
+          buildReviewArtifact(
+            replyText,
+            latestChangeSetId ?? ("" as ArtifactId),
+            latestTestReportId,
+            actx,
+          ),
+        );
+      }
+    }
+
+    for (const a of toInsert) {
+      try {
+        this.storage.artifacts.insert(a);
+        this.emitArtifact(a, role);
+      } catch (err) {
+        // SAFETY: Non-critical side-effect — artifact creation failure does not
+        // block the pipeline. The agent reply text is still available via the
+        // execution record for downstream context assembly.
+        console.warn(
+          "[orchestrator] artifact creation failed",
+          { runId, role, error: err instanceof Error ? err.message : String(err) },
+        );
+      }
+    }
+
+    const tr = toInsert.find((a) => a.kind === "test_report");
+    return tr ? { testReportId: tr.id } : {};
   }
 
   private getTaskExecution(task: TaskCard): ExecutionRecord | null {

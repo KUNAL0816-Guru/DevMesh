@@ -164,6 +164,7 @@ function seedPipelineData(storage: Storage) {
     durationMs: 100,
     resultArtifactId: spec.id,
     verificationArtifactId: null,
+    structured: null,
   });
 
   return { projectId, runId, task1, task2, evt1, evt2, evt3, spec, plan };

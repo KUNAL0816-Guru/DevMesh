@@ -6,6 +6,7 @@ import {
   type ProjectId,
   type TaskId,
   TerminalStateError,
+  newArtifactId,
 } from "@devmesh/contracts";
 import { createStorage, type Storage } from "@devmesh/storage";
 import { assertPipelineConsistency } from "@devmesh/storage";
@@ -104,7 +105,7 @@ function makeStack(
 
 /** Script factory that returns a different script per agent role. */
 function perAgentScript(
-  scripts: Record<string, { status?: string; effect?: () => void; text?: string }>,
+  scripts: Record<string, { status?: string; effect?: () => void; text?: string; structured?: unknown }>,
 ): FakeScriptFactory {
   return (req) => {
     // Extract the agent role from the instruction or use a default
@@ -122,6 +123,7 @@ function perAgentScript(
         status: (script.status as "completed" | "failed") ?? "completed",
         sessionId: `ses_${role}`,
         finalText: script.text ?? `${role} done`,
+        ...(script.structured !== undefined ? { structured: script.structured } : {}),
       },
       stepDelayMs: 5,
     };
@@ -1060,6 +1062,7 @@ describe("Orchestrator: interrupted pipeline recovery", () => {
       durationMs: null,
       resultArtifactId: null,
       verificationArtifactId: null,
+      structured: null,
     });
 
     const recovered = orchestrator.recoverInterruptedPipelines(stack.projectId);
@@ -2526,6 +2529,187 @@ describe("Phase 7C — resumable pipelines", () => {
       (s) => s.stageRole === "reviewer" && s.status === "completed" && s.startedAt !== null,
     );
     expect(newReviewerStage).toBeDefined();
+
+    await stack.storage.close();
+  });
+});
+
+describe("Orchestrator: Phase 7D — structured output", () => {
+  it("sends outputFormat for spec/plan, test_report, and review stages but not developer", async () => {
+    const received = new Map<string, unknown>();
+    const stack = makeStack((req) => {
+      const agentMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = agentMatch?.[1]?.toLowerCase() ?? "unknown";
+      received.set(role, req.outputFormat ?? null);
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} done` }] }],
+        outcome: { status: "completed", sessionId: `ses_${role}`, finalText: `${role} done` },
+        stepDelayMs: 1,
+      };
+    });
+
+    const result = await stack.orchestrator.run(stack.projectId, "structured output test");
+    expect(result.status).toBe("completed");
+
+    expect((received.get("architect") as { name?: string })?.name).toBe("architecture-plan");
+    expect((received.get("tester") as { name?: string })?.name).toBe("test-report");
+    expect((received.get("reviewer") as { name?: string })?.name).toBe("review");
+    expect(received.get("developer")).toBeNull();
+
+    await stack.storage.close();
+  });
+
+  it("uses structured output to build spec, plan, and test_report artifacts", async () => {
+    const specPayload = {
+      title: "Calculator module",
+      summary: "A simple arithmetic calculator",
+      goals: ["Add", "Subtract"],
+      nonGoals: [],
+      constraints: [],
+      techStack: [],
+      risks: [],
+      openQuestions: [],
+    };
+    const planPayload = {
+      tasks: [
+        {
+          refKey: "calc",
+          role: "developer",
+          title: "Implement calculator",
+          detail: "Build the module",
+          acceptanceCriteria: ["works"],
+          dependsOn: [],
+        },
+      ],
+    };
+    const testReportPayload = {
+      invocation: { command: "npm test", exitCode: 0, durationMs: 120 },
+      verdict: "pass" as const,
+      totals: { passed: 5, failed: 0, skipped: 0 },
+      failures: [],
+    };
+
+    const stack = makeStack(
+      perAgentScript({
+        architect: {
+          text: "some free text architect reply",
+          structured: { spec: specPayload, plan: planPayload },
+        },
+        developer: {
+          effect: () => writeFileSync(join(stack.root, "app.js"), "export const x = 1;\n"),
+          text: "implemented",
+        },
+        tester: { text: "all green", structured: testReportPayload },
+        reviewer: { text: "APPROVED" },
+      }),
+    );
+
+    const result = await stack.orchestrator.run(stack.projectId, "build a calculator");
+    expect(result.status).toBe("completed");
+
+    const runId = findLatestRunId(stack.storage)!;
+    const artifacts = stack.storage.artifacts.listByRun(runId as never);
+    const spec = artifacts.find((a) => a.kind === "spec");
+    const plan = artifacts.find((a) => a.kind === "plan");
+    const testReport = artifacts.find((a) => a.kind === "test_report");
+
+    // Artifacts reflect the structured payloads, not the free-text fallback.
+    expect((spec!.payload as { title: string }).title).toBe("Calculator module");
+    expect((plan!.payload as { tasks: unknown[] }).tasks).toHaveLength(1);
+    expect((testReport!.payload as { totals: { passed: number } }).totals.passed).toBe(5);
+    expect((testReport!.payload as { invocation: { command: string } }).invocation.command).toBe("npm test");
+
+    await stack.storage.close();
+  });
+
+  it("uses structured output to build review artifacts", async () => {
+    const changeSetId = newArtifactId();
+    const stack = makeStack(
+      perAgentScript({
+        architect: { text: "plan" },
+        developer: {
+          effect: () => writeFileSync(join(stack.root, "app.js"), "export const x = 1;\n"),
+          text: "implemented",
+        },
+        tester: { text: "pass" },
+        reviewer: {
+          text: "free text",
+          structured: {
+            subject: { changeSetId, testReportId: changeSetId },
+            verdict: "approved" as const,
+            findings: [],
+            summary: "Approved the implementation",
+          },
+        },
+      }),
+    );
+
+    const result = await stack.orchestrator.run(stack.projectId, "review target");
+    expect(result.status).toBe("completed");
+
+    const runId = findLatestRunId(stack.storage)!;
+    const artifacts = stack.storage.artifacts.listByRun(runId as never);
+    const review = artifacts.find((a) => a.kind === "review");
+    const subject = (review!.payload as { subject: { changeSetId: string } }).subject;
+    expect(subject.changeSetId).toBe(changeSetId);
+    expect((review!.payload as { verdict: string }).verdict).toBe("approved");
+    expect((review!.payload as { summary: string }).summary).toBe("Approved the implementation");
+
+    await stack.storage.close();
+  });
+
+  it("falls back to text-parsing when structured output is invalid", async () => {
+    const stack = makeStack(
+      perAgentScript({
+        architect: { text: "plan" },
+        developer: {
+          effect: () => writeFileSync(join(stack.root, "app.js"), "export const x = 1;\n"),
+          text: "implemented",
+        },
+        tester: { text: "5 passed", structured: { verdict: "pass" } as never },
+        reviewer: { text: "APPROVED" },
+      }),
+    );
+
+    const result = await stack.orchestrator.run(stack.projectId, "invalid structured");
+    expect(result.status).toBe("completed");
+
+    const runId = findLatestRunId(stack.storage)!;
+    const artifacts = stack.storage.artifacts.listByRun(runId as never);
+    const testReport = artifacts.find((a) => a.kind === "test_report");
+    // Invalid structured output degrades to the free-text parser.
+    expect(testReport).toBeDefined();
+    expect((testReport!.payload as { verdict: string }).verdict).toBe("pass");
+    expect((testReport!.payload as { totals: { passed: number } }).totals.passed).toBe(5);
+
+    await stack.storage.close();
+  });
+
+  it("falls back to text-parsing when structured output is absent", async () => {
+    const stack = makeStack(
+      perAgentScript({
+        architect: { text: "A simple spec with Goals listed" },
+        developer: {
+          effect: () => writeFileSync(join(stack.root, "app.js"), "export const x = 1;\n"),
+          text: "implemented",
+        },
+        tester: { text: "2 tests passed" },
+        reviewer: { text: "APPROVED" },
+      }),
+    );
+
+    const result = await stack.orchestrator.run(stack.projectId, "text only");
+    expect(result.status).toBe("completed");
+
+    const runId = findLatestRunId(stack.storage)!;
+    const artifacts = stack.storage.artifacts.listByRun(runId as never);
+    const spec = artifacts.find((a) => a.kind === "spec");
+    const plan = artifacts.find((a) => a.kind === "plan");
+    const testReport = artifacts.find((a) => a.kind === "test_report");
+    // No structured output anywhere: all artifacts built from free text.
+    expect(spec).toBeDefined();
+    expect(plan).toBeDefined();
+    expect(testReport).toBeDefined();
 
     await stack.storage.close();
   });

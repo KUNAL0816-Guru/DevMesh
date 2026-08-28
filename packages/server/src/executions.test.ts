@@ -282,6 +282,7 @@ describe("ExecutionService with FakeRuntime", () => {
       durationMs: null,
       resultArtifactId: null,
       verificationArtifactId: null,
+      structured: null,
     });
     expect(reconcileInterrupted(stack.storage)).toBe(1);
     expect(stack.storage.executions.get(rec.id)?.status).toBe("interrupted");

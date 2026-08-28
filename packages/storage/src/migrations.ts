@@ -188,6 +188,15 @@ const MIGRATIONS: readonly Migration[] = [
        CREATE INDEX idx_pipeline_stages_status ON pipeline_stages(status);`,
     ],
   },
+  {
+    version: 8,
+    name: "execution-structured-output",
+    up: [
+      `ALTER TABLE executions ADD COLUMN structured TEXT;
+       -- json encoding of the agent's structured output (outputFormat),
+       -- NULL when the agent produced no structured JSON.`,
+    ],
+  },
 ];
 
 function currentVersion(db: DatabaseSync): number {

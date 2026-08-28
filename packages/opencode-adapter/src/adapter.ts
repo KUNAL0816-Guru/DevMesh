@@ -188,6 +188,7 @@ export class OpencodeAdapter implements AgentRuntime {
           stderrTail,
           durationMs,
           failureReason: killState.detail,
+          structured: parsed.structured,
         });
         return;
       }
@@ -199,6 +200,7 @@ export class OpencodeAdapter implements AgentRuntime {
           finalText: parsed.finalText,
           stderrTail,
           durationMs,
+          structured: parsed.structured,
         });
         return;
       }
@@ -212,6 +214,7 @@ export class OpencodeAdapter implements AgentRuntime {
         failureReason:
           parsed.failureReasons.join("; ").slice(0, 2000) ||
           `opencode exited with code ${code}`,
+        structured: parsed.structured,
       });
     });
 
@@ -261,6 +264,9 @@ export class OpencodeAdapter implements AgentRuntime {
     if (this.opts.autoApprove) args.push("--auto");
     const model = request.model || this.opts.model || undefined;
     if (model) args.push("-m", model);
+    if (request.outputFormat) {
+      args.push("--output-schema", JSON.stringify(request.outputFormat.schema));
+    }
     // `--` keeps the instruction strictly positional regardless of content
     args.push("--", request.instruction);
     return args;
