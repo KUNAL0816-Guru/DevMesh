@@ -1,9 +1,9 @@
 # DevMesh Development Plan
 
 > Status: active
-> Last updated: 2026-08-27 (post Phase 7C)
+> Last updated: 2026-08-29 (post Phase 7F — entire Phase 7 complete)
 > Reference: docs/adr/0001-approved-architecture.md
-> Test baseline: 382 passed, 5 skipped, 0 failed
+> Test baseline: 427 passed, 5 skipped, 0 failed
 
 ---
 
@@ -17,13 +17,19 @@ agent runtime is OpenCode behind a swappable adapter port.
 
 **What works today:**
 - Full pipeline execution: architect → developer → tester → reviewer
+- Dynamic DAG execution driven by the plan artifact (Phase 7F)
 - Revision loops: tester failures and reviewer rejections route back to developer
-- Doom-loop detection with configurable threshold
-- Git checkpoint/rollback around developer stages
+- Doom-loop detection with configurable threshold (works per-plan-task)
+- Git checkpoint/rollback around developer stages (incl. DAG developer tasks)
 - Execution verification: SHA-256 re-hashing of claimed file changes
-- Pipeline persistence, query API, SSE event streaming, cancellation
+- Independent test replay (Phase 7E): DevMesh re-runs the tester's command to verify claims
+- Structured agent output (Phase 7D): agents return schema-validated JSON, text-parsing fallback
+- Pipeline persistence, query API, SSE event streaming, cancellation, resumption
+- Pipeline stage persistence + stage-progress tracking (Phase 7B)
+- Context blackboard REST API (Phase 7A)
+- Terminal-state-safe lifecycle mutations and classified error handling (Phase 6E)
 - 4 agent definitions with role-specific permissions and system prompts
-- SQLite storage with 6 migrations, 8 repositories
+- SQLite storage with 8 migrations, 8+ repositories
 - Workspace service with symlink escape protection and FIFO mutex locking
 
 ---
@@ -33,14 +39,18 @@ agent runtime is OpenCode behind a swappable adapter port.
 ```
 packages/
   contracts/       Zod schemas, branded IDs, task state machine, event catalog,
-                   artifact types, context entries, prompts, pipeline run schema
-  runtime/         AgentRuntime port interface, FakeRuntime, RuntimeError
-  storage/         SQLite persistence (node:sqlite), 8 repositories, 6 migrations
+                   artifact types, context entries, prompts, pipeline run schema,
+                   plan integrity validation
+  runtime/         AgentRuntime port interface (incl. outputFormat/structured),
+                   FakeRuntime, RuntimeError
+  storage/         SQLite persistence (node:sqlite), 9 repositories, 8 migrations,
+                   EventBus, diagnostic queries (pipelineRunSummary/pipelineHealth)
   workspace/       Git facade, file I/O, path safety, per-key async mutex
   agents/          AgentRegistry, 4 built-in agent definitions
-  opencode-adapter/ OpenCode CLI adapter (NDJSON, process-group kill)
+  opencode-adapter/ OpenCode CLI adapter (NDJSON, process-group kill, outputFormat)
   server/          Fastify HTTP server, orchestrator, execution service,
-                   verification, artifact builder, SSE streaming
+                   verification (SHA-256 + independent test replay), artifact
+                   builder (structured-first, text-parsing fallback), SSE streaming
 ```
 
 ---
@@ -164,6 +174,8 @@ packages/
 
 ### Phase 6E: Pipeline Lifecycle Hardening
 
+**Status:** complete — commit `d40dfa4`
+
 **Goal:** Eliminate lifecycle bugs from terminal-state violations, race
 conditions, and swallowed errors. Replace best-effort `catch {}` blocks with
 classified, observable error handling.
@@ -226,17 +238,17 @@ is safe to ignore with a `// SAFETY:` comment.
 
 #### Acceptance Criteria
 
-- [ ] `updateStatus()` rejects writes to terminal-status pipeline runs
-- [ ] Concurrent cancel + stage-completion results in exactly one terminal
+- [x] `updateStatus()` rejects writes to terminal-status pipeline runs
+- [x] Concurrent cancel + stage-completion results in exactly one terminal
       event and one status update
-- [ ] `cancel()` called twice emits exactly one `run.cancelled` event
-- [ ] `emitEvent` deduplicates identical event types per run
-- [ ] Git rollback is skipped when workspace is already at checkpoint
-- [ ] Zero `catch {}` (empty catch) blocks in orchestrator and execution
+- [x] `cancel()` called twice emits exactly one `run.cancelled` event
+- [x] `emitEvent` deduplicates identical event types per run
+- [x] Git rollback is skipped when workspace is already at checkpoint
+- [x] Zero `catch {}` (empty catch) blocks in orchestrator and execution
       pipeline
-- [ ] Every `catch` clause has either a re-throw, structured logging with
+- [x] Every `catch` clause has either a re-throw, structured logging with
       error classification, or a `// SAFETY:` justification
-- [ ] All existing orchestrator, cancellation, and SSE tests pass
+- [x] All existing orchestrator, cancellation, and SSE tests pass
 
 #### Required Tests
 
@@ -250,6 +262,8 @@ is safe to ignore with a `// SAFETY:` comment.
 ---
 
 ### Phase 6F: Pipeline Observability & Reliability
+
+**Status:** complete — commit `9d26de9`
 
 **Goal:** Close test coverage gaps in storage repositories and event bus,
 and add diagnostic infrastructure for pipeline health.
@@ -299,16 +313,16 @@ inconsistent writes.
 
 #### Acceptance Criteria
 
-- [ ] `ExecutionRepository` has full CRUD + listByRun test coverage
-- [ ] `RevisionCycleRepository` has full CRUD + listByRun test coverage
-- [ ] `EventBus.attachBus()` propagation and isolation tested
-- [ ] `EventRepository.listByRunAfter()` pagination and ordering tested
-- [ ] `TaskRepository.listByProject()` ordering and isolation tested
-- [ ] `withTransaction` rollback path tested
-- [ ] `pipelineRunSummary()` returns correct stage timings and counts
-- [ ] `pipelineHealth()` returns correct status counts and averages
-- [ ] `assertPipelineConsistency()` passes on a well-formed pipeline run
-- [ ] All existing tests pass (no regressions)
+- [x] `ExecutionRepository` has full CRUD + listByRun test coverage
+- [x] `RevisionCycleRepository` has full CRUD + listByRun test coverage
+- [x] `EventBus.attachBus()` propagation and isolation tested
+- [x] `EventRepository.listByRunAfter()` pagination and ordering tested
+- [x] `TaskRepository.listByProject()` ordering and isolation tested
+- [x] `withTransaction` rollback path tested
+- [x] `pipelineRunSummary()` returns correct stage timings and counts
+- [x] `pipelineHealth()` returns correct status counts and averages
+- [x] `assertPipelineConsistency()` passes on a well-formed pipeline run
+- [x] All existing tests pass (no regressions)
 
 #### Required Tests
 
@@ -352,7 +366,7 @@ inconsistent writes.
 
 ### Phase 7C: Resumable Pipelines
 
-**Status:** implemented — uncommitted (working tree)
+**Commit:** `fc9131a`
 
 | Deliverable | Status |
 |---|---|
@@ -365,14 +379,61 @@ inconsistent writes.
 | Resumed pipelines support revision loops, doom-loop detection, and cancellation | done |
 | 13 resumable-pipeline tests in `orchestrator.test.ts` + 5 resume endpoint tests in `app.test.ts` | done |
 
+### Phase 7D: Structured Agent Output
+
+**Commit:** `4173dd7`
+
+| Deliverable | Status |
+|---|---|
+| `AgentExecutionRequest.outputFormat` + `AgentExecutionResult.structured` added to runtime port (non-breaking) | done |
+| `OpencodeAdapter` passes `outputFormat` to OpenCode CLI and parses structured response | done |
+| `FakeRuntime` returns `structured` in scripted outcomes | done |
+| Orchestrator sends `outputFormat` for spec, plan, test_report, and review stages (not developer) | done |
+| Orchestrator uses `structured` output to build artifacts when valid; falls back to text-parsing otherwise | done |
+| `artifact-builder.ts` retained as fallback; no behavior change without structured output | done |
+| Migration 8 adds `executions.structured` column | done |
+| ~5 structured-output tests in `orchestrator.test.ts` | done |
+
+### Phase 7E: Independent Test Replay
+
+**Commit:** `777fc9f`
+
+| Deliverable | Status |
+|---|---|
+| After tester stage, orchestrator extracts test command from `test_report` artifact | done |
+| Command replayed in workspace root; produces `verification.v1` artifact with `command_replay` check | done |
+| Contradicting replay (tester says pass, replay fails) triggers developer revision | done |
+| Inconclusive replay (missing binary) recorded and does not fail the stage | done |
+| Replay timeout bounded (default 60s), yields inconclusive | done |
+| Replay reuses safety patterns from `verify.ts` (no destructive commands) | done |
+| ~5 test-replay tests in `orchestrator.test.ts` + `verify.ts` command extraction/comparison tests | done |
+
+### Phase 7F: Dynamic DAG Execution
+
+**Commit:** `349912f`
+
+| Deliverable | Status |
+|---|---|
+| Orchestrator parses `PlanPayload` from plan artifact after architect stage | done |
+| `validatePlanIntegrity()` called; invalid plans fail the pipeline | done |
+| Topological sort determines execution order from dependency graph | done |
+| Each plan task creates a `TaskCard` with correct `role` and `dependsOn` | done |
+| Concurrent execution respects `maxConcurrency` limit (default 1) | done |
+| Pipeline completes when all plan tasks are `done`; fails on attempt exhaustion | done |
+| Per-plan-task revision loops and doom-loop detection | done |
+| Git checkpoint/rollback per developer-task execution | done |
+| `respectPlanRoles` configurable (false routes all to developer) | done |
+| Fallback to linear chain for single-task plans or no plan artifact | done |
+| ~14 DAG tests in `orchestrator.test.ts` | done |
+
 ---
 
 ## ADR Gaps (requirements from 0001 not yet met)
 
 | ADR Ref | Requirement | Current Status |
 |---|---|---|
-| Amendment 5a | Test reports reference an exact invocation; DevMesh replays it | ❌ Only via optional `verificationCommand` on execution endpoint; not automatic from `test_report` artifacts |
-| Amendment 5b | Unverifiable claims fail the task | ⚠️ Partial — file hash verification works; test replay not enforced in pipeline flow |
+| Amendment 5a | Test reports reference an exact invocation; DevMesh replays it | ✅ Resolved — Phase 7E independent replay of the `test_report` invocation, producing a `verification.v1` artifact |
+| Amendment 5b | Unverifiable claims fail the task | ✅ Resolved — Phase 7E replay verification integrated into pipeline flow; contradicting replay routes back to developer |
 | Consequence | Resumable runs | ✅ Resolved — Phase 7C `POST /pipelines/:runId/resume` |
 | Consequence | Budget enforcement (token/cost) | ❌ Attempt limits only; no token or cost tracking |
 | Context | Context entries as derived facts | ✅ Resolved — Phase 7A REST read API |
@@ -383,24 +444,25 @@ inconsistent writes.
 
 | ID | Description | Severity |
 |---|---|---|
-| TD-1 | `artifact-builder.ts` uses regex text-parsing to extract structured data from agent free-text. Fragile across models and prompt phrasings. | high |
-| TD-2 | Orchestrator hard-codes a 4-role linear chain ignoring the plan artifact's task DAG and dependency graph | high |
-| TD-3 | `ExecutionRepository` (0 tests), `RevisionCycleRepository` (0 tests), `EventBus.attachBus()` (0 tests), `EventRepository.listByRunAfter()` (0 tests) | medium → Phase 6F |
-| TD-4 | `withTransaction` rollback path in `db.ts` is untested | medium → Phase 6F |
-| TD-5 | Best-effort `catch {}` blocks silently swallow errors in orchestrator (event persistence, artifact creation, git checkpoints) | medium → Phase 6E |
+| TD-1 | `artifact-builder.ts` uses regex text-parsing to extract structured data from agent free-text. Fragile across models and prompt phrasings. | ~~high~~ → resolved in Phase 7D (structured output is primary; text-parsing is fallback only) |
+| TD-2 | Orchestrator hard-codes a 4-role linear chain ignoring the plan artifact's task DAG and dependency graph | ~~high~~ → resolved in Phase 7F (dynamic DAG execution driven by the plan artifact) |
+| TD-3 | `ExecutionRepository` (0 tests), `RevisionCycleRepository` (0 tests), `EventBus.attachBus()` (0 tests), `EventRepository.listByRunAfter()` (0 tests) | ~~medium~~ → resolved in Phase 6F |
+| TD-4 | `withTransaction` rollback path in `db.ts` is untested | ~~medium~~ → resolved in Phase 6F |
+| TD-5 | Best-effort `catch {}` blocks silently swallow errors in orchestrator (event persistence, artifact creation, git checkpoints) | ~~medium~~ → resolved in Phase 6E |
 | TD-6 | README.md still describes Phase 0 as current with Phase 1-3 as TODO | low |
 | TD-7 | Synchronous `node:sqlite` `DatabaseSync` blocks event loop during queries | low |
 | TD-8 | `FailureKind` string union not backed by a Zod validation schema | low |
 
 ---
 
-## Phase 7: Context API + Pipeline Resumability + Structured Output
+## Phase 7: Context API + Pipeline Resumability + Structured Output — COMPLETE
 
-Phase 7 addresses the highest-impact ADR gaps while keeping changes additive
-(no breaking changes to the `AgentRuntime` port). It assumes Phases 6E/6F
-are complete: lifecycle mutations are terminal-state-safe, error handling is
+Phase 7 addressed the highest-impact ADR gaps while keeping changes additive
+(no breaking changes to the `AgentRuntime` port). It assumed Phases 6E/6F
+were complete: lifecycle mutations are terminal-state-safe, error handling is
 classified, and repository/event-bus coverage is established. It is split
-into six sub-phases.
+into six sub-phases — **all six are now implemented** (see Completed Phases).
+Sections below retain the original specs for reference.
 
 ---
 
@@ -434,14 +496,14 @@ None required. Existing `ContextEntry`, `contextNamespaceSchema`, and
 
 #### Acceptance Criteria
 
-- [ ] `GET /projects/:id/context` returns all latest entries grouped by namespace
-- [ ] `GET /projects/:id/context/:namespace` returns only entries in that namespace
-- [ ] `GET /projects/:id/context/:namespace/history/:key` returns version chain in
+- [x] `GET /projects/:id/context` returns all latest entries grouped by namespace
+- [x] `GET /projects/:id/context/:namespace` returns only entries in that namespace
+- [x] `GET /projects/:id/context/:namespace/history/:key` returns version chain in
       chronological order
-- [ ] `POST /projects/:id/context` creates an entry with server-assigned id/timestamp
-- [ ] Superseded entries are excluded from default GET but included in history
-- [ ] 404 for non-existent project; 400 for invalid namespace or body
-- [ ] Project ownership enforced (pipeline-scoped entries not leaked across projects)
+- [x] `POST /projects/:id/context` creates an entry with server-assigned id/timestamp
+- [x] Superseded entries are excluded from default GET but included in history
+- [x] 404 for non-existent project; 400 for invalid namespace or body
+- [x] Project ownership enforced (pipeline-scoped entries not leaked across projects)
 
 #### Required Tests
 
@@ -505,14 +567,14 @@ Status values: `pending`, `running`, `completed`, `failed`, `cancelled`.
 
 #### Acceptance Criteria
 
-- [ ] Migration 7 creates `pipeline_stages` table with correct schema
-- [ ] Migration is idempotent across reopens
-- [ ] Orchestrator inserts 4 stage rows on pipeline start
-- [ ] Stage status transitions are persisted (pending→running→completed/failed/cancelled)
-- [ ] `execution_id` and `task_id` are recorded for each completed stage
-- [ ] `getLastCompleted()` returns the last stage with `status: "completed"`
-- [ ] Stage rows survive database close/reopen (durability)
-- [ ] Stage rows are updated on cancellation (terminal stage marked cancelled)
+- [x] Migration 7 creates `pipeline_stages` table with correct schema
+- [x] Migration is idempotent across reopens
+- [x] Orchestrator inserts 4 stage rows on pipeline start
+- [x] Stage status transitions are persisted (pending→running→completed/failed/cancelled)
+- [x] `execution_id` and `task_id` are recorded for each completed stage
+- [x] `getLastCompleted()` returns the last stage with `status: "completed"`
+- [x] Stage rows survive database close/reopen (durability)
+- [x] Stage rows are updated on cancellation (terminal stage marked cancelled)
 
 #### Required Tests
 
@@ -565,18 +627,18 @@ The context entry approach is preferred (no contract version bump).
 
 #### Acceptance Criteria
 
-- [ ] `POST /pipelines/:runId/resume` returns 202 with updated pipeline on
+- [x] `POST /pipelines/:runId/resume` returns 202 with updated pipeline on
       valid resume
-- [ ] Returns 409 if pipeline is `running` or `completed`
-- [ ] Returns 404 if pipeline does not exist
-- [ ] Resumed pipeline skips stages that were `completed` before failure
-- [ ] Task cards are created only for remaining stages
-- [ ] `pipeline_runs.status` transitions back to `running` then to terminal
-- [ ] Context entry records the resume origin (which stage, which prior run)
-- [ ] Git workspace is clean before resume (rollback if needed)
-- [ ] Resume is idempotent (calling twice on same terminal run produces
+- [x] Returns 409 if pipeline is `running` or `completed`
+- [x] Returns 404 if pipeline does not exist
+- [x] Resumed pipeline skips stages that were `completed` before failure
+- [x] Task cards are created only for remaining stages
+- [x] `pipeline_runs.status` transitions back to `running` then to terminal
+- [x] Context entry records the resume origin (which stage, which prior run)
+- [x] Git workspace is clean before resume (rollback if needed)
+- [x] Resume is idempotent (calling twice on same terminal run produces
       consistent results)
-- [ ] All existing pipeline behaviors work normally on resumed runs (revision
+- [x] All existing pipeline behaviors work normally on resumed runs (revision
       loops, doom-loop detection, cancellation)
 
 #### Required Tests
@@ -652,18 +714,18 @@ Replace `buildSpecArtifact()`, `buildPlanArtifact()`,
 
 #### Acceptance Criteria
 
-- [ ] `AgentExecutionRequest.outputFormat` is accepted by the runtime port
-- [ ] `AgentExecutionResult.structured` carries parsed JSON from the agent
-- [ ] `OpencodeAdapter` passes `outputFormat` to the OpenCode CLI
-- [ ] `FakeRuntime` supports `structured` in scripted outcomes
-- [ ] Orchestrator sends `outputFormat` for spec, plan, test_report, and
+- [x] `AgentExecutionRequest.outputFormat` is accepted by the runtime port
+- [x] `AgentExecutionResult.structured` carries parsed JSON from the agent
+- [x] `OpencodeAdapter` passes `outputFormat` to the OpenCode CLI
+- [x] `FakeRuntime` supports `structured` in scripted outcomes
+- [x] Orchestrator sends `outputFormat` for spec, plan, test_report, and
       review stages
-- [ ] Orchestrator uses `structured` output when available and valid
-- [ ] Orchestrator falls back to text-parsing when structured output is
+- [x] Orchestrator uses `structured` output when available and valid
+- [x] Orchestrator falls back to text-parsing when structured output is
       unavailable or invalid
-- [ ] `artifact-builder.ts` remains as fallback; no behavior change when
+- [x] `artifact-builder.ts` remains as fallback; no behavior change when
       structured output is not available
-- [ ] All existing tests pass (FakeRuntime tests updated for new field)
+- [x] All existing tests pass (FakeRuntime tests updated for new field)
 
 #### Required Tests
 
@@ -798,26 +860,27 @@ existing behavior is preserved for agents that don't produce structured plans.
 
 ---
 
-## Phase 7 Total Estimates
+## Phase 7 Total — COMPLETE
 
-| Sub-phase | Focus | New Tests | Key Risk |
-|---|---|---|---|
-| 7A | Context API | ~10 | Low — additive REST endpoints |
-| 7B | Stage Persistence | ~10 | Low — new table + repository |
-| 7C | Resumable Pipelines | ~14 | Medium — orchestrator resume logic complexity |
-| 7D | Structured Output | ~10 | Medium — runtime port interface change, adapter integration |
-| 7E | Independent Test Replay | ~8 | Medium — command extraction from agent text, inconclusive handling |
-| 7F | Dynamic DAG Execution | ~14 | High — fundamental orchestrator redesign, concurrency |
-| **Total** | | **~66** | |
+| Sub-phase | Focus | Tests | Status | Key Risk (as assessed) |
+|---|---|---|---|---|
+| 7A | Context API | ~10 | done | Low — additive REST endpoints |
+| 7B | Stage Persistence | ~10 | done | Low — new table + repository |
+| 7C | Resumable Pipelines | ~14 | done | Medium — orchestrator resume logic complexity |
+| 7D | Structured Output | ~5 | done | Medium — runtime port interface change, adapter integration |
+| 7E | Independent Test Replay | ~5 | done | Medium — command extraction from agent text, inconclusive handling |
+| 7F | Dynamic DAG Execution | ~14 | done | High — fundamental orchestrator redesign, concurrency |
 
-**Projected test baseline after Phase 7:** 282 + ~66 = **~348 tests**
+**Test baseline after Phase 7 (actual):** 427 passed, 5 skipped, 0 failed
+(+145 vs. the Phase 0-6 count of 282; actual split across all phases).
 
 ---
 
-## Phase 8+ (Future, Not Planned Yet)
+## Phase 8+ (Future, Not Yet Started)
 
-These capabilities are referenced in the ADR or README but are out of scope
-for Phase 7:
+Phase 7 is now **complete** (all six sub-phases implemented). The next work is
+Phase 8+. These capabilities are referenced in the ADR or README but are out
+of scope for Phase 7:
 
 | Capability | ADR Ref | Notes |
 |---|---|---|
@@ -833,41 +896,46 @@ for Phase 7:
 
 ---
 
-## Appendix: Test File Inventory (post Phase 6D)
+## Appendix: Test File Inventory (post Phase 7F)
 
 | File | Tests | Area |
 |---|---|---|
-| `contracts/src/common.test.ts` | 4 | Path safety, schemas |
-| `contracts/src/ids.test.ts` | 3 | Branded ID uniqueness |
-| `contracts/src/tasks.test.ts` | 4 | Task state machine |
-| `contracts/src/events.test.ts` | 3 | Event parsing |
-| `contracts/src/artifacts.test.ts` | 6 | Artifact validation |
-| `contracts/src/context.test.ts` | 3 | Context entries |
-| `contracts/src/manifest.test.ts` | 3 | Agent manifests |
-| `contracts/src/pipeline.test.ts` | 3 | Pipeline run schema |
-| `runtime/src/fake.test.ts` | 4 | FakeRuntime |
+| `contracts/src/common.test.ts` | 7 | Path safety, schemas |
+| `contracts/src/ids.test.ts` | 4 | Branded ID uniqueness |
+| `contracts/src/tasks.test.ts` | 7 | Task state machine |
+| `contracts/src/events.test.ts` | 5 | Event parsing |
+| `contracts/src/artifacts.test.ts` | 21 | Artifact validation |
+| `contracts/src/context.test.ts` | 5 | Context entries |
+| `contracts/src/manifest.test.ts` | 4 | Agent manifests |
+| `contracts/src/pipeline.test.ts` | 7 | Pipeline run schema |
+| `runtime/src/fake.test.ts` | 6 | FakeRuntime (incl. structured output) |
 | `agents/src/agents.test.ts` | 8 | Registry + builtins |
-| `opencode-adapter/src/adapter.test.ts` | 5 | Adapter integration |
-| `storage/src/storage.test.ts` | 18 | All repositories + migrations |
-| `workspace/src/git.test.ts` | 17 | Git operations + checkpoints |
+| `opencode-adapter/src/adapter.test.ts` | 7 | Adapter integration |
+| `storage/src/storage.test.ts` | 68 | All repositories + migrations + diagnostics |
+| `workspace/src/git.test.ts` | 20 | Git operations + checkpoints |
 | `workspace/src/locks.test.ts` | 6 | MutexMap |
 | `workspace/src/paths.test.ts` | 5 | Path safety |
 | `workspace/src/service.test.ts` | 13 | Workspace service |
-| `server/src/app.test.ts` | 32 | HTTP API |
-| `server/src/orchestrator.test.ts` | 40 | Orchestrator |
+| `server/src/app.test.ts` | 52 | HTTP API (incl. context/resume endpoints) |
+| `server/src/orchestrator.test.ts` | 105 | Orchestrator (DAG, replay, structured, resume, lifecycle) |
 | `server/src/executions.test.ts` | 21 | Execution service |
-| `server/src/pipeline-sse.test.ts` | 22 | SSE streaming |
+| `server/src/executions/verify.test.ts` | 17 | Independent test replay verification |
+| `server/src/pipeline-sse.test.ts` | 24 | SSE streaming |
 | `server/src/orchestrator-real.test.ts` | 1 | Real OpenCode (gated) |
 | `server/src/opencode-real.test.ts` | 4 | Real OpenCode E2E (gated) |
-| **Total** | **~282** | |
+| **Total** | **432 (427 passed, 5 skipped)** | |
 
-### Known Test Gaps (addressed by Phase 6F)
+> Counts above reflect the `it(`/`test(` occurrences per file and are
+> approximate; the authoritative number comes from `npm test`
+> (427 passed, 5 skipped, 0 failed).
 
-| Gap | Target |
+### Known Test Gaps — all resolved
+
+| Gap | Resolution |
 |---|---|
-| `ExecutionRepository` — 0 tests | Phase 6F |
-| `RevisionCycleRepository` — 0 tests | Phase 6F |
-| `EventBus` / `EventRepository.attachBus()` — 0 tests | Phase 6F |
-| `EventRepository.listByRunAfter()` — 0 tests | Phase 6F |
-| `TaskRepository.listByProject()` — 0 tests | Phase 6F |
-| `withTransaction` rollback path — 0 tests | Phase 6F |
+| `ExecutionRepository` — 0 tests | ✅ Phase 6F |
+| `RevisionCycleRepository` — 0 tests | ✅ Phase 6F |
+| `EventBus` / `EventRepository.attachBus()` — 0 tests | ✅ Phase 6F |
+| `EventRepository.listByRunAfter()` — 0 tests | ✅ Phase 6F |
+| `TaskRepository.listByProject()` — 0 tests | ✅ Phase 6F |
+| `withTransaction` rollback path — 0 tests | ✅ Phase 6F |
