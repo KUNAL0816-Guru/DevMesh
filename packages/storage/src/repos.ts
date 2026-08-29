@@ -466,6 +466,24 @@ export const executionStatuses = [
 ] as const;
 export type ExecutionRowStatus = (typeof executionStatuses)[number];
 
+export interface ExecutionUsage {
+  /**
+   * Token usage reported by the runtime adapter. Null when the runtime
+   * could not measure — never a fabricated or estimated number.
+   */
+  inputTokens: number | null;
+  outputTokens: number | null;
+  /** Nominal cost in micro-USD; null until a pricing rule exists (Phase 8C). */
+  costUsdMicros: number | null;
+  /** ISO 4217 currency code (default "USD"); null while cost is unknown. */
+  currency: string | null;
+  /**
+   * How cost was obtained: "reported" (runtime supplied) | "derived"
+   * (computed by DevMesh from config pricing) | null (tokens only).
+   */
+  usageSource: "reported" | "derived" | null;
+}
+
 export interface ExecutionRecord {
   id: string;
   runId: string;
@@ -496,6 +514,11 @@ export interface ExecutionRecord {
   verificationArtifactId: string | null;
   /** Parsed structured JSON output from the agent (outputFormat), or null. */
   structured: unknown;
+  /**
+   * Token/cost usage. Null when nothing was measured — an old row and a
+   * clean-zero report are NOT the same thing.
+   */
+  usage: ExecutionUsage | null;
 }
 
 interface ExecutionRow {
@@ -522,13 +545,19 @@ interface ExecutionRow {
   result_artifact_id: string | null;
   verification_artifact_id: string | null;
   structured: string | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cost_usd_micros: number | null;
+  cost_currency: string | null;
+  usage_source: string | null;
 }
 
 const EXECUTION_COLUMNS =
   "id, run_id, project_id, task_id, agent_id, role, runtime, status, " +
   "failure_kind, instruction, session_ref, exit_code, stopped_reason, " +
   "error_message, stdout_tail, stderr_tail, reply_text, started_at, finished_at, " +
-  "duration_ms, result_artifact_id, verification_artifact_id, structured";
+  "duration_ms, result_artifact_id, verification_artifact_id, structured, " +
+  "input_tokens, output_tokens, cost_usd_micros, cost_currency, usage_source";
 
 /** Parse a stored JSON structured value; malformed JSON degrades to null. */
 function parseStructured(raw: string | null): unknown {
@@ -541,6 +570,8 @@ function parseStructured(raw: string | null): unknown {
 }
 
 function rowToExecution(r: ExecutionRow): ExecutionRecord {
+  const measuredUsage =
+    r.input_tokens !== null || r.output_tokens !== null || r.cost_usd_micros !== null;
   return {
     id: r.id,
     runId: r.run_id,
@@ -565,6 +596,18 @@ function rowToExecution(r: ExecutionRow): ExecutionRecord {
     resultArtifactId: r.result_artifact_id,
     verificationArtifactId: r.verification_artifact_id,
     structured: parseStructured(r.structured),
+    usage: measuredUsage
+      ? {
+          inputTokens: r.input_tokens === null ? null : Number(r.input_tokens),
+          outputTokens: r.output_tokens === null ? null : Number(r.output_tokens),
+          costUsdMicros: r.cost_usd_micros === null ? null : Number(r.cost_usd_micros),
+          currency: r.cost_currency,
+          usageSource:
+            r.usage_source === "reported" || r.usage_source === "derived"
+              ? r.usage_source
+              : null,
+        }
+      : null,
   };
 }
 
@@ -579,8 +622,9 @@ export class ExecutionRepository {
            id, run_id, project_id, task_id, agent_id, role, runtime, status,
            failure_kind, instruction, session_ref, exit_code, stopped_reason,
            error_message, stdout_tail, stderr_tail, reply_text, started_at, finished_at,
-           duration_ms, result_artifact_id, verification_artifact_id, structured
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           duration_ms, result_artifact_id, verification_artifact_id, structured,
+           input_tokens, output_tokens, cost_usd_micros, cost_currency, usage_source
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         row.id,
@@ -608,6 +652,11 @@ export class ExecutionRepository {
         row.structured === null || row.structured === undefined
           ? null
           : JSON.stringify(row.structured),
+        row.usage?.inputTokens ?? null,
+        row.usage?.outputTokens ?? null,
+        row.usage?.costUsdMicros ?? null,
+        row.usage?.currency ?? null,
+        row.usage?.usageSource ?? null,
       );
     return row;
   }
@@ -620,7 +669,8 @@ export class ExecutionRepository {
            runtime = ?, status = ?, failure_kind = ?, instruction = ?,
            session_ref = ?, exit_code = ?, stopped_reason = ?, error_message = ?,
            stdout_tail = ?, stderr_tail = ?, reply_text = ?, started_at = ?, finished_at = ?,
-           duration_ms = ?, result_artifact_id = ?, verification_artifact_id = ?, structured = ?
+           duration_ms = ?, result_artifact_id = ?, verification_artifact_id = ?, structured = ?,
+           input_tokens = ?, output_tokens = ?, cost_usd_micros = ?, cost_currency = ?, usage_source = ?
          WHERE id = ?`,
       )
       .run(
@@ -648,6 +698,11 @@ export class ExecutionRepository {
         rec.structured === null || rec.structured === undefined
           ? null
           : JSON.stringify(rec.structured),
+        rec.usage?.inputTokens ?? null,
+        rec.usage?.outputTokens ?? null,
+        rec.usage?.costUsdMicros ?? null,
+        rec.usage?.currency ?? null,
+        rec.usage?.usageSource ?? null,
         rec.id,
       );
     if (Number(res.changes) === 0) {

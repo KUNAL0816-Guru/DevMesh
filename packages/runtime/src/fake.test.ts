@@ -110,4 +110,40 @@ describe("FakeRuntime", () => {
     const result = await rt.start({ ...baseRequest(), outputFormat: { name: "test-report", schema: {} } }).result;
     expect(result.structured).toBeUndefined();
   });
+
+  it("surfaces scripted token usage on the outcome path", async () => {
+    const rt = new FakeRuntime({
+      outcome: {
+        status: "completed",
+        finalText: "done",
+        usage: { inputTokens: 1200, outputTokens: 340 },
+      },
+      stepDelayMs: 1,
+    });
+    const result = await rt.start(baseRequest()).result;
+    expect(result.usage).toEqual({ inputTokens: 1200, outputTokens: 340 });
+  });
+
+  it("carries usage on failed outcomes that measured it", async () => {
+    const rt = new FakeRuntime({
+      outcome: {
+        status: "failed",
+        failureReason: "provider error",
+        usage: { inputTokens: 40, outputTokens: 10 },
+      },
+      stepDelayMs: 1,
+    });
+    const result = await rt.start(baseRequest()).result;
+    expect(result.status).toBe("failed");
+    expect(result.usage).toEqual({ inputTokens: 40, outputTokens: 10 });
+  });
+
+  it("omits usage when the outcome declares none", async () => {
+    const rt = new FakeRuntime({
+      outcome: { status: "completed", finalText: "no usage recorded" },
+      stepDelayMs: 1,
+    });
+    const result = await rt.start(baseRequest()).result;
+    expect(result.usage).toBeUndefined();
+  });
 });

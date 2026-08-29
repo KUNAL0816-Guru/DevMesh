@@ -73,6 +73,32 @@ describe("migrations", () => {
     expect(cols.map((c) => c.name)).toContain("reply_text");
     s.close();
   });
+
+  it("migration 9 adds usage columns to executions", () => {
+    const path = join(dir, "mig9.db");
+    const s = createStorage({ path });
+    expect(s.schemaVersion).toBeGreaterThanOrEqual(9);
+    const cols = s.db
+      .prepare("PRAGMA table_info(executions)")
+      .all() as Array<{ name: string }>;
+    const names = cols.map((c) => c.name);
+    expect(names).toContain("input_tokens");
+    expect(names).toContain("output_tokens");
+    expect(names).toContain("cost_usd_micros");
+    expect(names).toContain("cost_currency");
+    expect(names).toContain("usage_source");
+    s.close();
+  });
+
+  it("migration 9 is idempotent across reopens", () => {
+    const path = join(dir, "mig9-idempotent.db");
+    const s1 = createStorage({ path });
+    expect(s1.schemaVersion).toBeGreaterThanOrEqual(9);
+    s1.close();
+    const s2 = createStorage({ path });
+    expect(s2.schemaVersion).toBe(s1.schemaVersion);
+    s2.close();
+  });
 });
 
 describe("projects", () => {
@@ -547,6 +573,7 @@ function makeExec(overrides: Partial<ExecutionRecord> = {}): ExecutionRecord {
     resultArtifactId: null,
     verificationArtifactId: null,
     structured: null,
+    usage: null,
     ...overrides,
   };
 }
@@ -590,6 +617,73 @@ describe("ExecutionRepository", () => {
     expect(fetched.durationMs).toBeNull();
     expect(fetched.resultArtifactId).toBeNull();
     expect(fetched.verificationArtifactId).toBeNull();
+    expect(fetched.usage).toBeNull();
+    s.close();
+  });
+
+  it("roundtrips reported token usage (tokens only, no cost yet)", () => {
+    const s = fileStorage();
+    const projectId = newProjectId();
+    ensureProject(s, projectId, "usage");
+    const rec = s.executions.insert(
+      makeExec({
+        projectId,
+        usage: {
+          inputTokens: 1240,
+          outputTokens: 380,
+          costUsdMicros: null,
+          currency: null,
+          usageSource: null,
+        },
+      }),
+    );
+    const fetched = s.executions.get(rec.id)!;
+    expect(fetched.usage).toEqual({
+      inputTokens: 1240,
+      outputTokens: 380,
+      costUsdMicros: null,
+      currency: null,
+      usageSource: null,
+    });
+    s.close();
+  });
+
+  it("roundtrips a fully-stamped usage report (derived cost)", () => {
+    const s = fileStorage();
+    const projectId = newProjectId();
+    ensureProject(s, projectId, "usage-der");
+    const rec = s.executions.insert(
+      makeExec({
+        projectId,
+        usage: {
+          inputTokens: 500,
+          outputTokens: 90,
+          costUsdMicros: 415,
+          currency: "USD",
+          usageSource: "derived",
+        },
+      }),
+    );
+    const updated = s.executions.update({
+      ...rec,
+      status: "completed",
+      usage: {
+        inputTokens: 500,
+        outputTokens: 90,
+        costUsdMicros: 415,
+        currency: "USD",
+        usageSource: "derived",
+      },
+    });
+    expect(updated).toBeUndefined();
+    const fetched = s.executions.get(rec.id)!;
+    expect(fetched.usage).toEqual({
+      inputTokens: 500,
+      outputTokens: 90,
+      costUsdMicros: 415,
+      currency: "USD",
+      usageSource: "derived",
+    });
     s.close();
   });
 

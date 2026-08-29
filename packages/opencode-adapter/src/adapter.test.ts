@@ -43,7 +43,13 @@ if (action.writeFile) {
   writeFileSync(action.writeFile, action.content ?? "created by stub agent\\n");
 }
 if (action.sleepMs) await new Promise((r) => setTimeout(r, action.sleepMs));
-line({ type: "step_finish" });
+if (action.usage) {
+  // Verified opencode shape: step_finish carries { part: { tokens: { input, output, ... } } }
+  line({ type: "step_finish", part: { type: "step-finish", tokens: action.usage } });
+  if (action.repeatUsageSteps === true) line({ type: "step_finish", part: { type: "step-finish", tokens: action.usage } });
+} else {
+  line({ type: "step_finish" });
+}
 process.exit(action.exitCode ?? 0);
 `,
   );
@@ -164,5 +170,57 @@ describe("OpencodeAdapter (stub binary)", () => {
 
     expect(result.status).toBe("completed");
     expect(result.structured).toEqual(structured);
+  });
+
+  it("surfaces usage parsed from step_finish tokens", async () => {
+    const adapter = new OpencodeAdapter({ binaryPath: stubPath });
+    const result = await adapter
+      .start(
+        request({
+          instruction: JSON.stringify({
+            usage: { input: 812, output: 199 },
+          }),
+        }),
+      )
+      .result;
+    expect(result.status).toBe("completed");
+    expect(result.usage).toEqual({ inputTokens: 812, outputTokens: 199 });
+  });
+
+  it("accumulates usage across multiple step_finish events", async () => {
+    const adapter = new OpencodeAdapter({ binaryPath: stubPath });
+    const result = await adapter
+      .start(
+        request({
+          instruction: JSON.stringify({
+            usage: { input: 100, output: 20 },
+            repeatUsageSteps: true,
+          }),
+        }),
+      )
+      .result;
+    expect(result.status).toBe("completed");
+    expect(result.usage).toEqual({ inputTokens: 200, outputTokens: 40 });
+  });
+
+  it("omits usage when no step reports tokens", async () => {
+    const adapter = new OpencodeAdapter({ binaryPath: stubPath });
+    const result = await adapter.start(request()).result;
+    expect(result.status).toBe("completed");
+    expect(result.usage).toBeUndefined();
+  });
+
+  it("ignores malformed step usage instead of fabricating totals", async () => {
+    const adapter = new OpencodeAdapter({ binaryPath: stubPath });
+    const result = await adapter
+      .start(
+        request({
+          instruction: JSON.stringify({ usage: { input: -1, output: "many" } }),
+        }),
+      )
+      .result;
+    // Negative input + non-numeric output fail the integer guard -> whole
+    // step ignored, total left undefined (never a fabricated 0).
+    expect(result.usage).toBeUndefined();
   });
 });

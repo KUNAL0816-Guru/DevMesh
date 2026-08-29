@@ -39,7 +39,7 @@ export interface CreateStorageOptions {
   path: string;
 }
 
-export type { ExecutionRecord, ExecutionRowStatus, PipelineRunRecord, PipelineRunSummary, PipelineHealth, RevisionCycleRecord, ConsistencyViolation, StageRecord, StageStatus } from "./repos.js";
+export type { ExecutionRecord, ExecutionRowStatus, ExecutionUsage, PipelineRunRecord, PipelineRunSummary, PipelineHealth, RevisionCycleRecord, ConsistencyViolation, StageRecord, StageStatus } from "./repos.js";
 export { pipelineRunSummary, pipelineHealth, assertPipelineConsistency } from "./repos.js";
 export { EventBus } from "./event-bus.js";
 

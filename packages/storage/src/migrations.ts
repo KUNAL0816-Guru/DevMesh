@@ -197,6 +197,24 @@ const MIGRATIONS: readonly Migration[] = [
        -- NULL when the agent produced no structured JSON.`,
     ],
   },
+  {
+    version: 9,
+    name: "execution-usage",
+    up: [
+      `ALTER TABLE executions ADD COLUMN input_tokens INTEGER;
+       -- token usage reported by the runtime adapter; NULL = not measured.
+       -- Tokens are runtime-reported TRUTH, never fabricated or estimated.`,
+      `ALTER TABLE executions ADD COLUMN output_tokens INTEGER;`,
+      `ALTER TABLE executions ADD COLUMN cost_usd_micros INTEGER;
+       -- nominal cost in micro-USD. NULL until a pricing rule exists
+       -- (Phase 8C config) or a runtime reports it; never a fabricated 0.`,
+      `ALTER TABLE executions ADD COLUMN cost_currency TEXT;
+       -- ISO 4217 (default 'USD'). NULL while cost_usd_micros is NULL.`,
+      `ALTER TABLE executions ADD COLUMN usage_source TEXT;
+       -- NULL = tokens only, no cost yet | 'reported' = runtime supplied |
+       -- 'derived' = computed by DevMesh from config pricing.`,
+    ],
+  },
 ];
 
 function currentVersion(db: DatabaseSync): number {

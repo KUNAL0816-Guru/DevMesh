@@ -1064,6 +1064,7 @@ describe("Orchestrator: interrupted pipeline recovery", () => {
       resultArtifactId: null,
       verificationArtifactId: null,
       structured: null,
+      usage: null,
     });
 
     const recovered = orchestrator.recoverInterruptedPipelines(stack.projectId);

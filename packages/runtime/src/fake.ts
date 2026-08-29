@@ -3,6 +3,7 @@ import type {
   AgentExecutionResult,
   AgentRuntime,
   AgentStreamEvent,
+  AgentUsage,
   ExecutionStatus,
   RunningExecution,
 } from "./types.js";
@@ -24,6 +25,12 @@ export interface FakeOutcome {
   failureReason?: string;
   /** Structured JSON output surfaced on result.structured (see outputFormat). */
   structured?: unknown;
+  /**
+   * Token usage reported on the outcome path. Honored for the status the
+   * scripted outcome declares (including failed/timeout runtimes that did
+   * measure usage); cancelled/cut-off paths surface nothing.
+   */
+  usage?: AgentUsage;
 }
 
 export interface FakeScript {
@@ -170,6 +177,7 @@ export class FakeRuntime implements AgentRuntime {
         stderrTail: o.stderrTail ?? "",
         failureReason: o.failureReason,
         structured: o.structured,
+        usage: o.usage,
       });
     };
 

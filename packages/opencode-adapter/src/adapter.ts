@@ -189,6 +189,7 @@ export class OpencodeAdapter implements AgentRuntime {
           durationMs,
           failureReason: killState.detail,
           structured: parsed.structured,
+          usage: parsed.usage,
         });
         return;
       }
@@ -201,6 +202,7 @@ export class OpencodeAdapter implements AgentRuntime {
           stderrTail,
           durationMs,
           structured: parsed.structured,
+          usage: parsed.usage,
         });
         return;
       }
@@ -215,6 +217,7 @@ export class OpencodeAdapter implements AgentRuntime {
           parsed.failureReasons.join("; ").slice(0, 2000) ||
           `opencode exited with code ${code}`,
         structured: parsed.structured,
+        usage: parsed.usage,
       });
     });
 

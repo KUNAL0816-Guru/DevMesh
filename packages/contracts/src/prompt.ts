@@ -3,6 +3,7 @@ import { jsonValueSchema } from "./common.js";
 import { sessionIdSchema } from "./ids.js";
 import { agentRoleSchema } from "./roles.js";
 import { modelRefSchema } from "./manifest.js";
+import { tokenUsageSchema } from "./usage.js";
 
 // ---------------------------------------------------------------------------
 // Runtime-neutral prompt/reply types. The runtime adapter translates these
@@ -38,11 +39,6 @@ export const agentReplySchema = z.strictObject({
   /** Present when the request carried an outputFormat and it validated. */
   structured: jsonValueSchema.optional(),
   stopReason: z.enum(["completed", "aborted", "error", "timeout"]),
-  usage: z
-    .strictObject({
-      inputTokens: z.number().int().nonnegative(),
-      outputTokens: z.number().int().nonnegative(),
-    })
-    .optional(),
+  usage: tokenUsageSchema.optional(),
 });
 export type AgentReply = z.infer<typeof agentReplySchema>;

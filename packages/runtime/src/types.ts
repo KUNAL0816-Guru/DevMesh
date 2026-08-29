@@ -35,6 +35,17 @@ export type AgentStreamEvent =
   | { kind: "tool"; tool?: string; status?: string }
   | { kind: "error"; message: string };
 
+/**
+ * Token usage as reported by the runtime adapter. The runtime states this
+ * TRUTH directly (tokens only — cost is never a runtime constant; DevMesh
+ * derives or trusts reported cost separately). Absent when the runtime
+ * cannot measure usage; that absence is never upgraded to a guessed number.
+ */
+export interface AgentUsage {
+  inputTokens: number;
+  outputTokens: number;
+}
+
 export interface AgentExecutionResult {
   status: ExecutionStatus;
   exitCode: number | null;
@@ -51,6 +62,11 @@ export interface AgentExecutionResult {
    * structured output or it could not be parsed.
    */
   structured?: unknown;
+  /**
+   * Token usage reported by the runtime. Absent when the runtime cannot
+   * measure usage — never fabricated or estimated by DevMesh.
+   */
+  usage?: AgentUsage;
 }
 
 /**

@@ -2,10 +2,11 @@ import {
   canTransition,
   newRunId,
   taskCardSchema,
+  tokenUsageSchema,
   type ProjectId,
   type TaskId,
 } from "@devmesh/contracts";
-import type { Storage } from "@devmesh/storage";
+import type { Storage, ExecutionRecord, ExecutionUsage } from "@devmesh/storage";
 import { WorkspaceError, type GitService, type WorkspaceService } from "@devmesh/workspace";
 import {
   RuntimeError,
@@ -13,7 +14,6 @@ import {
   type RunningExecution,
 } from "@devmesh/runtime";
 import { AgentRegistryError, type AgentRegistry } from "@devmesh/agents";
-import type { ExecutionRecord } from "@devmesh/storage";
 import { buildVerificationArtifacts, observeChanges } from "./verify.js";
 import { classifyResult, classifyStartError } from "./classify.js";
 import { runVerificationCommand } from "./commands.js";
@@ -87,6 +87,25 @@ const STOPPED_REASON: Record<string, "end_turn" | "aborted" | "error" | "budget_
   failed: "error",
   timeout: "budget_exceeded",
 };
+
+/**
+ * Validate runtime-reported usage at the persistence boundary. Returns the
+ * stored shape with tokens only: cost is derived later from config pricing
+ * (Phase 8C), so cost fields stay NULL — "tokens only, no cost yet" is
+ * recorded as usage_source NULL. Invalid/malformed usage is dropped, never
+ * persisted as fabricated zeros.
+ */
+function persistedUsage(usage: unknown): ExecutionUsage | null {
+  const parsed = tokenUsageSchema.safeParse(usage);
+  if (!parsed.success) return null;
+  return {
+    inputTokens: parsed.data.inputTokens,
+    outputTokens: parsed.data.outputTokens,
+    costUsdMicros: null,
+    currency: null,
+    usageSource: null,
+  };
+}
 
 /**
  * Core-side orchestration of a single agent execution. Owns the lifecycle
@@ -185,6 +204,7 @@ export class ExecutionService {
       resultArtifactId: null,
       verificationArtifactId: null,
       structured: null,
+      usage: null,
     });
 
     // Optional TaskCard integration: ready -> running.
@@ -418,6 +438,7 @@ export class ExecutionService {
         resultArtifactId: changeSetId,
         verificationArtifactId: verificationId,
         structured: result.structured ?? null,
+        usage: persistedUsage(result.usage),
       });
 
       this.emit({

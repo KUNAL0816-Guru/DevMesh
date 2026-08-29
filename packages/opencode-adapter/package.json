@@ -19,6 +19,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@devmesh/contracts": "*",
     "@devmesh/runtime": "*"
   }
 }

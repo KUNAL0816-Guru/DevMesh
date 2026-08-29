@@ -152,6 +152,62 @@ describe("ExecutionService with FakeRuntime", () => {
     await stack.app.close();
   });
 
+  it("persists runtime-reported token usage on completion", async () => {
+    const stack = makeStack(
+      (h) =>
+        new FakeRuntime({
+          steps: [
+            {
+              effect: () => writeFileSync(join(h.root, "notes.txt"), "agent output\n"),
+              events: [{ kind: "tool", tool: "write", status: "completed" }],
+            },
+          ],
+          outcome: {
+            status: "completed",
+            sessionId: "ses_usage",
+            finalText: "did it",
+            exitCode: 0,
+            usage: { inputTokens: 812, outputTokens: 199 },
+          },
+          stepDelayMs: 5,
+        }),
+    );
+    const rec = await stack.app
+      .inject({
+        method: "POST",
+        url: `/projects/${stack.handle.projectId}/executions`,
+        payload: { instruction: "measure me" },
+      })
+      .then((r) => r.json().execution);
+    expect(await waitForTerminal(stack.storage, rec.id)).toBe("completed");
+
+    const row = stack.storage.executions.get(rec.id)!;
+    // 8A persists tokens; cost fields stay NULL until config pricing lands (8C).
+    expect(row.usage).toEqual({
+      inputTokens: 812,
+      outputTokens: 199,
+      costUsdMicros: null,
+      currency: null,
+      usageSource: null,
+    });
+    await stack.app.close();
+  });
+
+  it("keeps usage null when the runtime reports none", async () => {
+    const stack = makeStack((h) => new FakeRuntime(doneScript(h.root)));
+    const rec = await stack.app
+      .inject({
+        method: "POST",
+        url: `/projects/${stack.handle.projectId}/executions`,
+        payload: { instruction: "quiet run" },
+      })
+      .then((r) => r.json().execution);
+    expect(await waitForTerminal(stack.storage, rec.id)).toBe("completed");
+    const row = stack.storage.executions.get(rec.id)!;
+    expect(row.usage).toBeNull();
+    await stack.app.close();
+  });
+
   it("failed run: no artifacts, task -> failed", async () => {
     const stack = makeStack(
       () =>
@@ -283,6 +339,7 @@ describe("ExecutionService with FakeRuntime", () => {
       resultArtifactId: null,
       verificationArtifactId: null,
       structured: null,
+      usage: null,
     });
     expect(reconcileInterrupted(stack.storage)).toBe(1);
     expect(stack.storage.executions.get(rec.id)?.status).toBe("interrupted");
