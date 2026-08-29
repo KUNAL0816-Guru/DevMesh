@@ -1,5 +1,6 @@
 import {
   canTransition,
+  validatePlanIntegrity,
   makeContextEntry,
   makeTaskCard,
   newRunId,
@@ -8,9 +9,11 @@ import {
   type TaskId,
   type ProjectId,
   type ArtifactId,
-  type AgentRole,
   type Artifact,
   type ArtifactKind,
+  type AgentRole,
+  type PlanPayload,
+  type PlanTask,
 } from "@devmesh/contracts";
 import type { Storage, ExecutionRecord, StageRecord } from "@devmesh/storage";
 import type { WorkspaceService, GitService } from "@devmesh/workspace";
@@ -125,6 +128,53 @@ export type PipelineStatus =
   | "cancelled"
   | "timeout";
 
+/**
+ * Topologically sort the plan tasks by their `dependsOn` refKeys (Kahn's
+ * algorithm). Returns the ordered list of PlanTask, or `null` if the graph
+ * has a cycle (which should never occur given validatePlanIntegrity ran).
+ */
+function topologicalSort(tasks: PlanTask[]): PlanTask[] {
+  const byRef = new Map<string, PlanTask>();
+  for (const t of tasks) byRef.set(t.refKey, t);
+
+  const indegree = new Map<string, number>();
+  const dependents = new Map<string, string[]>();
+  for (const t of tasks) {
+    indegree.set(t.refKey, 0);
+    dependents.set(t.refKey, []);
+  }
+  for (const t of tasks) {
+    for (const dep of t.dependsOn) {
+      if (!byRef.has(dep)) continue;
+      indegree.set(t.refKey, (indegree.get(t.refKey) ?? 0) + 1);
+      dependents.get(dep)?.push(t.refKey);
+    }
+  }
+
+  const queue: string[] = [];
+  for (const t of tasks) {
+    if ((indegree.get(t.refKey) ?? 0) === 0) queue.push(t.refKey);
+  }
+
+  const order: PlanTask[] = [];
+  while (queue.length > 0) {
+    const ref = queue.shift()!;
+    const task = byRef.get(ref);
+    if (task) order.push(task);
+    for (const dep of dependents.get(ref) ?? []) {
+      const remaining = (indegree.get(dep) ?? 0) - 1;
+      indegree.set(dep, remaining);
+      if (remaining === 0) queue.push(dep);
+    }
+  }
+
+  // If not all tasks were scheduled, there's a cycle — return tasks in
+  // original order as a safe fallback (shouldn't happen after validation).
+  if (order.length !== tasks.length) return tasks;
+  return order;
+}
+
+
 export interface PipelineResult {
   status: PipelineStatus;
   taskId: TaskId;
@@ -157,6 +207,12 @@ export interface OrchestratorOptions {
    * Clamped to the commands module's hard replay ceiling (120s).
    */
   testReplayTimeoutMs?: number;
+  /** Maximum number of plan tasks executing simultaneously (default 1). */
+  maxConcurrency?: number;
+  /** Use the plan task's `role` field to pick the agent (default true). */
+  respectPlanRoles?: boolean;
+  /** Roles to try when a plan task's role is not executable (default ["developer"]). */
+  fallbackChain?: AgentRole[];
 }
 
 // ---------------------------------------------------------------------------
@@ -182,9 +238,13 @@ export class Orchestrator {
   private readonly maxTesterRevisions: number;
   private readonly maxReviewerRevisions: number;
   private readonly doomLoop: DoomLoopDetector;
+  private readonly doomLoopThreshold: number;
   private readonly taskMaxAttempts: Partial<Record<TaskCard["role"], number>>;
   private readonly maxTotalAttempts: number;
   private readonly testReplayTimeoutMs: number;
+  private readonly maxConcurrency: number;
+  private readonly respectPlanRoles: boolean;
+  private readonly fallbackChain: AgentRole[];
   private _userTask = "";
   private _currentPipelineRunId: string | null = null;
   private _cancelled = false;
@@ -201,9 +261,13 @@ export class Orchestrator {
     this.maxTesterRevisions = opts.maxTesterRevisions ?? MAX_TESTER_REVISIONS;
     this.maxReviewerRevisions = opts.maxReviewerRevisions ?? MAX_REVIEWER_REVISIONS;
     this.doomLoop = new DoomLoopDetector(opts.doomLoopThreshold ?? DEFAULT_DOOM_LOOP_THRESHOLD);
+    this.doomLoopThreshold = opts.doomLoopThreshold ?? DEFAULT_DOOM_LOOP_THRESHOLD;
     this.taskMaxAttempts = opts.taskMaxAttempts ?? {};
     this.maxTotalAttempts = opts.maxTotalAttempts ?? Infinity;
     this.testReplayTimeoutMs = opts.testReplayTimeoutMs ?? 60_000;
+    this.maxConcurrency = opts.maxConcurrency ?? 1;
+    this.respectPlanRoles = opts.respectPlanRoles ?? true;
+    this.fallbackChain = opts.fallbackChain ?? ["developer"];
   }
 
   /** Return the runId of the most recently started pipeline, or null. */
@@ -572,6 +636,44 @@ export class Orchestrator {
             this.transitionTask(developerTask, "running");
             currentIdx = taskChain.indexOf(developerTask);
             continue;
+          }
+        }
+
+        // --- Phase 7F: Dynamic DAG execution -------------------------------
+        // After the architect stage succeeds and produces a plan artifact with
+        // more than one task, route the remaining pipeline to DAG scheduling
+        // instead of the fixed linear chain. A single-task (or absent) plan
+        // falls back to the linear chain below; an invalid plan fails the
+        // pipeline.
+        if (role === "architect") {
+          const planAttempt = this.tryParsePlan(card, runId);
+          if (planAttempt.kind === "invalid") {
+            this.finishStage(currentStage, "failed", rec.id);
+            this.cancelRemainingStages(stageRows);
+            this.transitionTask(card, "blocked");
+            this.emitEvent({
+              ts: new Date().toISOString(),
+              runId,
+              projectId,
+              actor: "system",
+              type: "run.failed",
+              reason: planAttempt.reason,
+            });
+            return this.result("failed", card.id, projectId, planAttempt.reason);
+          }
+          if (planAttempt.kind === "plan" && planAttempt.plan.tasks.length > 1) {
+            const dagResult = await this.executeDag({
+              runId,
+              projectId,
+              userTask: this._userTask,
+              plan: planAttempt.plan,
+              stageRows,
+              architectStage: currentStage,
+              architectCard: card,
+              latestChangeSetId,
+              latestTestReportId,
+            });
+            return dagResult;
           }
         }
 
@@ -1398,6 +1500,576 @@ export class Orchestrator {
     // Should not reach here
     return this.result("failed", taskChain[taskChain.length - 1]!.id, projectId,
       "pipeline fell through");
+  }
+
+  // --- Phase 7F: Dynamic DAG execution ------------------------------------
+
+  /**
+   * Parse the plan artifact the architect produced for a task card.
+   * Returns "none" when no plan artifact exists, "invalid" when the plan
+   * fails integrity validation, or "plan" with the validated PlanPayload.
+   */
+  private tryParsePlan(
+    card: TaskCard,
+    runId: string,
+  ): { kind: "none" } | { kind: "invalid"; reason: string } | { kind: "plan"; plan: PlanPayload } {
+    // The architect's structured output is persisted as a plan artifact under
+    // the pipeline runId (produceStageArtifacts is called with the pipeline
+    // runId), so look it up there directly.
+    const artifacts = this.storage.artifacts.listByRun(runId as never);
+    const planArtifact =
+      [...artifacts].reverse().find((a) => a.kind === "plan") ??
+      this.findLatestArtifactOfKind(card, "plan");
+    if (!planArtifact) return { kind: "none" };
+    const payload = planArtifact.payload as unknown as PlanPayload;
+    if (!payload || !Array.isArray(payload.tasks)) return { kind: "none" };
+    const issues = validatePlanIntegrity(payload);
+    if (issues.length > 0) {
+      const reason = `invalid plan: ${issues.map((i) => i.message).join("; ")}`;
+      return { kind: "invalid", reason };
+    }
+    return { kind: "plan", plan: payload };
+  }
+
+  private async executeDag(opts: {
+    runId: string;
+    projectId: ProjectId;
+    userTask: string;
+    plan: PlanPayload;
+    stageRows: StageRecord[];
+    architectStage: StageRecord;
+    architectCard: TaskCard;
+    latestChangeSetId?: ArtifactId;
+    latestTestReportId?: ArtifactId;
+  }): Promise<PipelineResult> {
+    const {
+      runId,
+      projectId,
+      plan,
+      stageRows,
+      architectStage,
+      architectCard,
+    } = opts;
+    const handle = this.workspaces.get(projectId);
+
+    // 1. The architect stage that just succeeded becomes "completed".
+    this.finishStage(architectStage, "completed");
+    this.transitionTask(architectCard, "done");
+
+    // 2. Cancel the hard-coded developer/tester/reviewer stage rows — they are
+    //    replaced by the plan task rows below.
+    this.cancelRemainingStages(stageRows);
+    // Retire the pre-created linear-chain task cards (the architect is already
+    // "done" above); they are superseded by the plan task cards below.
+    for (const sr of stageRows) {
+      if (sr.taskId && sr.taskId !== architectCard.id) {
+        const legacy = this.storage.tasks.get(sr.taskId as TaskId);
+        if (legacy && canTransition(legacy.status, "cancelled")) {
+          this.transitionTask(legacy, "cancelled");
+        }
+      }
+    }
+
+    // 3. Build TaskCards from the plan tasks (respecting role assignments) and
+    //    topological order.
+    const order = topologicalSort(plan.tasks);
+    const refToCard = new Map<string, TaskCard>();
+
+    const maxAttemptsDefault = (role: AgentRole): number => {
+      const def = role === "developer" ? 3 : 2;
+      return this.taskMaxAttempts[role] ?? def;
+    };
+
+    for (const pt of order) {
+      const role = this.resolvePlanRole(pt);
+      const deps: TaskId[] = [];
+      for (const depRef of pt.dependsOn) {
+        const depCard = refToCard.get(depRef);
+        if (depCard) deps.push(depCard.id as TaskId);
+      }
+      const card = makeTaskCard({
+        projectId,
+        runId,
+        role,
+        status: "pending",
+        title: pt.title,
+        detail: `${pt.detail}\n\n# Task\nYou are the ${role} agent.\n\n# Rules\n- Do not claim results you haven't verified.\n- Only modify files in the working directory.`,
+        acceptanceCriteria: pt.acceptanceCriteria,
+        dependsOn: deps,
+        maxAttempts: maxAttemptsDefault(role),
+      });
+      this.storage.tasks.insert(card);
+      this.emit({
+        ts: card.createdAt,
+        runId,
+        projectId,
+        actor: "system",
+        type: "task.created",
+        card,
+      });
+      refToCard.set(pt.refKey, card);
+    }
+
+    const tasks = order.map((pt) => refToCard.get(pt.refKey)!);
+    // Per-plan-task doom-loop detection: each task has its own consecutive
+    // failure counter so two tasks sharing a role don't interfere.
+    const doomByTask = new Map<string, DoomLoopDetector>();
+    const doomFor = (cardId: string): DoomLoopDetector => {
+      let d = doomByTask.get(cardId);
+      if (!d) {
+        d = new DoomLoopDetector(this.doomLoopThreshold);
+        doomByTask.set(cardId, d);
+      }
+      return d;
+    };
+
+    // 4. Execute tasks in dependency order, respecting the concurrency limit.
+    let testerRevisions = 0;
+    let totalAttempts = 0;
+    const running = new Map<TaskCard, ExecutionRecord>();
+    const finished = new Set<string>();
+    const launched = new Set<string>();
+
+    // A task's dependencies are the TaskCards it points at; all deps must
+    // reach a success state before the task becomes ready.
+    const depsSatisfied = (card: TaskCard): boolean => {
+      for (const depId of card.dependsOn) {
+        const dep = this.storage.tasks.get(depId as TaskId);
+        if (!dep) return false;
+        if (!finished.has(dep.id)) return false;
+      }
+      return true;
+    };
+
+    while (finished.size < tasks.length && !this._cancelled) {
+      // Pipeline-level attempt budget check.
+      totalAttempts++;
+      if (totalAttempts > this.maxTotalAttempts) {
+        this.cancelRemainingStages(stageRows);
+        this.emit({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "error.raised",
+          scope: "orchestrator/pipeline-budget",
+          message: `pipeline total attempt budget exhausted (${this.maxTotalAttempts})`,
+          fatal: true,
+        });
+        return this.result("failed", tasks[0]!.id, projectId,
+          "pipeline total attempt budget exhausted");
+      }
+
+      // Launch any ready tasks while below the concurrency limit. Scan from the
+      // start so tasks whose deps became satisfiable after an earlier task
+      // completed are still picked up.
+      for (const card of tasks) {
+        if (running.size >= this.maxConcurrency) break;
+        if (launched.has(card.id)) continue;
+        if (finished.has(card.id)) continue;
+        if (!depsSatisfied(card)) continue;
+        const started = await this.startDagTask(card, projectId, handle.root);
+        if (!started || started.kind === "locked") {
+          // null = not launchable; locked = project already running another
+          // execution. Either way leave the task unlaunched; it is retried on
+          // the next loop iteration.
+          continue;
+        }
+        if (started.kind === "error") {
+          this.cancelRemainingStages(stageRows);
+          this.emitEvent({
+            ts: new Date().toISOString(),
+            runId,
+            projectId,
+            actor: "system",
+            type: "run.failed",
+            reason: started.message,
+          });
+          return this.result("failed", card.id, projectId, started.message);
+        }
+        launched.add(card.id);
+        running.set(card, started.rec);
+      }
+
+      if (running.size === 0) {
+        // No task can make progress — block the remaining tasks and fail.
+        for (const t of tasks) {
+          if (!finished.has(t.id) && t.status === "pending") this.transitionTask(t, "blocked");
+        }
+        this.cancelRemainingStages(stageRows);
+        this.emitEvent({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "run.failed",
+          reason: "plan task deadlock: dependencies could not be satisfied",
+        });
+        return this.result("failed", tasks[0]!.id, projectId,
+          "plan task deadlock: dependencies could not be satisfied");
+      }
+
+      // Wait for a task to reach a terminal execution state.
+      const { card, rec } = await this.waitAnyDagTask(running);
+      const terminal = await this.waitForTerminal(card.id, rec.id);
+
+      if (this._cancelled) {
+        for (const [, r] of running) {
+          void this.executionService.cancel(r.id, "pipeline cancelled").catch(() => {});
+        }
+        this.cancelRemainingStages(stageRows);
+        this.emitEvent({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "run.cancelled",
+          reason: "pipeline cancelled",
+        });
+        return this.result("cancelled", card.id, projectId, "pipeline cancelled");
+      }
+
+      running.delete(card);
+      const refreshed = this.storage.tasks.get(card.id as TaskId)!;
+
+      if (refreshed.status === "in_review") {
+        // Success — mark done, reset doom-loop, produce artifacts.
+        this.doomLoop.recordSuccess(card.role);
+        doomFor(card.id).recordSuccess(card.role);
+        finished.add(card.id);
+
+        const replyText = this.getTaskReplyText(card) ?? "";
+        const produced = this.produceStageArtifacts(
+          card,
+          runId,
+          projectId,
+          card.role,
+          replyText,
+          opts.latestChangeSetId,
+          opts.latestTestReportId,
+        );
+
+        if (card.role === "developer") {
+          const execRec = this.getTaskExecution(card);
+          if (execRec?.resultArtifactId) opts.latestChangeSetId = execRec.resultArtifactId as ArtifactId;
+        }
+
+        // Independent test replay for plan-scheduled tester tasks.
+        if (
+          card.role === "tester" &&
+          produced.testReportId &&
+          produced.testReportFromStructured
+        ) {
+          const classification = await this.replayTestReport({
+            card,
+            runId,
+            projectId,
+            workspaceRoot: handle.root,
+            testReportId: produced.testReportId,
+            timeoutMs: this.testReplayTimeoutMs,
+          });
+          if (classification === "contradiction") {
+            finished.delete(card.id);
+            launched.delete(card.id);
+            this.transitionTask(card, "failed");
+            testerRevisions++;
+            if (testerRevisions > this.maxTesterRevisions) {
+              this.cancelRemainingStages(stageRows);
+              this.emitEvent({
+                ts: new Date().toISOString(),
+                runId,
+                projectId,
+                actor: "system",
+                type: "run.failed",
+                reason: "tester claim contradicted by DevMesh replay (budget exhausted)",
+              });
+              return this.result("failed", card.id, projectId,
+                "tester revision budget exhausted (independent replay contradiction)");
+            }
+            // Route back to the upstream developer, whose implementation
+            // caused the contradiction.
+            const contradictionDevId = card.dependsOn[0];
+            const contradictionDev = contradictionDevId
+              ? this.storage.tasks.get(contradictionDevId as TaskId)
+              : null;
+            if (contradictionDev) {
+              if (canTransition(contradictionDev.status, "failed")) {
+                this.transitionTask(contradictionDev, "failed");
+              }
+              finished.delete(contradictionDev.id);
+              launched.delete(contradictionDev.id);
+            }
+            continue;
+          }
+        }
+
+        // Leave the task at "in_review" (not "done") so a downstream plan task
+        // failure can still reset and rebuild the responsible upstream task.
+        launched.delete(card.id);
+        continue;
+      }
+
+      // Failure / timeout / cancelled path for a plan task.
+      if (terminal === "timeout") {
+        this.transitionTask(card, "failed");
+        this.cancelRemainingStages(stageRows);
+        this.emitEvent({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "run.failed",
+          reason: `${card.role} timed out`,
+        });
+        return this.result("timeout", card.id, projectId, `${card.role} timed out`);
+      }
+      if (terminal === "cancelled") {
+        this.cancelRemainingStages(stageRows);
+        this.emitEvent({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "run.cancelled",
+          reason: `${card.role} was cancelled`,
+        });
+        return this.result("cancelled", card.id, projectId, `${card.role} was cancelled`);
+      }
+
+      // Doom-loop detection before entering a revision loop.
+      const lastExec = this.getLatestTaskExecution(card);
+      if (lastExec) {
+        const sig = computeFailureSignature(lastExec);
+        if (doomFor(card.id).recordFailure(card.role, sig)) {
+          this.cancelRemainingStages(stageRows);
+          this.transitionTask(card, "blocked");
+          this.blockAllRemaining(tasks, finished);
+          this.emitEvent({
+            ts: new Date().toISOString(),
+            runId,
+            projectId,
+            actor: "system",
+            type: "run.failed",
+            reason: `doom-loop: ${card.role} repeating identical failure`,
+          });
+          return this.result("failed", card.id, projectId,
+            `doom-loop: ${card.role} repeating identical failure`);
+        }
+      }
+      this.transitionTask(card, "failed");
+      launched.delete(card.id);
+
+      // Attempt budget exhausted → fail the pipeline. Use the fresh reload of
+      // the card (attempts are incremented by ExecutionService and don't
+      // propagate to the in-memory DAG card reference).
+      if (refreshed.attempts >= card.maxAttempts) {
+        this.transitionTask(card, "blocked");
+        this.blockAllRemaining(tasks, finished);
+        this.cancelRemainingStages(stageRows);
+        this.emitEvent({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "run.failed",
+          reason: `plan task exhausted attempts: ${card.title}`,
+        });
+        return this.result("failed", card.id, projectId,
+          `plan task exhausted attempts: ${card.title}`);
+      }
+
+      // Tester failure → route back to its upstream developer (retry the
+      // responsible developer task, which resets its downstream dependents).
+      if (card.role === "tester") {
+        const devId = card.dependsOn[0];
+        const devCard = devId ? this.storage.tasks.get(devId as TaskId) : null;
+        if (devCard) {
+          // Reset the developer so its deps/state allow a clean rebuild.
+          if (canTransition(devCard.status, "failed")) this.transitionTask(devCard, "failed");
+          finished.delete(devCard.id);
+          launched.delete(devCard.id);
+          // Downstream tasks depending on the developer (e.g. the tester that
+          // just failed) become unfinished so they re-run after the developer.
+          for (const t of tasks) {
+            if (t.id !== devCard.id && t.dependsOn.includes(devCard.id as TaskId)) {
+              finished.delete(t.id);
+              launched.delete(t.id);
+              if (canTransition(t.status, "failed")) this.transitionTask(t, "failed");
+            }
+          }
+        }
+        continue;
+      }
+
+      // Other task failure (developer/reviewer/architect) — retry the task
+      // itself up to its attempt budget.
+      continue;
+    }
+
+    if (this._cancelled) {
+      this.cancelRemainingStages(stageRows);
+      this.emitEvent({
+        ts: new Date().toISOString(),
+        runId,
+        projectId,
+        actor: "system",
+        type: "run.cancelled",
+        reason: "pipeline cancelled",
+      });
+      return this.result("cancelled", tasks[0]!.id, projectId, "pipeline cancelled");
+    }
+
+    // 5. Pipeline complete — all plan tasks done.
+    for (const t of tasks) {
+      if (!finished.has(t.id) && t.status !== "done") this.transitionTask(t, "done");
+    }
+    this.emitEvent({
+      ts: new Date().toISOString(),
+      runId,
+      projectId,
+      actor: "system",
+      type: "run.completed",
+      summary: "pipeline completed successfully",
+    });
+    return this.result("completed", tasks[tasks.length - 1]!.id, projectId);
+  }
+
+  /**
+   * Resolve the agent role for a plan task, honoring `respectPlanRoles` and
+   * the `fallbackChain`. Non-executable/unknown roles fall back to developer.
+   */
+  private resolvePlanRole(pt: PlanTask): AgentRole {
+    if (!this.respectPlanRoles) return "developer" as AgentRole;
+    const EXECUTABLE: ReadonlySet<string> = new Set([
+      "architect",
+      "developer",
+      "tester",
+      "reviewer",
+    ]);
+    const candidate = pt.role as AgentRole;
+    if (EXECUTABLE.has(candidate)) return candidate;
+    for (const fallback of this.fallbackChain) {
+      if (EXECUTABLE.has(fallback)) return fallback;
+    }
+    return "developer" as AgentRole;
+  }
+
+  /**
+   * Start a single plan task execution.
+   * - { kind: "started", rec } — execution is running.
+   * - { kind: "locked" } — the project already has a running execution
+   *   (workspace/locked); retryable, do NOT fail the pipeline.
+   * - { kind: "error", message } — a hard, non-retryable start failure.
+   * - null — task not launchable right now (deps unsatisfied / illegal state).
+   */
+  private async startDagTask(
+    card: TaskCard,
+    projectId: ProjectId,
+    workspaceRoot: string,
+  ): Promise<
+    | { kind: "started"; rec: ExecutionRecord }
+    | { kind: "locked" }
+    | { kind: "error"; message: string }
+    | null
+  > {
+    if (!this.areDependenciesSatisfied(card)) return null;
+    const current = this.storage.tasks.get(card.id as TaskId);
+    const from = current?.status ?? "pending";
+    if (canTransition(from, "ready")) {
+      // pending -> ready only; the ready -> running hop is applied by
+      // ExecutionService via tryStartTaskCard once the execution actually
+      // starts. Keeping "running" out of the orchestrator's hands means a
+      // locked start (workspace/locked) leaves the card at "ready" so it can
+      // be retried on the next scheduling loop pass.
+      this.transitionTask(card, "ready");
+    } else if (from !== "ready") {
+      return null;
+    }
+    const instruction = this.assembleInstruction(card, this.storage.tasks.listByRun(card.runId as never), workspaceRoot);
+
+    // --- Git checkpoint before a plan-scheduled developer task modifies files.
+    // Mirrors the linear-chain behavior; only the first attempt checkpoints so a
+    // revision loop doesn't stack redundant checkpoints. Rollback on a DAG
+    // pipeline failure (via result()) is otherwise a no-op because no checkpoint
+    // would ever exist.
+    if (card.role === "developer" && this.git && (current?.attempts ?? 0) <= 1) {
+      try {
+        const cp = this.git.checkpoint(workspaceRoot, `pre-developer-${card.attempts}`);
+        this.emitEvent({
+          ts: new Date().toISOString(),
+          runId: card.runId,
+          projectId,
+          actor: "system",
+          type: "run.started",
+          goal: `git checkpoint created: ${cp.label}`,
+        });
+      } catch (err) {
+        // SAFETY: Non-critical side-effect — checkpoint failure does not block
+        // the pipeline. Git rollback on failure will be a no-op if no checkpoint
+        // was created.
+        console.warn(
+          "[orchestrator] git checkpoint failed",
+          { runId: card.runId, error: err instanceof Error ? err.message : String(err) },
+        );
+      }
+    }
+
+    try {
+      const rec = await this.executionService.start({
+        projectId,
+        instruction,
+        taskId: card.id,
+        agentId: card.role,
+        ...(card.role === "architect" || card.role === "tester" || card.role === "reviewer"
+          ? { outputFormat: ARTIFACT_OUTPUT_FORMATS[card.role] }
+          : {}),
+      });
+      return { kind: "started", rec };
+    } catch (err) {
+      const code = (err as { code?: string })?.code;
+      // The project already has a running execution — this is concurrency
+      // pressure, not a failure. The caller retries on the next iteration.
+      if (code === "workspace/locked") {
+        return { kind: "locked" };
+      }
+      console.warn(
+        "[orchestrator] failed to start plan task",
+        { taskId: card.id, role: card.role, error: err instanceof Error ? err.message : String(err) },
+      );
+      return { kind: "error", message: `failed to start plan task ${card.title}` };
+    }
+  }
+
+  /** Wait until any of the currently-running plan executions reaches terminal. */
+  private async waitAnyDagTask(
+    running: Map<TaskCard, ExecutionRecord>,
+  ): Promise<{ card: TaskCard; rec: ExecutionRecord }> {
+    for (;;) {
+      const entries = [...running.entries()];
+      if (entries.length === 0) {
+        // Nothing running — nothing to wait for. Caller re-launches or exits.
+        return { card: null as never, rec: null as never };
+      }
+      if (this._cancelled) {
+        return { card: entries[0]![0], rec: entries[0]![1] };
+      }
+      for (const [card, rec] of entries) {
+        const latest = this.storage.executions.get(rec.id);
+        if (latest && latest.status !== "running") {
+          return { card, rec };
+        }
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+
+  /** Block every plan task that has not yet finished. */
+  private blockAllRemaining(tasks: TaskCard[], finished: Set<string>): void {
+    for (const t of tasks) {
+      if (!finished.has(t.id) && t.status !== "done") {
+        if (canTransition(t.status, "blocked")) this.transitionTask(t, "blocked");
+      }
+    }
   }
 
   // --- Internal helpers ---------------------------------------------------

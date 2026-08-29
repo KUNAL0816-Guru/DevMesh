@@ -773,20 +773,20 @@ existing behavior is preserved for agents that don't produce structured plans.
 
 #### Acceptance Criteria
 
-- [ ] Orchestrator parses `PlanPayload` from plan artifact after architect
+- [x] Orchestrator parses `PlanPayload` from plan artifact after architect
       stage
-- [ ] `validatePlanIntegrity()` is called; invalid plans fail the pipeline
-- [ ] Topological sort determines execution order from dependency graph
-- [ ] Tasks are executed in dependency order (ready tasks run before dependents)
-- [ ] Each plan task creates a `TaskCard` with correct `role` and `dependsOn`
-- [ ] Concurrent execution respects `maxConcurrency` limit
-- [ ] Pipeline completes when all plan tasks are `done`
-- [ ] Pipeline fails when any task exhausts attempts
-- [ ] Revision loops work per-plan-task (tester/reviewer failures route back
+- [x] `validatePlanIntegrity()` is called; invalid plans fail the pipeline
+- [x] Topological sort determines execution order from dependency graph
+- [x] Tasks are executed in dependency order (ready tasks run before dependents)
+- [x] Each plan task creates a `TaskCard` with correct `role` and `dependsOn`
+- [x] Concurrent execution respects `maxConcurrency` limit
+- [x] Pipeline completes when all plan tasks are `done`
+- [x] Pipeline fails when any task exhausts attempts
+- [x] Revision loops work per-plan-task (tester/reviewer failures route back
       to the responsible developer task)
-- [ ] Fallback to linear chain when plan has a single task or no plan artifact
-- [ ] Doom-loop detection works per-plan-task
-- [ ] Git checkpoints/rollback work per developer-task execution
+- [x] Fallback to linear chain when plan has a single task or no plan artifact
+- [x] Doom-loop detection works per-plan-task
+- [x] Git checkpoints/rollback work per developer-task execution
 
 #### Required Tests
 

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   type ProjectId,
   type TaskId,
+  type TaskCard,
   TerminalStateError,
   newArtifactId,
 } from "@devmesh/contracts";
@@ -3048,6 +3049,477 @@ describe("Orchestrator: Phase 7E — independent test replay", () => {
     // fail and trigger a contradiction. A completed run proves the cwd was the
     // workspace root.
     expect(result.status).toBe("completed");
+
+    await stack.storage.close();
+  });
+});
+
+describe("Orchestrator: Phase 7F — dynamic DAG execution", () => {
+  // A spec + multi-task plan produced by the architect via structured output.
+  function dagPlan(tasks: Array<Record<string, unknown>>) {
+    return {
+      spec: {
+        title: "DAG project",
+        summary: "a plan-driven multi-task project",
+        goals: ["ship"],
+        nonGoals: [],
+        constraints: [],
+        techStack: [],
+        risks: [],
+        openQuestions: [],
+      },
+      plan: { tasks },
+    };
+  }
+
+  function planTask(refKey: string, extra: Partial<Record<string, unknown>> = {}) {
+    return {
+      refKey,
+      role: "developer",
+      title: `Task ${refKey}`,
+      detail: `Implement ${refKey}`,
+      acceptanceCriteria: ["done"],
+      dependsOn: [] as string[],
+      ...extra,
+    };
+  }
+
+  // Factory that delegates to perAgentScript for the architect and all four
+  // linear roles, while letting developer tasks be routed by their title.
+  function planScript(
+    tasks: Array<Record<string, unknown>>,
+    devBehavior: (
+      title: string,
+    ) => { status?: "completed" | "failed"; effect?: () => void; text?: string },
+  ): FakeScriptFactory {
+    return (req) => {
+      const agentMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = agentMatch?.[1]?.toLowerCase() ?? "unknown";
+
+      if (role === "architect") {
+        return {
+          steps: [{ events: [{ kind: "text", text: "plan" }] }],
+          outcome: { status: "completed", finalText: "plan", structured: dagPlan(tasks) },
+          stepDelayMs: 5,
+        };
+      }
+      if (role === "developer") {
+        // Route by the embedded plan task refKey in the detail text.
+        const refKey = req.instruction.match(/Implement ([A-Za-z0-9_-]+)/)?.[1];
+        const behavior = devBehavior(refKey ?? "unknown");
+        return {
+          steps: [
+            {
+              effect: behavior.effect,
+              events: [{ kind: "text", text: behavior.text ?? "impl" }],
+            },
+          ],
+          outcome: {
+            status: behavior.status ?? "completed",
+            finalText: behavior.text ?? "impl",
+          },
+          stepDelayMs: 5,
+        };
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} ok` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    };
+  }
+
+  // Plan-scheduled task cards carry the "# Task" instruction appended in
+  // executeDag; the pre-created linear chain cards do not.
+  const planTasksOf = (stack: ReturnType<typeof makeStack>, runId: string): TaskCard[] =>
+    stack.storage.tasks
+      .listByRun(runId as never)
+      .filter((t) => t.detail.includes("# Task\nYou are the"));
+
+  it("parses a multi-task plan from the architect and runs the DAG", async () => {
+    const stack = makeStack(
+      planScript(
+        [planTask("task-1"), planTask("task-2", { dependsOn: ["task-1"] })],
+        () => ({}),
+      ),
+    );
+
+    const result = await stack.orchestrator.run(stack.projectId, "build a dag project");
+    expect(result.status).toBe("completed");
+
+    const runId = findLatestRunId(stack.storage)!;
+    const tasks = stack.storage.tasks.listByRun(runId as never);
+    // The plan schedules exactly the 2 plan tasks (NOT the 3-card linear tail).
+    const planTasks = planTasksOf(stack, runId);
+    expect(planTasks).toHaveLength(2);
+
+    // Architect and plan tasks reach terminal success; the superseded linear
+    // tail cards are cancelled rather than left dangling.
+    expect(tasks.find((t) => t.role === "architect")?.status).toBe("done");
+    for (const t of planTasks) {
+      expect(["done", "in_review"]).toContain(t.status);
+    }
+    expect(tasks.filter((t) => t.status === "cancelled").length).toBe(3);
+
+    await stack.storage.close();
+  });
+
+  it("creates plan tasks with correct dependencies from dependsOn refKeys", async () => {
+    const stack = makeStack(
+      planScript([planTask("t1"), planTask("t2", { dependsOn: ["t1"] })], () => ({})),
+    );
+    const result = await stack.orchestrator.run(stack.projectId, "plan deps");
+    expect(result.status).toBe("completed");
+
+    const runId = findLatestRunId(stack.storage)!;
+    const tasks = stack.storage.tasks.listByRun(runId as never);
+    const t1 = tasks.find((t) => t.detail.includes("Implement t1"))!;
+    const t2 = tasks.find((t) => t.detail.includes("Implement t2"))!;
+    expect(t2.dependsOn).toContain(t1.id);
+
+    await stack.storage.close();
+  });
+
+  it("executes tasks in topological dependency order", async () => {
+    const writeOrder: string[] = [];
+    const orderArr: string[] = [];
+    const stack = makeStack(
+      planScript(
+        [
+          planTask("a"),
+          planTask("b", { dependsOn: ["a"] }),
+          planTask("c", { dependsOn: ["a"] }),
+        ],
+        (title) => ({
+          effect: () => {
+            writeOrder.push(title);
+            orderArr.push(title);
+            writeFileSync(join(stack.root, `${title}.txt`), title);
+          },
+        }),
+      ),
+    );
+
+    const result = await stack.orchestrator.run(stack.projectId, "topo order");
+    expect(result.status).toBe("completed");
+
+    // b and c both depend on a, so a must come first.
+    expect(writeOrder[0]).toBe("a");
+    expect(writeOrder).toContain("b");
+    expect(writeOrder).toContain("c");
+
+    await stack.storage.close();
+  });
+
+  it("pipeline completes when all plan tasks reach done", async () => {
+    const stack = makeStack(
+      planScript(
+        [
+          planTask("x"),
+          planTask("y", { dependsOn: ["x"] }),
+          planTask("z", { dependsOn: ["x"] }),
+        ],
+        () => ({ effect: () => writeFileSync(join(stack.root, "f.js"), "x") }),
+      ),
+    );
+    const result = await stack.orchestrator.run(stack.projectId, "all done");
+    expect(result.status).toBe("completed");
+
+    const runId = findLatestRunId(stack.storage)!;
+    const planTasks = planTasksOf(stack, runId);
+    expect(planTasks).toHaveLength(3);
+    for (const t of planTasks) {
+      expect(["done", "in_review"]).toContain(t.status);
+    }
+    // run.completed emitted exactly once.
+    expect(getEventsOfType(stack.storage, "run.completed").length).toBe(1);
+
+    await stack.storage.close();
+  });
+
+  it("handles concurrency pressure above the ExecutionService project lock", async () => {
+    // ExecutionService permits only one active execution per project, so even
+    // with maxConcurrency=2 the DAG cannot run two tasks truly in parallel.
+    // The important guarantee is that concurrent pressure does NOT spuriously
+    // fail the pipeline: tasks are serialized by the project lock and all still
+    // complete.
+    const stack = makeStack(
+      planScript([planTask("one"), planTask("two")], () => ({
+        // No-op effect: serialization is proven via session/reply ordering.
+      })),
+    );
+    stack.orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      maxConcurrency: 2,
+      respectPlanRoles: true,
+    });
+
+    const result = await stack.orchestrator.run(stack.projectId, "concurrent");
+    expect(result.status).toBe("completed");
+
+    const runId = findLatestRunId(stack.storage)!;
+    const planTasks = planTasksOf(stack, runId);
+    expect(planTasks).toHaveLength(2);
+    for (const t of planTasks) {
+      expect(["done", "in_review"]).toContain(t.status);
+    }
+
+    await stack.storage.close();
+  });
+
+  it("serializes execution with maxConcurrency=1 (default)", async () => {
+    const stack = makeStack(
+      planScript([planTask("one"), planTask("two")], () => ({
+        // No-op effect: serialization is proven via session/reply ordering.
+      })),
+    );
+    // Default maxConcurrency is 1 — sequential.
+    const result = await stack.orchestrator.run(stack.projectId, "serial");
+    expect(result.status).toBe("completed");
+
+    const events = [...stack.storage.events.listAfter(0, 2000)];
+    const devOpens = events
+      .map((e, i) => ({ e, i }))
+      .filter(({ e }) => e.type === "agent.session.opened" && e.role === "developer")
+      .map(({ i }) => i);
+    const firstReply = events.findIndex((e) => e.type === "agent.reply.completed");
+    expect(devOpens.length).toBe(2);
+    // With default concurrency, the second developer start happens only after
+    // the first developer reply completed.
+    expect(devOpens[1]).toBeGreaterThan(firstReply);
+
+    await stack.storage.close();
+  });
+
+  it("falls back to the linear chain when the plan has a single task", async () => {
+    const stack = makeStack(
+      planScript([planTask("only", { role: "developer" })], () => ({
+        effect: () => writeFileSync(join(stack.root, "app.js"), "x"),
+      })),
+    );
+    const result = await stack.orchestrator.run(stack.projectId, "single task plan");
+    expect(result.status).toBe("completed");
+
+    const runId = findLatestRunId(stack.storage)!;
+    const tasks = stack.storage.tasks.listByRun(runId as never);
+    // Single-task plan -> full 4-card linear chain.
+    expect(tasks).toHaveLength(4);
+    expect(getEventsOfType(stack.storage, "task.created").length).toBe(4);
+
+    await stack.storage.close();
+  });
+
+  it("falls back to the linear chain when no plan artifact is produced", async () => {
+    // Architect emits no structured output at all -> no plan artifact.
+    const stack = makeStack(
+      perAgentScript({
+        architect: { text: "A general analysis without a structured plan" },
+        developer: {
+          effect: () => writeFileSync(join(stack.root, "app.js"), "x"),
+          text: "impl",
+        },
+        tester: { text: "pass" },
+        reviewer: { text: "APPROVED" },
+      }),
+    );
+    const result = await stack.orchestrator.run(stack.projectId, "no plan");
+    expect(result.status).toBe("completed");
+
+    const runId = findLatestRunId(stack.storage)!;
+    const tasks = stack.storage.tasks.listByRun(runId as never);
+    expect(tasks).toHaveLength(4);
+    expect(getEventsOfType(stack.storage, "task.created").length).toBe(4);
+
+    await stack.storage.close();
+  });
+
+  it("invalid plan (dangling dependency) fails the pipeline", async () => {
+    // task-2 depends on a nonexistent refKey "ghost".
+    const stack = makeStack(
+      planScript([planTask("task-1"), planTask("task-2", { dependsOn: ["ghost"] })], () => ({})),
+    );
+    const result = await stack.orchestrator.run(stack.projectId, "invalid plan");
+    expect(result.status).toBe("failed");
+    expect(result.errorMessage).toContain("invalid plan");
+
+    await stack.storage.close();
+  });
+
+  it("per-plan-task revision loop: a failing developer task retries", async () => {
+    const attempts = new Map<string, number>();
+    const stack = makeStack(
+      planScript([planTask("flaky"), planTask("stable")], (title) => {
+        if (title === "flaky") {
+          const n = (attempts.get("flaky") ?? 0) + 1;
+          attempts.set("flaky", n);
+          if (n === 1) {
+            return { status: "failed", text: "flaky build error" };
+          }
+          return { effect: () => writeFileSync(join(stack.root, "flaky.txt"), "ok") };
+        }
+        return { effect: () => writeFileSync(join(stack.root, "stable.txt"), "ok") };
+      }),
+    );
+
+    const result = await stack.orchestrator.run(stack.projectId, "flaky task");
+    expect(result.status).toBe("completed");
+    expect(attempts.get("flaky")).toBe(2);
+
+    const runId = findLatestRunId(stack.storage)!;
+    const tasks = stack.storage.tasks.listByRun(runId as never);
+    const flaky = tasks.find((t) => t.detail.includes("Implement flaky"))!;
+    expect(flaky.attempts).toBeGreaterThanOrEqual(2);
+
+    await stack.storage.close();
+  });
+
+  it("per-plan-task doom-loop detection terminates on repeated identical failure", async () => {
+    // Two plan tasks, both of which fail with an identical signature every
+    // time, so the per-task doom-loop detector fires before the attempt budget.
+    const stack = makeStack(
+      planScript(
+        [
+          planTask("loop-1", { role: "developer" }),
+          planTask("loop-2", { role: "developer", dependsOn: ["loop-1"] }),
+        ],
+        () => ({ status: "failed", text: "build failed" }),
+      ),
+    );
+
+    // Override doom-loop threshold low so it fires before the attempt budget.
+    stack.orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      doomLoopThreshold: 2,
+      taskMaxAttempts: { developer: 10 },
+    });
+
+    const result = await stack.orchestrator.run(stack.projectId, "doom loop task");
+    expect(result.status).toBe("failed");
+    expect(result.errorMessage).toContain("doom-loop");
+
+    await stack.storage.close();
+  });
+
+  it("pipeline fails when a plan task exhausts its attempt budget", async () => {
+    const stack = makeStack(
+      planScript([planTask("bad"), planTask("good")], (title) => {
+        if (title === "bad") return { status: "failed", text: "always fails" };
+        return { effect: () => writeFileSync(join(stack.root, "good.txt"), "ok") };
+      }),
+    );
+    // Give the bad task a single-shot budget so it fails fast.
+    stack.orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      taskMaxAttempts: { developer: 1 },
+    });
+
+    const result = await stack.orchestrator.run(stack.projectId, "bad task");
+    expect(result.status).toBe("failed");
+    expect(result.errorMessage).toContain("exhausted");
+
+    await stack.storage.close();
+  });
+
+  it("respectPlanRoles=false routes all plan tasks to the developer agent", async () => {
+    const usedRoles = new Set<string>();
+    const stack = makeStack((req) => {
+      const agentMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = agentMatch?.[1]?.toLowerCase() ?? "unknown";
+      usedRoles.add(role);
+      if (role === "architect") {
+        return {
+          steps: [{ events: [{ kind: "text", text: "plan" }] }],
+          outcome: {
+            status: "completed",
+            finalText: "plan",
+            structured: dagPlan([
+              { ...planTask("t1", { role: "architect" }) },
+              { ...planTask("t2", { role: "reviewer" }) },
+            ]),
+          },
+          stepDelayMs: 5,
+        };
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} ok` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+    stack.orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      respectPlanRoles: false,
+      fallbackChain: ["developer"],
+    });
+
+    const result = await stack.orchestrator.run(stack.projectId, "force developer");
+    expect(result.status).toBe("completed");
+
+    // Only the architect runs as architect; the plan tasks are all developers.
+    // Legacy linear-chain cards are retired as "cancelled" and don't count.
+    const runId = findLatestRunId(stack.storage)!;
+    const tasks = stack.storage.tasks.listByRun(runId as never);
+    const active = tasks.filter((t) => t.status !== "cancelled");
+    const devTasks = active.filter((t) => t.role === "developer");
+    const archTasks = active.filter((t) => t.role === "architect");
+    expect(devTasks).toHaveLength(2);
+    expect(archTasks).toHaveLength(1);
+
+    await stack.storage.close();
+  });
+
+  it("creates a git checkpoint before a DAG developer task and rolls back on failure", async () => {
+    const { GitService } = await import("@devmesh/workspace");
+    const git = new GitService();
+
+    const stack = makeStack(
+      planScript(
+        [
+          planTask("t1"),
+          planTask("t2", { dependsOn: ["t1"] }),
+        ],
+        (title) => {
+          if (title === "t1") {
+            return {
+              status: "failed",
+              effect: () => writeFileSync(join(stack.root, "app.js"), "broken"),
+            };
+          }
+          return {};
+        },
+      ),
+    );
+
+    git.init(stack.root);
+    stack.orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      git,
+      taskMaxAttempts: { developer: 1 },
+    });
+
+    const result = await stack.orchestrator.run(stack.projectId, "git dag task");
+    // t1 writes a broken file then fails and exhausts its single-shot budget,
+    // failing the pipeline and triggering rollback.
+    expect(result.status).toBe("failed");
+
+    // A checkpoint must have been created before the plan developer ran.
+    const handle = stack.ws.get(stack.projectId);
+    const checkpoints = git.listCheckpoints(handle.root);
+    expect(checkpoints.length).toBeGreaterThanOrEqual(1);
+
+    // Rollback should have removed the broken file written by t1.
+    const { existsSync } = await import("node:fs");
+    expect(existsSync(join(handle.root, "app.js"))).toBe(false);
 
     await stack.storage.close();
   });
