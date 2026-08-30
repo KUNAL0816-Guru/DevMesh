@@ -14,9 +14,11 @@ import type { AgentRegistry } from "@devmesh/agents";
 import { createDefaultAgentRegistry } from "@devmesh/agents";
 import { z } from "zod";
 import type { Config } from "./config.js";
+import { budgetConfigFromConfig, pricingRulesFromConfig } from "./config.js";
 import { normalizeError } from "./errors-map.js";
 import { GitService } from "@devmesh/workspace";
 import { ExecutionService } from "./executions/service.js";
+import { createPriceTable } from "./executions/pricing.js";
 import { VERIFICATION_COMMAND_PATTERN } from "./executions/commands.js";
 import { Orchestrator } from "./orchestrator.js";
 import type { DomainEvent } from "@devmesh/contracts";
@@ -77,6 +79,8 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
 
   const startedAt = Date.now();
   const git = new GitService();
+  const budgetConfig = budgetConfigFromConfig(opts.config);
+  const priceRules = pricingRulesFromConfig(opts.config);
   const executions = new ExecutionService({
     storage: opts.storage,
     workspaces: opts.workspaces,
@@ -85,6 +89,8 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
     agents: opts.agents ?? createDefaultAgentRegistry(),
     defaultTimeoutMs: opts.config.execTimeoutMs,
     defaultModel: opts.config.opencodeModel,
+    ...(budgetConfig ? { budget: budgetConfig } : {}),
+    ...(priceRules.length > 0 ? { pricing: createPriceTable(priceRules) } : {}),
   });
 
   // In-memory registry of active pipeline runs (runId → Orchestrator).

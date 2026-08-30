@@ -1,9 +1,9 @@
 # DevMesh Development Plan
 
 > Status: active
-> Last updated: 2026-08-30 (post Phase 8B — Phases 0–8B complete; Phases 8C–14 planned)
+> Last updated: 2026-08-30 (post Phase 8C — Phases 0–8C complete; Phases 9–14 planned)
 > Reference: docs/adr/0001-approved-architecture.md
-> Test baseline: 459 passed, 5 skipped, 0 failed
+> Test baseline: 506 passed, 5 skipped, 0 failed
 
 ---
 
@@ -33,6 +33,9 @@ agent runtime is OpenCode behind a swappable adapter port.
 - Workspace service with symlink escape protection and FIFO mutex locking
 - Usage reporting + persistence (Phase 8A): runtime-reported tokens recorded per execution
 - Usage aggregation (Phase 8B): read-only run/task rollups with correct unknown semantics
+- Cost pricing + budget enforcement (Phase 8C): config-driven pricing derives `costUsdMicros`
+  (stamped `derived`, reported cost preserved), and per-run/per-task token & micro-USD gates
+  reject over-limit starts before they run (HTTP 409 `budget/exhausted`)
 
 ---
 
@@ -437,7 +440,7 @@ inconsistent writes.
 | Amendment 5a | Test reports reference an exact invocation; DevMesh replays it | ✅ Resolved — Phase 7E independent replay of the `test_report` invocation, producing a `verification.v1` artifact |
 | Amendment 5b | Unverifiable claims fail the task | ✅ Resolved — Phase 7E replay verification integrated into pipeline flow; contradicting replay routes back to developer |
 | Consequence | Resumable runs | ✅ Resolved — Phase 7C `POST /pipelines/:runId/resume` |
-| Consequence | Budget enforcement (token/cost) | ⏳ Usage tracked & recorded (Phases 8A/8B); enforcement pending — Phase 8C pricing + budget gates |
+| Consequence | Budget enforcement (token/cost) | ✅ Resolved — Phase 8C config-driven pricing + per-run/per-task budget gates; conservative default (no budget configured) preserves pre-8C behavior |
 | Context | Context entries as derived facts | ✅ Resolved — Phase 7A REST read API |
 
 ---
@@ -878,11 +881,11 @@ existing behavior is preserved for agents that don't produce structured plans.
 
 ---
 
-## Phase 8: Usage Accounting — 8A & 8B COMPLETE
+## Phase 8: Usage Accounting — 8A, 8B & 8C COMPLETE
 
 Usage accounting is delivered as sub-phases. Core intent (ADR consequence):
 track `usage` from `AgentReply` and record it per execution so per-run and
-per-task budgets can be enforced later (Phase 8C).
+per-task budgets can be enforced.
 
 ### Phase 8A: Usage Reporting and Persistence — COMPLETE
 
@@ -969,49 +972,73 @@ Unknown semantics (documented on `aggregateUsage`):
 
 **Estimated new tests: ~11** (actual: 11 added)
 
-### Phase 8C: Cost Pricing and Budget Enforcement (Future, Not Yet Started)
+### Phase 8C: Cost Pricing and Budget Enforcement — COMPLETE
 
 **Goal:** Derive nominal cost from config-driven pricing and enforce per-run and
 per-task token/cost budgets, so a runaway agent cannot exhaust the device.
 
 #### Implementation
 
-1. `packages/contracts`: `PricingRule` schema mapping `provider/model-id` →
-   `{ inputPerMsToken, outputPerMsToken, currency }` with unit conversion to
-   micro-USD.
-2. `packages/config` (new or existing): load a pricing table + budget defaults
-   (`maxTokensPerRun`, `maxCostUsdPerRun`, per-task equivalents).
-3. `packages/server` `ExecutionService`: when runtime reports tokens but no
-   cost, derive `costUsdMicros` from the pricing rule and stamp
-   `usageSource: "derived"` (Phase 8B aggregation already preserves this).
-4. Budget gate in the orchestrator task loop:
-   - after each `execution.completed`, query `summarizeRunUsage` /
-     `summarizeTaskUsage`;
-   - if a run/task budget is exceeded, mark the pipeline/task as
-     `failed` with a `budget.exceeded` failure kind and surface a
-     `run.failed`/`task.transitioned` event;
-   - per-task budget routes back as a revision failure; per-run budget
-     terminates the pipeline.
+1. `packages/contracts`: `PricingRule` schema mapping a neutral `provider/model`
+   selector → `{ inputUsdMicrosPerMillion, outputUsdMicrosPerMillion, currency }`
+   in integer micro-USD per one million tokens, with a deterministic
+   `usdToMicros()` conversion so all downstream cost arithmetic stays integer-only.
+2. `packages/config` (`packages/server/src/config.ts`): optional `budget`
+   (`maxTokens`, `maxCostUsd`, `behavior: warn|block`, `unknownUsage`, and a
+   `reservationTokens` optimistic per-start estimate) and `pricing` (array of
+   human-USD-per-million rules) blocks, loadable from `DEVMESH_BUDGET` /
+   `DEVMESH_PRICING` or the config schema. Absent configuration is a
+   **conservative default**: no gates and no derived cost (identical to pre-8C).
+3. `packages/server` `ExecutionService` (`executions/pricing.ts`): when the
+   runtime reports tokens but no cost, `usageWithDerivedCost` derives
+   `costUsdMicros` from the matching pricing rule (BigInt arithmetic,
+   round-half-up) and stamps `usageSource: "derived"`. Runtime-reported costs
+   are never overwritten.
+4. Budget gate in `ExecutionService.start` (`executions/budget.ts`): the
+   authoritative pre-start gate for every execution path (direct/API and both
+   orchestrator schedulers). Task executions clear BOTH their task scope and the
+   linked run scope; direct executions clear a transient run scope. It reads the
+   committed aggregate (`aggregateCommittedRunUsage` /
+   `summarizeTaskCommittedUsage` — terminal-status-only, Phase 8B semantics),
+   adds in-process ledger reservations, and throws `BudgetError` (HTTP 409
+   `budget/exhausted`) before anything is persisted or started. `warn` behavior
+   allows the start and surfaces an `error.raised` budget warning; after each
+   execution completes the service reconciles the committed scopes and emits a
+   non-fatal "budget concern" for any overshoot.
+5. Orchestrator reaction: a run-scope exhaustion blocks the pipeline (stage →
+   `failed`, remaining stages cancelled, run → `failed` with a budget message and
+   `run.failed` event). A task-scope exhaustion can never start, so the card is
+   transitioned `ready → blocked` (the only legal terminal-adjacent transition)
+   and the run fails — functionally equivalent to a revision-failure treatment,
+   but strictly safer: a revision loop cannot make progress because the exhausted
+   task-scope gate rejects every retry.
 
 #### Acceptance Criteria
 
-- [ ] `PricingRule` validates provider/model and non-negative prices
-- [ ] Cost derivation is deterministic and stamped `derived`
-- [ ] Runtime-reported costs are never overwritten
-- [ ] Per-task budget exhaustion fails the task and enters the revision cycle
-- [ ] Per-run budget exhaustion fails the pipeline
-- [ ] Budget check runs after each execution, not only at the end
-- [ ] Zero/unknown usage is handled without a false budget breach
+- [x] `PricingRule` validates provider/model and non-negative prices
+- [x] Cost derivation is deterministic and stamped `derived`
+- [x] Runtime-reported costs are never overwritten
+- [x] Per-task budget exhaustion fails the task/run without entering a retry
+      loop — the card transitions `ready → blocked` (the revision-cycle path
+      cannot progress on an exhausted task scope), the run fails, and a
+      `run.failed` event surfaces the budget reason
+- [x] Per-run budget exhaustion fails the pipeline
+- [x] Budget check runs before every start and is reconciled after each
+      execution, not only at the end
+- [x] Zero/unknown usage is handled without a false budget breach (unknown
+      cost/tokens skip their check; `unknownUsage: "block"` is opt-in)
 
 #### Required Tests
 
 | File | Tests |
 |---|---|
-| `contracts/pricing.test.ts` (new) | Pricing schema, unit conversion |
-| `server/executions.test.ts` | Derived cost stamping, reported-cost preservation |
-| `server/orchestrator.test.ts` | Per-task budget revision, per-run budget failure, boundary cases |
+| `contracts/pricing.test.ts` | Pricing schema, unit conversion |
+| `server/executions/pricing.test.ts` | PriceTable lookup, derived-cost stamping, reported-cost preservation |
+| `server/executions/budget.test.ts` | Pure `evaluateBudget` (token/cost/unknown/warn), reservation ledger |
+| `server/executions/budget-service.test.ts` | HTTP 409 gate (task/run/unknown), warn path, post-completion concern, reservation release, derived cost via app |
+| `server/budget-orchestrator.test.ts` | Run-exhaustion pipeline failure, DAG blocked task, warn keeps pipeline running, serialized gate |
 
-**Estimated new tests: ~10**
+**Implemented tests: 47 (5 files, all passing)**
 
 ### Phase 9: Approval Flow (Future, Not Yet Started)
 
@@ -1220,6 +1247,7 @@ plugin and MCP server.
 |---|---|---|---|---|
 | 8A | Usage reporting + persistence | ~6 (adapter, runtime, storage, service) | done | Low — additive columns + boundary validation |
 | 8B | Usage aggregation | 11 new storage tests | done | Low — pure read-only SQL aggregation |
+| 8C | Cost pricing + budget enforcement | 47 new (pricing, budget gate/ledger, service, orchestrator) | done | Low — integer-only arithmetic; conservative default when unconfigured |
 
 ---
 
@@ -1227,7 +1255,7 @@ plugin and MCP server.
 
 | Phase | Focus | ADR Ref | Est. Tests | Status |
 |---|---|---|---|---|
-| 8C | Cost pricing + budget enforcement | Consequence | ~10 | Not started |
+| 8C | Cost pricing + budget enforcement | Consequence | ~10 | ✅ Complete (47 tests) |
 | 9 | Approval flow | Events catalog | ~10 | Not started |
 | 10 | Model/provider gateway | Amendment 6 | ~8 | Not started |
 | 11 | Additional agent roles | Amendment 3 | ~8 | Not started |
@@ -1235,12 +1263,12 @@ plugin and MCP server.
 | 13 | Frontend/UI | Amendment 7 | ~2 | Not started |
 | 14 | Security hardening, permissions, MCP & plugin packaging | ADR/README | ~12 | Not started |
 
-> All Phases 8C–14 are **planned only** — none are implemented. Detailed
-> goals, acceptance criteria, and required tests for each appear above.
+> Phases 9–14 are **planned only** — none are implemented. Detailed goals,
+> acceptance criteria, and required tests for each appear above.
 
 ---
 
-## Appendix: Test File Inventory (post Phase 8B)
+## Appendix: Test File Inventory (post Phase 8C)
 
 | File | Tests | Area |
 |---|---|---|
@@ -1252,10 +1280,11 @@ plugin and MCP server.
 | `contracts/src/context.test.ts` | 5 | Context entries |
 | `contracts/src/manifest.test.ts` | 4 | Agent manifests |
 | `contracts/src/pipeline.test.ts` | 7 | Pipeline run schema |
+| `contracts/src/pricing.test.ts` | 7 | Pricing schema + unit conversion (8C) |
 | `runtime/src/fake.test.ts` | 6 | FakeRuntime (incl. structured output) |
 | `agents/src/agents.test.ts` | 8 | Registry + builtins |
 | `opencode-adapter/src/adapter.test.ts` | 7 | Adapter integration |
-| `storage/src/storage.test.ts` | 83 | All repositories + migrations + diagnostics + usage aggregation |
+| `storage/src/storage.test.ts` | 83 | All repositories + migrations + diagnostics + usage aggregation (incl. committed-only 8C variants) |
 | `workspace/src/git.test.ts` | 20 | Git operations + checkpoints |
 | `workspace/src/locks.test.ts` | 6 | MutexMap |
 | `workspace/src/paths.test.ts` | 5 | Path safety |
@@ -1264,14 +1293,18 @@ plugin and MCP server.
 | `server/src/orchestrator.test.ts` | 105 | Orchestrator (DAG, replay, structured, resume, lifecycle) |
 | `server/src/executions.test.ts` | 21 | Execution service |
 | `server/src/executions/verify.test.ts` | 17 | Independent test replay verification |
+| `server/src/executions/pricing.test.ts` | 10 | PriceTable + derived cost (8C) |
+| `server/src/executions/budget.test.ts` | 17 | Budget evaluation + ledger (8C) |
+| `server/src/executions/budget-service.test.ts` | 9 | Budget gate + derived cost via HTTP (8C) |
+| `server/src/budget-orchestrator.test.ts` | 4 | Orchestrator budget reaction (8C) |
 | `server/src/pipeline-sse.test.ts` | 24 | SSE streaming |
 | `server/src/orchestrator-real.test.ts` | 1 | Real OpenCode (gated) |
 | `server/src/opencode-real.test.ts` | 4 | Real OpenCode E2E (gated) |
-| **Total** | **432 (427 passed, 5 skipped)** | |
+| **Total (listed)** | **479 `it(`/`test(` occurrences summed** | 8C adds 47 across 5 files |
 
 > Counts above reflect the `it(`/`test(` occurrences per file and are
-> approximate; the authoritative number comes from `npm test`
-> (427 passed, 5 skipped, 0 failed).
+> approximate (vitest's numeric total includes dynamically-defined subtests);
+> the authoritative number comes from `npm test` (506 passed, 5 skipped, 0 failed).
 
 ### Known Test Gaps — all resolved
 

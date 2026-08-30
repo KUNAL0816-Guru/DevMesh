@@ -24,6 +24,7 @@ const STATUS_BY_CODE: Readonly<Record<string, number>> = {
   "agent/unknown": 400,
   "agent/not-executable": 409,
   "task/exhausted": 409,
+  "budget/exhausted": 409,
 };
 
 export interface NormalizedError {

@@ -1353,13 +1353,19 @@ function aggregateUsage(
   };
 }
 
+/** Terminal execution statuses only. */
+const COMMITTED_STATUS_FILTER = "AND status IN ('completed', 'failed', 'timeout', 'cancelled')";
+
 function taskUsageSummary(
   db: Database,
   task: { id: string; run_id: string; role: string; title: string },
+  onlyCommitted = false,
 ): TaskUsageSummary {
   const rows = db
     .prepare(
-      `SELECT ${EXECUTION_COLUMNS} FROM executions WHERE task_id = ? ORDER BY started_at`,
+      `SELECT ${EXECUTION_COLUMNS} FROM executions
+       WHERE task_id = ? ${onlyCommitted ? COMMITTED_STATUS_FILTER : ""}
+       ORDER BY started_at`,
     )
     .all(task.id) as unknown as ExecutionRow[];
   const executions = rows.map(rowToExecution);
@@ -1373,6 +1379,47 @@ function taskUsageSummary(
     unknownExecutionCount,
     totals,
   };
+}
+
+/** Every execution belonging to a pipeline run (see summarizeRunUsage). */
+function runUsageExecutions(
+  db: Database,
+  runId: string,
+  onlyCommitted = false,
+): ExecutionRow[] {
+  return db
+    .prepare(
+      `SELECT ${EXECUTION_COLUMNS} FROM executions
+       WHERE id IN (
+         SELECT id FROM executions WHERE run_id = ?
+         UNION
+         SELECT e.id FROM executions e
+         INNER JOIN tasks t ON e.task_id = t.id
+         WHERE t.run_id = ?
+       )
+       ${onlyCommitted ? COMMITTED_STATUS_FILTER : ""}
+       ORDER BY started_at`,
+    )
+    .all(runId, runId) as unknown as ExecutionRow[];
+}
+
+export interface CommittedRunAggregate {
+  executionCount: number;
+  unknownExecutionCount: number;
+  totals: ExecutionUsage;
+}
+
+/**
+ * Committed (terminal-only) usage aggregate over every execution matching a
+ * run linkage by EITHER convention (task-link or legacy run_id). Unlike
+ * summarizeRunUsage it does NOT require a pipeline_runs row, so it also works
+ * for transient direct/API executions that have no pipeline run of their own.
+ */
+export function aggregateCommittedRunUsage(db: Database, runId: string): CommittedRunAggregate {
+  const rows = runUsageExecutions(db, runId, true);
+  const executions = rows.map(rowToExecution);
+  const { totals, unknownExecutionCount } = aggregateUsage(executions);
+  return { executionCount: executions.length, unknownExecutionCount, totals };
 }
 
 /**
@@ -1390,19 +1437,7 @@ export function summarizeRunUsage(db: Database, runId: string): RunUsageSummary 
     .get(runId) as unknown as PipelineRunRow | undefined;
   if (!run) return null;
 
-  const rows = db
-    .prepare(
-      `SELECT ${EXECUTION_COLUMNS} FROM executions
-       WHERE id IN (
-         SELECT id FROM executions WHERE run_id = ?
-         UNION
-         SELECT e.id FROM executions e
-         INNER JOIN tasks t ON e.task_id = t.id
-         WHERE t.run_id = ?
-       )
-       ORDER BY started_at`,
-    )
-    .all(runId, runId) as unknown as ExecutionRow[];
+  const rows = runUsageExecutions(db, runId);
   const executions = rows.map(rowToExecution);
   const { totals, unknownExecutionCount } = aggregateUsage(executions);
 
@@ -1423,6 +1458,38 @@ export function summarizeRunUsage(db: Database, runId: string): RunUsageSummary 
 }
 
 /**
+ * Committed-only variant of summarizeRunUsage: aggregates usage over terminal
+ * executions (completed / failed / timeout / cancelled) and their terminal
+ * per-task breakdowns. In-flight executions are excluded, making this stable
+ * for budget reconciliation. Returns null when the pipeline run does not exist.
+ */
+export function summarizeRunCommittedUsage(db: Database, runId: string): RunUsageSummary | null {
+  const run = db
+    .prepare(`SELECT ${PR_COLUMNS} FROM pipeline_runs WHERE id = ?`)
+    .get(runId) as unknown as PipelineRunRow | undefined;
+  if (!run) return null;
+
+  const rows = runUsageExecutions(db, runId, true);
+  const executions = rows.map(rowToExecution);
+  const { totals, unknownExecutionCount } = aggregateUsage(executions);
+
+  const taskRows = db
+    .prepare(
+      "SELECT id, run_id, role, title FROM tasks WHERE run_id = ? ORDER BY created_at",
+    )
+    .all(runId) as unknown as Array<{ id: string; run_id: string; role: string; title: string }>;
+
+  return {
+    runId,
+    projectId: run.project_id,
+    executionCount: executions.length,
+    unknownExecutionCount,
+    totals,
+    perTask: taskRows.map((t) => taskUsageSummary(db, t, true)),
+  };
+}
+
+/**
  * Aggregate usage for every execution attributed to a single task via
  * `executions.task_id`. Returns null when the task does not exist.
  */
@@ -1432,6 +1499,18 @@ export function summarizeTaskUsage(db: Database, taskId: string): TaskUsageSumma
     .get(taskId) as unknown as { id: string; run_id: string; role: string; title: string } | undefined;
   if (!task) return null;
   return taskUsageSummary(db, task);
+}
+
+/**
+ * Committed-only variant of summarizeTaskUsage: aggregates usage over terminal
+ * executions attributed to the task. Returns null when the task does not exist.
+ */
+export function summarizeTaskCommittedUsage(db: Database, taskId: string): TaskUsageSummary | null {
+  const task = db
+    .prepare("SELECT id, run_id, role, title FROM tasks WHERE id = ?")
+    .get(taskId) as unknown as { id: string; run_id: string; role: string; title: string } | undefined;
+  if (!task) return null;
+  return taskUsageSummary(db, task, true);
 }
 
 // ---------------------------------------------------------------------------

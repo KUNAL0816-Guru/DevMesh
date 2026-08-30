@@ -530,11 +530,16 @@ export class Orchestrator {
             : {}),
         });
       } catch (err) {
+        const isBudget = (err as { code?: string })?.code === "budget/exhausted";
         this.finishStage(currentStage, "failed");
         this.cancelRemainingStages(stageRows);
-        this.transitionTask(card, "failed");
+        // ready -> failed is illegal; a budget-exhausted stage can never start,
+        // so aim at "blocked" (ready -> blocked is legal) for truthfulness.
+        this.transitionTask(card, isBudget ? "blocked" : "failed");
         return this.result("failed", card.id, projectId,
-          `failed to start ${role}: ${err instanceof Error ? err.message : String(err)}`);
+          isBudget
+            ? `budget exhausted for ${role}: ${err instanceof Error ? err.message : String(err)}`
+            : `failed to start ${role}: ${err instanceof Error ? err.message : String(err)}`);
       }
 
       // Wait for terminal state
@@ -1186,11 +1191,16 @@ export class Orchestrator {
             : {}),
         });
       } catch (err) {
+        const isBudget = (err as { code?: string })?.code === "budget/exhausted";
         this.finishStage(currentStage, "failed");
         this.cancelRemainingStages(stageRows);
-        this.transitionTask(card, "failed");
+        // ready -> failed is illegal; a budget-exhausted stage can never start,
+        // so aim at "blocked" (ready -> blocked is legal) for truthfulness.
+        this.transitionTask(card, isBudget ? "blocked" : "failed");
         return this.result("failed", card.id, projectId,
-          `failed to start ${role}: ${err instanceof Error ? err.message : String(err)}`);
+          isBudget
+            ? `budget exhausted for ${role}: ${err instanceof Error ? err.message : String(err)}`
+            : `failed to start ${role}: ${err instanceof Error ? err.message : String(err)}`);
       }
 
       const terminal = await this.waitForTerminal(card.id, rec.id);
@@ -2031,6 +2041,13 @@ export class Orchestrator {
       // pressure, not a failure. The caller retries on the next iteration.
       if (code === "workspace/locked") {
         return { kind: "locked" };
+      }
+      // Task-level budget exhaustion: mark the card blocked (ready -> blocked
+      // is legal; a running execution is never disturbed). The caller fails
+      // the run via the "error" branch.
+      if (code === "budget/exhausted") {
+        this.transitionTask(card, "blocked");
+        return { kind: "error", message: `budget exhausted for plan task ${card.title}` };
       }
       console.warn(
         "[orchestrator] failed to start plan task",

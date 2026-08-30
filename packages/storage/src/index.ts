@@ -39,8 +39,8 @@ export interface CreateStorageOptions {
   path: string;
 }
 
-export type { ExecutionRecord, ExecutionRowStatus, ExecutionUsage, PipelineRunRecord, PipelineRunSummary, PipelineHealth, RevisionCycleRecord, ConsistencyViolation, StageRecord, StageStatus, RunUsageSummary, TaskUsageSummary } from "./repos.js";
-export { pipelineRunSummary, pipelineHealth, assertPipelineConsistency, summarizeRunUsage, summarizeTaskUsage } from "./repos.js";
+export type { ExecutionRecord, ExecutionRowStatus, ExecutionUsage, PipelineRunRecord, PipelineRunSummary, PipelineHealth, RevisionCycleRecord, ConsistencyViolation, StageRecord, StageStatus, RunUsageSummary, TaskUsageSummary, CommittedRunAggregate } from "./repos.js";
+export { pipelineRunSummary, pipelineHealth, assertPipelineConsistency, summarizeRunUsage, summarizeTaskUsage, summarizeRunCommittedUsage, summarizeTaskCommittedUsage, aggregateCommittedRunUsage } from "./repos.js";
 export { EventBus } from "./event-bus.js";
 
 /**
