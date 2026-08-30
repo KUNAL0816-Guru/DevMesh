@@ -215,6 +215,35 @@ const MIGRATIONS: readonly Migration[] = [
        -- 'derived' = computed by DevMesh from config pricing.`,
     ],
   },
+  {
+    version: 10,
+    name: "approvals",
+    up: [
+      `CREATE TABLE approvals (
+         id           TEXT PRIMARY KEY,
+         project_id   TEXT NOT NULL REFERENCES projects(id),
+         run_id       TEXT NOT NULL,
+         task_id      TEXT,
+         kind         TEXT NOT NULL,
+           -- what kind of action needs approval (e.g. 'destructive_git',
+           -- 'external_network', 'cost_cap_release')
+         title        TEXT NOT NULL,
+         detail       TEXT NOT NULL DEFAULT '',
+         risk         TEXT NOT NULL,
+           -- 'low' | 'medium' | 'high' | 'critical'
+         status       TEXT NOT NULL DEFAULT 'pending',
+           -- 'pending' | 'approved' | 'denied'
+         requested_at TEXT NOT NULL,
+         resolved_at  TEXT,
+         decision     TEXT,
+           -- 'allow' | 'deny', once status is approved/denied
+         decided_by   TEXT
+           -- 'user', once resolved
+       );
+       CREATE INDEX idx_approvals_project_status ON approvals(project_id, status);
+       CREATE INDEX idx_approvals_run ON approvals(run_id);`,
+    ],
+  },
 ];
 
 function currentVersion(db: DatabaseSync): number {

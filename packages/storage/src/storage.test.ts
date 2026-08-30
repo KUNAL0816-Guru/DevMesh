@@ -6,6 +6,7 @@ import {
   artifactSchema,
   makeContextEntry,
   makeTaskCard,
+  newApprovalId,
   newArtifactBase,
   newArtifactId,
   newProjectId,
@@ -17,8 +18,8 @@ import {
 import { createStorage, pipelineRunSummary, pipelineHealth, summarizeRunUsage, summarizeTaskUsage, type Storage } from "./index.js";
 import { withTransaction, StorageError } from "./db.js";
 import { EventBus } from "./event-bus.js";
-import type { ExecutionRecord, RevisionCycleRecord } from "./repos.js";
-import type { DomainEvent } from "@devmesh/contracts";
+import type { ExecutionRecord, RevisionCycleRecord, ApprovalRecord } from "./repos.js";
+import type { DomainEvent, ProjectId, RunId } from "@devmesh/contracts";
 
 let dir: string;
 
@@ -98,6 +99,48 @@ describe("migrations", () => {
     s1.close();
     const s2 = createStorage({ path });
     expect(s2.schemaVersion).toBe(s1.schemaVersion);
+    s2.close();
+  });
+
+  it("migration 10 creates approvals table", () => {
+    const path = join(dir, "mig10.db");
+    const s = createStorage({ path });
+    expect(s.schemaVersion).toBeGreaterThanOrEqual(10);
+    const cols = s.db
+      .prepare("PRAGMA table_info(approvals)")
+      .all() as Array<{ name: string }>;
+    const names = cols.map((c) => c.name);
+    for (const expected of [
+      "id",
+      "project_id",
+      "run_id",
+      "task_id",
+      "kind",
+      "title",
+      "detail",
+      "risk",
+      "status",
+      "requested_at",
+      "resolved_at",
+      "decision",
+      "decided_by",
+    ]) {
+      expect(names).toContain(expected);
+    }
+    s.close();
+  });
+
+  it("migration 10 is idempotent across reopens", () => {
+    const path = join(dir, "mig10-idempotent.db");
+    const s1 = createStorage({ path });
+    expect(s1.schemaVersion).toBeGreaterThanOrEqual(10);
+    s1.close();
+    const s2 = createStorage({ path });
+    expect(s2.schemaVersion).toBe(s1.schemaVersion);
+    const tables = s2.db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+      .all() as Array<{ name: string }>;
+    expect(tables.map((t) => t.name)).toContain("approvals");
     s2.close();
   });
 });
@@ -1862,5 +1905,274 @@ describe("usage aggregation (Phase 8B)", () => {
     expect(summary.totals.currency).toBeNull();
     expect(summary.totals.usageSource).toBe("reported");
     s.close();
+  });
+});
+
+describe("approvals (Phase 9A)", () => {
+  function seed(s: Storage, projectId: ProjectId, runId: RunId) {
+    s.projects.insert({
+      id: projectId,
+      name: `approval-proj-${projectId}`,
+      rootPath: `/tmp/approval-${projectId}`,
+      createdAt: new Date().toISOString(),
+    });
+    s.pipelineRuns.insert({
+      id: runId,
+      projectId,
+      status: "running",
+      goal: "approval test",
+      errorMessage: null,
+      createdAt: new Date().toISOString(),
+      finishedAt: null,
+      durationMs: null,
+    });
+  }
+
+  function makeApproval(projectId: ProjectId, runId: RunId): ApprovalRecord {
+    return {
+      id: newApprovalId(),
+      projectId,
+      runId,
+      taskId: newTaskId(),
+      kind: "destructive_git",
+      title: "Allow force push?",
+      detail: "Overwrites remote history",
+      risk: "high",
+      status: "pending",
+      requestedAt: new Date().toISOString(),
+      resolvedAt: null,
+      decision: null,
+      decidedBy: null,
+    };
+  }
+
+  it("creates and retrieves an approval", () => {
+    const s = fileStorage();
+    const projectId = newProjectId();
+    const runId = newRunId();
+    seed(s, projectId, runId);
+
+    const rec = makeApproval(projectId, runId);
+    s.approvals.insert(rec);
+
+    const fetched = s.approvals.get(rec.id);
+    expect(fetched).not.toBeNull();
+    expect(fetched!.projectId).toBe(projectId);
+    expect(fetched!.runId).toBe(runId);
+    expect(fetched!.kind).toBe("destructive_git");
+    expect(fetched!.title).toBe("Allow force push?");
+    expect(fetched!.risk).toBe("high");
+    expect(fetched!.status).toBe("pending");
+    expect(fetched!.resolvedAt).toBeNull();
+    expect(fetched!.decision).toBeNull();
+    expect(fetched!.decidedBy).toBeNull();
+    s.close();
+  });
+
+  it("returns null for unknown approval id", () => {
+    const s = fileStorage();
+    expect(s.approvals.get(newApprovalId())).toBeNull();
+    s.close();
+  });
+
+  it("lists approvals by project ordered by requested_at DESC", () => {
+    const s = fileStorage();
+    const projectId = newProjectId();
+    const runId = newRunId();
+    seed(s, projectId, runId);
+
+    const a1 = makeApproval(projectId, runId);
+    const a2 = makeApproval(projectId, runId);
+    a2.requestedAt = new Date(Date.now() + 1000).toISOString();
+    s.approvals.insert(a1);
+    s.approvals.insert(a2);
+
+    const list = s.approvals.listByProject(projectId);
+    expect(list.map((a) => a.id)).toEqual([a2.id, a1.id]);
+    s.close();
+  });
+
+  it("lists approvals by run", () => {
+    const s = fileStorage();
+    const projectId = newProjectId();
+    const runId1 = newRunId();
+    const runId2 = newRunId();
+    s.projects.insert({
+      id: projectId,
+      name: `approval-proj-${projectId}`,
+      rootPath: `/tmp/approval-${projectId}`,
+      createdAt: new Date().toISOString(),
+    });
+    s.pipelineRuns.insert({
+      id: runId1,
+      projectId,
+      status: "running",
+      goal: "approval test",
+      errorMessage: null,
+      createdAt: new Date().toISOString(),
+      finishedAt: null,
+      durationMs: null,
+    });
+    s.pipelineRuns.insert({
+      id: runId2,
+      projectId,
+      status: "running",
+      goal: "approval test",
+      errorMessage: null,
+      createdAt: new Date().toISOString(),
+      finishedAt: null,
+      durationMs: null,
+    });
+
+    const a1 = makeApproval(projectId, runId1);
+    const a2 = makeApproval(projectId, runId2);
+    s.approvals.insert(a1);
+    s.approvals.insert(a2);
+
+    const runList = s.approvals.listByRun(runId1);
+    expect(runList.map((a) => a.id)).toEqual([a1.id]);
+    s.close();
+  });
+
+  it("listPending returns only pending approvals, scoped or global", () => {
+    const s = fileStorage();
+    const projectId1 = newProjectId();
+    const projectId2 = newProjectId();
+    const runId1 = newRunId();
+    const runId2 = newRunId();
+    seed(s, projectId1, runId1);
+    seed(s, projectId2, runId2);
+
+    const pending1 = makeApproval(projectId1, runId1);
+    const pending2 = makeApproval(projectId2, runId2);
+    const resolved = makeApproval(projectId1, runId1);
+    resolved.id = newApprovalId();
+    s.approvals.insert(pending1);
+    s.approvals.insert(pending2);
+    s.approvals.insert(resolved);
+    s.approvals.resolve(resolved.id, "allow", "user");
+
+    // Global pending: both pending, resolved excluded.
+    let pendingIds = s.approvals.listPending().map((a) => a.id);
+    expect(pendingIds).toContain(pending1.id);
+    expect(pendingIds).toContain(pending2.id);
+    expect(pendingIds).not.toContain(resolved.id);
+
+    // Project scoped.
+    pendingIds = s.approvals.listPending(projectId1).map((a) => a.id);
+    expect(pendingIds).toEqual([pending1.id]);
+    s.close();
+  });
+
+  it("approves a pending approval atomically", () => {
+    const s = fileStorage();
+    const projectId = newProjectId();
+    const runId = newRunId();
+    seed(s, projectId, runId);
+
+    const rec = makeApproval(projectId, runId);
+    s.approvals.insert(rec);
+
+    const updated = s.approvals.resolve(rec.id, "allow", "user");
+    expect(updated.status).toBe("approved");
+    expect(updated.decision).toBe("allow");
+    expect(updated.decidedBy).toBe("user");
+    expect(updated.resolvedAt).not.toBeNull();
+
+    const fetched = s.approvals.get(rec.id)!;
+    expect(fetched.status).toBe("approved");
+    expect(fetched.decision).toBe("allow");
+    expect(fetched.decidedBy).toBe("user");
+    expect(fetched.resolvedAt).not.toBeNull();
+    s.close();
+  });
+
+  it("denies a pending approval atomically", () => {
+    const s = fileStorage();
+    const projectId = newProjectId();
+    const runId = newRunId();
+    seed(s, projectId, runId);
+
+    const rec = makeApproval(projectId, runId);
+    s.approvals.insert(rec);
+
+    const updated = s.approvals.resolve(rec.id, "deny", "user");
+    expect(updated.status).toBe("denied");
+    expect(updated.decision).toBe("deny");
+    expect(updated.decidedBy).toBe("user");
+    expect(updated.resolvedAt).not.toBeNull();
+
+    const fetched = s.approvals.get(rec.id)!;
+    expect(fetched.status).toBe("denied");
+    expect(fetched.decision).toBe("deny");
+    s.close();
+  });
+
+  it("rejects resolution of an unknown approval id", () => {
+    const s = fileStorage();
+    expect(() => s.approvals.resolve(newApprovalId(), "allow", "user")).toThrow(
+      /does not exist/,
+    );
+    s.close();
+  });
+
+  it("rejects double-resolution of an already-resolved approval", () => {
+    const s = fileStorage();
+    const projectId = newProjectId();
+    const runId = newRunId();
+    seed(s, projectId, runId);
+
+    const rec = makeApproval(projectId, runId);
+    s.approvals.insert(rec);
+
+    s.approvals.resolve(rec.id, "allow", "user");
+    expect(() => s.approvals.resolve(rec.id, "allow", "user")).toThrow(
+      /already resolved/,
+    );
+    expect(() => s.approvals.resolve(rec.id, "deny", "user")).toThrow(
+      /already resolved/,
+    );
+
+    // The decision is immutable — first resolution wins.
+    const fetched = s.approvals.get(rec.id)!;
+    expect(fetched.status).toBe("approved");
+    expect(fetched.decision).toBe("allow");
+    s.close();
+  });
+
+  it("approvals survive reopen (durability)", () => {
+    const path = join(dir, "approval-durability.db");
+    const projectId = newProjectId();
+    const runId = newRunId();
+
+    const s1 = createStorage({ path });
+    s1.projects.insert({
+      id: projectId,
+      name: "approval-durable",
+      rootPath: "/tmp/approval-durable",
+      createdAt: new Date().toISOString(),
+    });
+    s1.pipelineRuns.insert({
+      id: runId,
+      projectId,
+      status: "running",
+      goal: "durable approval",
+      errorMessage: null,
+      createdAt: new Date().toISOString(),
+      finishedAt: null,
+      durationMs: null,
+    });
+    const rec = makeApproval(projectId, runId);
+    s1.approvals.insert(rec);
+    s1.approvals.resolve(rec.id, "deny", "user");
+    s1.close();
+
+    const s2 = createStorage({ path });
+    const fetched = s2.approvals.get(rec.id);
+    expect(fetched).not.toBeNull();
+    expect(fetched!.status).toBe("denied");
+    expect(fetched!.decision).toBe("deny");
+    expect(fetched!.decidedBy).toBe("user");
+    s2.close();
   });
 });

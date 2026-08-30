@@ -1040,17 +1040,28 @@ per-task token/cost budgets, so a runaway agent cannot exhaust the device.
 
 **Implemented tests: 47 (5 files, all passing)**
 
-### Phase 9: Approval Flow (Future, Not Yet Started)
+### Phase 9: Approval Flow (Future, Partially Started — 9A Persistence Done)
+
+**Phase 9A (storage persistence) — complete.**
 
 **Goal:** Wire the existing `approval.requested` / `approval.resolved` events
 (contracts already define them) into a user-visible approval workflow so
 sensitive actions (e.g. destructive git ops, external network calls, cost cap
 releases) pause the pipeline until a human approves or denies.
 
-#### Implementation
+#### Phase 9A (Done): Approval Persistence
 
-1. `packages/storage`: `ApprovalRepository` + `approvals` table (approval id,
-   run id, task id, kind, reason, status, requested at, resolved at, decision).
+1. `packages/storage`: `ApprovalRepository` + `approvals` table (migration 10)
+   with approval id, project id, run id, task id, kind, title, detail, risk,
+   status, requested at, resolved at, decision, decided by. `ApprovalRepository`
+   exposes `insert`, `get`, `listByProject`, `listByRun`, `listPending` (scoped
+   or global), and an atomic `resolve(id, decision, decidedBy)` that transitions
+   `pending` → `approved`/`denied` via a single guarded `UPDATE`, rejecting
+   unknown ids (`storage/not-found`) and double-resolution
+   (`storage/approval-resolved`).
+
+#### Phase 9B (Future): Orchestrator + REST API
+
 2. `packages/server`: REST endpoints
    - `POST /approvals` — create an approval request;
    - `GET /approvals/:id` — fetch status;
@@ -1068,18 +1079,18 @@ releases) pause the pipeline until a human approves or denies.
 - [ ] Approve resumes the task; deny fails it
 - [ ] Pending approvals are listed and resolvable via the API
 - [ ] Blocked state survives a resume
-- [ ] Approvals are validated (unknown id / double-resolve rejected)
+- [x] Approvals are validated (unknown id / double-resolve rejected)
 
 #### Required Tests
 
 | File | Tests |
 |---|---|
 | `contracts/events.test.ts` | Existing approval events (already covered) |
-| `storage/storage.test.ts` | Approval repository + resolution transitions |
-| `server/app.test.ts` | Approval endpoints |
-| `server/orchestrator.test.ts` | Blocked-on-approval, resume-on-approve, fail-on-deny |
+| `storage/storage.test.ts` | Approval repository + resolution transitions (Phase 9A, done) |
+| `server/app.test.ts` | Approval endpoints (Phase 9B, future) |
+| `server/orchestrator.test.ts` | Blocked-on-approval, resume-on-approve, fail-on-deny (Phase 9B, future) |
 
-**Estimated new tests: ~10**
+**Estimated new tests: ~10 (Phase 9A storage tests complete; Phase 9B API/orchestrator pending)**
 
 ### Phase 10: Model/Provider Gateway (Future, Not Yet Started)
 
@@ -1284,7 +1295,7 @@ plugin and MCP server.
 | `runtime/src/fake.test.ts` | 6 | FakeRuntime (incl. structured output) |
 | `agents/src/agents.test.ts` | 8 | Registry + builtins |
 | `opencode-adapter/src/adapter.test.ts` | 7 | Adapter integration |
-| `storage/src/storage.test.ts` | 83 | All repositories + migrations + diagnostics + usage aggregation (incl. committed-only 8C variants) |
+| `storage/src/storage.test.ts` | 94 | All repositories + migrations + diagnostics + usage aggregation (incl. committed-only 8C variants) + approvals (9A) |
 | `workspace/src/git.test.ts` | 20 | Git operations + checkpoints |
 | `workspace/src/locks.test.ts` | 6 | MutexMap |
 | `workspace/src/paths.test.ts` | 5 | Path safety |

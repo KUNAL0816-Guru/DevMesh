@@ -1137,6 +1137,186 @@ export class StageRepository {
 }
 
 // ---------------------------------------------------------------------------
+// Approvals (Phase 9A) — user-visible approval requests that pause sensitive
+// actions. `status` is a small state machine: pending → approved|denied once,
+// resolved atomically via a guarded single UPDATE (never double-resolved).
+// ---------------------------------------------------------------------------
+
+export const approvalStatuses = ["pending", "approved", "denied"] as const;
+export type ApprovalStatus = (typeof approvalStatuses)[number];
+
+export const approvalDecisions = ["allow", "deny"] as const;
+export type ApprovalDecision = (typeof approvalDecisions)[number];
+
+export interface ApprovalRecord {
+  id: string;
+  projectId: string;
+  runId: string;
+  taskId: string | null;
+  kind: string;
+  title: string;
+  detail: string;
+  risk: "low" | "medium" | "high" | "critical";
+  status: ApprovalStatus;
+  requestedAt: string;
+  resolvedAt: string | null;
+  decision: ApprovalDecision | null;
+  decidedBy: string | null;
+}
+
+interface ApprovalRow {
+  id: string;
+  project_id: string;
+  run_id: string;
+  task_id: string | null;
+  kind: string;
+  title: string;
+  detail: string;
+  risk: string;
+  status: string;
+  requested_at: string;
+  resolved_at: string | null;
+  decision: string | null;
+  decided_by: string | null;
+}
+
+const APPROVAL_COLUMNS =
+  "id, project_id, run_id, task_id, kind, title, detail, risk, status, " +
+  "requested_at, resolved_at, decision, decided_by";
+
+function rowToApproval(row: ApprovalRow): ApprovalRecord {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    runId: row.run_id,
+    taskId: row.task_id,
+    kind: row.kind,
+    title: row.title,
+    detail: row.detail,
+    risk: row.risk as ApprovalRecord["risk"],
+    status: row.status as ApprovalStatus,
+    requestedAt: row.requested_at,
+    resolvedAt: row.resolved_at,
+    decision: row.decision as ApprovalDecision | null,
+    decidedBy: row.decided_by,
+  };
+}
+
+export class ApprovalRepository {
+  constructor(private readonly db: Database) {}
+
+  insert(rec: ApprovalRecord): ApprovalRecord {
+    this.db
+      .prepare(
+        `INSERT INTO approvals
+         (id, project_id, run_id, task_id, kind, title, detail, risk, status,
+          requested_at, resolved_at, decision, decided_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        rec.id,
+        rec.projectId,
+        rec.runId,
+        rec.taskId ?? null,
+        rec.kind,
+        rec.title,
+        rec.detail,
+        rec.risk,
+        rec.status,
+        rec.requestedAt,
+        rec.resolvedAt ?? null,
+        rec.decision ?? null,
+        rec.decidedBy ?? null,
+      );
+    return rec;
+  }
+
+  get(id: string): ApprovalRecord | null {
+    const row = this.db
+      .prepare(`SELECT ${APPROVAL_COLUMNS} FROM approvals WHERE id = ?`)
+      .get(id) as unknown as ApprovalRow | undefined;
+    return row ? rowToApproval(row) : null;
+  }
+
+  listByProject(projectId: string, limit = 200): ApprovalRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ${APPROVAL_COLUMNS} FROM approvals
+         WHERE project_id = ? ORDER BY requested_at DESC LIMIT ?`,
+      )
+      .all(projectId, limit) as unknown as ApprovalRow[];
+    return rows.map(rowToApproval);
+  }
+
+  listByRun(runId: string, limit = 200): ApprovalRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ${APPROVAL_COLUMNS} FROM approvals
+         WHERE run_id = ? ORDER BY requested_at DESC LIMIT ?`,
+      )
+      .all(runId, limit) as unknown as ApprovalRow[];
+    return rows.map(rowToApproval);
+  }
+
+  /** List approval requests still awaiting a decision, across all projects or
+   *  scoped to a single project. Ordered oldest-first so upstream consumers
+   *  see the longest-waiting request first. */
+  listPending(projectId?: string): ApprovalRecord[] {
+    const rows = projectId
+      ? (this.db
+          .prepare(
+            `SELECT ${APPROVAL_COLUMNS} FROM approvals
+             WHERE project_id = ? AND status = 'pending'
+             ORDER BY requested_at`,
+          )
+          .all(projectId) as unknown as ApprovalRow[])
+      : (this.db
+          .prepare(
+            `SELECT ${APPROVAL_COLUMNS} FROM approvals
+             WHERE status = 'pending' ORDER BY requested_at`,
+          )
+          .all() as unknown as ApprovalRow[]);
+    return rows.map(rowToApproval);
+  }
+
+  /**
+   * Atomically transition a pending approval to approved/denied. The single
+   * guarded UPDATE (WHERE status = 'pending') is atomic, so concurrent
+   * resolutions cannot double-resolve. Throws:
+   *  - `storage/not-found` when the id does not exist
+   *  - `storage/approval-resolved` when it is already resolved
+   * On success returns the updated record.
+   */
+  resolve(id: string, decision: ApprovalDecision, decidedBy: string): ApprovalRecord {
+    const res = this.db
+      .prepare(
+        `UPDATE approvals SET
+           status = ?, decision = ?, decided_by = ?, resolved_at = ?
+         WHERE id = ? AND status = 'pending'`,
+      )
+      .run(
+        decision === "allow" ? "approved" : "denied",
+        decision,
+        decidedBy,
+        new Date().toISOString(),
+        id,
+      );
+
+    if (Number(res.changes) === 0) {
+      const existing = this.get(id);
+      if (!existing) {
+        throw new StorageError("storage/not-found", `approval ${id} does not exist`);
+      }
+      throw new StorageError(
+        "storage/approval-resolved",
+        `approval ${id} is already resolved as "${existing.status}"`,
+      );
+    }
+    return this.get(id)!;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Diagnostic queries (read-only, no new tables)
 // ---------------------------------------------------------------------------
 

@@ -4,6 +4,7 @@ import { openDatabase, type Database } from "./db.js";
 import { migrate } from "./migrations.js";
 import { EventBus } from "./event-bus.js";
 import {
+  ApprovalRepository,
   ArtifactRepository,
   ContextRepository,
   EventRepository,
@@ -26,6 +27,7 @@ export interface Storage {
   readonly revisionCycles: RevisionCycleRepository;
   readonly pipelineRuns: PipelineRunRepository;
   readonly stages: StageRepository;
+  readonly approvals: ApprovalRepository;
   /** In-process event bus for SSE fan-out (fires AFTER SQLite persist). */
   readonly eventBus: EventBus;
   /** Applied schema version. */
@@ -39,7 +41,7 @@ export interface CreateStorageOptions {
   path: string;
 }
 
-export type { ExecutionRecord, ExecutionRowStatus, ExecutionUsage, PipelineRunRecord, PipelineRunSummary, PipelineHealth, RevisionCycleRecord, ConsistencyViolation, StageRecord, StageStatus, RunUsageSummary, TaskUsageSummary, CommittedRunAggregate } from "./repos.js";
+export type { ExecutionRecord, ExecutionRowStatus, ExecutionUsage, PipelineRunRecord, PipelineRunSummary, PipelineHealth, RevisionCycleRecord, ConsistencyViolation, StageRecord, StageStatus, RunUsageSummary, TaskUsageSummary, CommittedRunAggregate, ApprovalRecord, ApprovalStatus, ApprovalDecision } from "./repos.js";
 export { pipelineRunSummary, pipelineHealth, assertPipelineConsistency, summarizeRunUsage, summarizeTaskUsage, summarizeRunCommittedUsage, summarizeTaskCommittedUsage, aggregateCommittedRunUsage } from "./repos.js";
 export { EventBus } from "./event-bus.js";
 
@@ -69,6 +71,7 @@ export function createStorage(opts: CreateStorageOptions): Storage {
     revisionCycles: new RevisionCycleRepository(db),
     pipelineRuns: new PipelineRunRepository(db),
     stages: new StageRepository(db),
+    approvals: new ApprovalRepository(db),
     eventBus,
     close(): void {
       try {
