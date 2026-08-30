@@ -1,9 +1,9 @@
 # DevMesh Development Plan
 
 > Status: active
-> Last updated: 2026-08-29 (post Phase 7F — entire Phase 7 complete)
+> Last updated: 2026-08-30 (post Phase 8B — Phases 0–8B complete; Phases 8C–14 planned)
 > Reference: docs/adr/0001-approved-architecture.md
-> Test baseline: 427 passed, 5 skipped, 0 failed
+> Test baseline: 459 passed, 5 skipped, 0 failed
 
 ---
 
@@ -31,6 +31,8 @@ agent runtime is OpenCode behind a swappable adapter port.
 - 4 agent definitions with role-specific permissions and system prompts
 - SQLite storage with 8 migrations, 8+ repositories
 - Workspace service with symlink escape protection and FIFO mutex locking
+- Usage reporting + persistence (Phase 8A): runtime-reported tokens recorded per execution
+- Usage aggregation (Phase 8B): read-only run/task rollups with correct unknown semantics
 
 ---
 
@@ -435,7 +437,7 @@ inconsistent writes.
 | Amendment 5a | Test reports reference an exact invocation; DevMesh replays it | ✅ Resolved — Phase 7E independent replay of the `test_report` invocation, producing a `verification.v1` artifact |
 | Amendment 5b | Unverifiable claims fail the task | ✅ Resolved — Phase 7E replay verification integrated into pipeline flow; contradicting replay routes back to developer |
 | Consequence | Resumable runs | ✅ Resolved — Phase 7C `POST /pipelines/:runId/resume` |
-| Consequence | Budget enforcement (token/cost) | ❌ Attempt limits only; no token or cost tracking |
+| Consequence | Budget enforcement (token/cost) | ⏳ Usage tracked & recorded (Phases 8A/8B); enforcement pending — Phase 8C pricing + budget gates |
 | Context | Context entries as derived facts | ✅ Resolved — Phase 7A REST read API |
 
 ---
@@ -876,11 +878,11 @@ existing behavior is preserved for agents that don't produce structured plans.
 
 ---
 
-## Phase 8: Usage Accounting (in progress)
+## Phase 8: Usage Accounting — 8A & 8B COMPLETE
 
 Usage accounting is delivered as sub-phases. Core intent (ADR consequence):
 track `usage` from `AgentReply` and record it per execution so per-run and
-per-task budgets can be enforced later.
+per-task budgets can be enforced later (Phase 8C).
 
 ### Phase 8A: Usage Reporting and Persistence — COMPLETE
 
@@ -967,22 +969,248 @@ Unknown semantics (documented on `aggregateUsage`):
 
 **Estimated new tests: ~11** (actual: 11 added)
 
-### Phase 8C and beyond (Future, Not Yet Started)
+### Phase 8C: Cost Pricing and Budget Enforcement (Future, Not Yet Started)
 
-These capabilities are referenced in the ADR or README but are out of scope
-for Phases 8A–8B:
+**Goal:** Derive nominal cost from config-driven pricing and enforce per-run and
+per-task token/cost budgets, so a runaway agent cannot exhaust the device.
 
-| Capability | ADR Ref | Notes |
-|---|---|---|
-| Token/cost pricing and budget enforcement | Consequence | Config-driven cost derivation (`usageSource: "derived"`) then per-run and per-task budget gates |
-| Authentication/authorization | — | Not in ADR; single-user environment |
-| Approval flow | Events catalog | `approval.requested`/`approval.resolved` events exist but not wired to endpoints |
-| Model/provider gateway | Amendment 6 | ADR mentions it; no implementation exists |
-| Additional agent roles | Amendment 3 | `planner`, `debugger`, `documenter`, `devops` in `PLANNED_AGENT_ROLES` |
-| MCP server | README layout | Future |
-| OpenCode plugin | README layout | Future |
-| Frontend/UI | Amendment 7 | Explicitly deferred |
-| Ollama/local-model adapter | Amendment 9 | Deferred; adapter shape keeps the door open |
+#### Implementation
+
+1. `packages/contracts`: `PricingRule` schema mapping `provider/model-id` →
+   `{ inputPerMsToken, outputPerMsToken, currency }` with unit conversion to
+   micro-USD.
+2. `packages/config` (new or existing): load a pricing table + budget defaults
+   (`maxTokensPerRun`, `maxCostUsdPerRun`, per-task equivalents).
+3. `packages/server` `ExecutionService`: when runtime reports tokens but no
+   cost, derive `costUsdMicros` from the pricing rule and stamp
+   `usageSource: "derived"` (Phase 8B aggregation already preserves this).
+4. Budget gate in the orchestrator task loop:
+   - after each `execution.completed`, query `summarizeRunUsage` /
+     `summarizeTaskUsage`;
+   - if a run/task budget is exceeded, mark the pipeline/task as
+     `failed` with a `budget.exceeded` failure kind and surface a
+     `run.failed`/`task.transitioned` event;
+   - per-task budget routes back as a revision failure; per-run budget
+     terminates the pipeline.
+
+#### Acceptance Criteria
+
+- [ ] `PricingRule` validates provider/model and non-negative prices
+- [ ] Cost derivation is deterministic and stamped `derived`
+- [ ] Runtime-reported costs are never overwritten
+- [ ] Per-task budget exhaustion fails the task and enters the revision cycle
+- [ ] Per-run budget exhaustion fails the pipeline
+- [ ] Budget check runs after each execution, not only at the end
+- [ ] Zero/unknown usage is handled without a false budget breach
+
+#### Required Tests
+
+| File | Tests |
+|---|---|
+| `contracts/pricing.test.ts` (new) | Pricing schema, unit conversion |
+| `server/executions.test.ts` | Derived cost stamping, reported-cost preservation |
+| `server/orchestrator.test.ts` | Per-task budget revision, per-run budget failure, boundary cases |
+
+**Estimated new tests: ~10**
+
+### Phase 9: Approval Flow (Future, Not Yet Started)
+
+**Goal:** Wire the existing `approval.requested` / `approval.resolved` events
+(contracts already define them) into a user-visible approval workflow so
+sensitive actions (e.g. destructive git ops, external network calls, cost cap
+releases) pause the pipeline until a human approves or denies.
+
+#### Implementation
+
+1. `packages/storage`: `ApprovalRepository` + `approvals` table (approval id,
+   run id, task id, kind, reason, status, requested at, resolved at, decision).
+2. `packages/server`: REST endpoints
+   - `POST /approvals` — create an approval request;
+   - `GET /approvals/:id` — fetch status;
+   - `POST /approvals/:id/resolve { decision }` — approve/deny;
+   - `GET /projects/:projectId/approvals` — list pending approvals.
+3. Orchestrator hook: when an approval-gated action is reached, the pipeline
+   emits `approval.requested` and transitions the task to `blocked`; it stays
+   blocked until `approval.resolved` arrives (approve → resume, deny → fail).
+4. Persist resolution so resumable pipelines (Phase 7C) restore blocked state.
+
+#### Acceptance Criteria
+
+- [ ] `approval.requested`/`approval.resolved` are emitted on the bus
+- [ ] Approval-gated action pauses the task as `blocked`
+- [ ] Approve resumes the task; deny fails it
+- [ ] Pending approvals are listed and resolvable via the API
+- [ ] Blocked state survives a resume
+- [ ] Approvals are validated (unknown id / double-resolve rejected)
+
+#### Required Tests
+
+| File | Tests |
+|---|---|
+| `contracts/events.test.ts` | Existing approval events (already covered) |
+| `storage/storage.test.ts` | Approval repository + resolution transitions |
+| `server/app.test.ts` | Approval endpoints |
+| `server/orchestrator.test.ts` | Blocked-on-approval, resume-on-approve, fail-on-deny |
+
+**Estimated new tests: ~10**
+
+### Phase 10: Model/Provider Gateway (Future, Not Yet Started)
+
+**Goal:** Honor ADR Amendment 6 — route DevMesh's own LLM calls and neutral
+`provider/model-id` preferences through a `ProviderGateway` port so model
+choice is provider-independent.
+
+#### Implementation
+
+1. `packages/runtime` (or new `packages/provider`): `ProviderGateway` port with
+   `complete({ provider, model, messages, maxTokens })`; keep the existing
+   `AgentRuntime` adapter for coding agents separate.
+2. `packages/contracts`: `ProviderRequest`/`ProviderResult` schemas.
+3. A neutral model preference string (`provider/model-id`) is validated by the
+   gateway; unknown providers fail with a typed error rather than a fallback.
+4. `packages/server` bootstrap wires a default gateway (OpenAI-compatible
+   shape per ADR Amendment 9) and exposes config to select it.
+
+#### Acceptance Criteria
+
+- [ ] `ProviderGateway` port is defined against contracts
+- [ ] Neutral `provider/model-id` strings are validated
+- [ ] Unknown provider model fails with a typed error
+- [ ] Coding-agent runtime stays behind `AgentRuntime` (unchanged)
+- [ ] Default gateway is configurable at bootstrap
+
+#### Required Tests
+
+| File | Tests |
+|---|---|
+| `contracts/provider.test.ts` (new) | Request/result schemas |
+| `runtime/provider.test.ts` (new) | Gateway port contract + fake |
+| `server/bootstrap.test.ts` | Gateway wiring + config selection |
+
+**Estimated new tests: ~8**
+
+### Phase 11: Additional Agent Roles (Future, Not Yet Started)
+
+**Goal:** Promote the `PLANNED_AGENT_ROLES` (`planner`, `debugger`,
+`documenter`, `devops`) from intent-only to valid on the wire, enabling richer
+plan/spec graphs.
+
+#### Implementation
+
+1. `packages/contracts`: extend `agentRoleSchema` to include the new roles — a
+   deliberate breaking contract change; revisit every downstream switch.
+2. `packages/agents`: add built-in agent manifests with prompts and permissions
+   for `planner`, `debugger`, `documenter`, `devops`.
+3. `packages/server` orchestrator: allow plan tasks (Phase 7F DAG) to assign
+   these roles; update the fallback chain config and permission checks.
+
+#### Acceptance Criteria
+
+- [ ] New roles are valid `agentRoleSchema` values
+- [ ] Each role has a manifest (prompt + permissions)
+- [ ] Plan tasks can be assigned new roles and execute
+- [ ] `respectPlanRoles` respects new roles
+- [ ] Existing 4-role pipelines still work (backward compatibility)
+
+#### Required Tests
+
+| File | Tests |
+|---|---|
+| `contracts/roles.test.ts` | Schema accepts new roles, rejects unknown |
+| `agents/agents.test.ts` | Registry returns new manifests |
+| `server/orchestrator.test.ts` | DAG executes a plan task with a new role |
+
+**Estimated new tests: ~8**
+
+### Phase 12: Golden-Hammer / Local-Model Adapter (Future, Not Yet Started)
+
+**Goal:** Satisfy ADR Amendment 9 — support an OpenAI-compatible local/offline
+model (e.g. Ollama) behind the `AgentRuntime` port without changing core.
+
+#### Implementation
+
+1. `packages/opencode-adapter`: add a runtime variant/switching hook so an
+   OpenAI-compatible local endpoint (e.g. Ollama) can back agent execution.
+2. Keep the adapter shape provider-independent (Amendment 6) so core unchanged.
+3. Add an `opencode`-independent fake/local runtime for tests and offline dev.
+
+#### Acceptance Criteria
+
+- [ ] A local OpenAI-compatible endpoint can back an agent session
+- [ ] Core/orchestrator is unchanged (runtime swapped at the port)
+- [ ] Health probe reports the local runtime
+- [ ] Failure/timeout semantics match the existing adapter
+
+#### Required Tests
+
+| File | Tests |
+|---|---|
+| `opencode-adapter/adapter.test.ts` | Local-endpoint variant config, health, failure handling |
+| `server/bootstrap.test.ts` | Selecting the local runtime |
+
+**Estimated new tests: ~5**
+
+### Phase 13: Frontend/UI (Future, Not Yet Started)
+
+**Goal:** ADR Amendment 7 explicitly defers a frontend; when pursued it should
+surface pipeline runs, live SSE events (Phase 6C), artifacts, and usage.
+
+#### Implementation
+
+1. Serve a static UI from the Fastify server (or a separate client package)
+   consuming the existing REST + SSE APIs — no new backend surface required.
+2. Views: pipeline list/detail, live event stream, artifact viewer, task DAG,
+   usage/cost rollups (Phase 8B), approval queue (Phase 9).
+
+#### Acceptance Criteria
+
+- [ ] Read-only views over existing APIs, no backend changes (or minimal)
+- [ ] Live SSE pipeline event stream rendered in-browser
+- [ ] Usage rollups displayed from run/task summaries
+
+#### Required Tests
+
+| File | Tests |
+|---|---|
+| `server/app.test.ts` | Static route served; API contracts unchanged |
+
+**Estimated new tests: ~2** (mostly manual/visual)
+
+### Phase 14: Security Hardening — AuthN/Z, Permissions, MCP & Plugin Packaging (Future, Not Yet Started)
+
+**Goal:** Production-hardening items referenced across the ADR and README:
+authentication/authorization for a multi-user deployment, wiring the existing
+`permission.requested`/`permission.resolved` events, and packaging the OpenCode
+plugin and MCP server.
+
+#### Implementation
+
+1. **AuthN/Z** (`packages/auth` new): API token / bearer authn, per-project
+   authorization; a single-user mode remains the default.
+2. **Permissions**: route `permission.requested` / `permission.resolved`
+   through a policy check in the orchestrator; deny-by-default for flagged
+   actions.
+3. **OpenCode plugin**: package the plugin shipped into projects.
+4. **MCP server**: expose DevMesh state (pipelines, artifacts, context) to
+   tools over MCP.
+
+#### Acceptance Criteria
+
+- [ ] Unauthenticated requests are rejected in multi-user mode
+- [ ] Per-project authorization is enforced
+- [ ] Permission request/resolve events drive a policy decision
+- [ ] OpenCode plugin packages and installs into a project
+- [ ] MCP server exposes pipelines/artifacts/context
+
+#### Required Tests
+
+| File | Tests |
+|---|---|
+| `auth/auth.test.ts` (new) | Token auth, project authorization |
+| `server/app.test.ts` | Auth middleware, permission flow, MCP routes |
+| `integrations/plugin.test.ts` (new) | Plugin packaging/install |
+
+**Estimated new tests: ~12**
 
 ---
 
@@ -992,6 +1220,23 @@ for Phases 8A–8B:
 |---|---|---|---|---|
 | 8A | Usage reporting + persistence | ~6 (adapter, runtime, storage, service) | done | Low — additive columns + boundary validation |
 | 8B | Usage aggregation | 11 new storage tests | done | Low — pure read-only SQL aggregation |
+
+---
+
+## Remaining Roadmap (Future Phases — Not Yet Started)
+
+| Phase | Focus | ADR Ref | Est. Tests | Status |
+|---|---|---|---|---|
+| 8C | Cost pricing + budget enforcement | Consequence | ~10 | Not started |
+| 9 | Approval flow | Events catalog | ~10 | Not started |
+| 10 | Model/provider gateway | Amendment 6 | ~8 | Not started |
+| 11 | Additional agent roles | Amendment 3 | ~8 | Not started |
+| 12 | Local/offline model adapter | Amendment 9 | ~5 | Not started |
+| 13 | Frontend/UI | Amendment 7 | ~2 | Not started |
+| 14 | Security hardening, permissions, MCP & plugin packaging | ADR/README | ~12 | Not started |
+
+> All Phases 8C–14 are **planned only** — none are implemented. Detailed
+> goals, acceptance criteria, and required tests for each appear above.
 
 ---
 
