@@ -876,15 +876,105 @@ existing behavior is preserved for agents that don't produce structured plans.
 
 ---
 
-## Phase 8+ (Future, Not Yet Started)
+## Phase 8: Usage Accounting (in progress)
 
-Phase 7 is now **complete** (all six sub-phases implemented). The next work is
-Phase 8+. These capabilities are referenced in the ADR or README but are out
-of scope for Phase 7:
+Usage accounting is delivered as sub-phases. Core intent (ADR consequence):
+track `usage` from `AgentReply` and record it per execution so per-run and
+per-task budgets can be enforced later.
+
+### Phase 8A: Usage Reporting and Persistence — COMPLETE
+
+**Goal:** capture token usage reported by the runtime and persist it with each
+execution record, without fabricating numbers.
+
+#### Implementation
+
+1. `packages/contracts`: `TokenUsage` schema + `agentreply.usage` field for
+   `AgentExecutionResult`.
+2. `packages/opencode-adapter`: parse `usage` from the OpenCode JSON event
+   stream (`ndjson.ts`).
+3. `packages/runtime`: `ExecutionUsage` travels on `AgentExecutionResult`;
+   `FakeRuntime` can script usage reports.
+4. `packages/storage`: migration 9 adds `input_tokens`, `output_tokens`,
+   `cost_usd_micros`, `cost_currency`, `usage_source` to `executions`;
+   `ExecutionRepository` round-trips them; NULL means "unmeasured", never zero.
+5. `packages/server`: `ExecutionService.finalize()` validates and persists
+   runtime-reported usage at the persistence boundary.
+
+#### Acceptance Criteria
+
+- [x] Runtime-reported tokens are validated at the persistence boundary
+- [x] Invalid/malformed usage is dropped, never persisted, and the execution
+      records `usage: null`
+- [x] Cost fields stay NULL until a pricing rule exists (Phase 8C)
+- [x] NULL/missing usage is distinct from a clean-zero report
+
+#### Required Tests
+
+| File | Tests |
+|---|---|
+| `contracts/usage.test.ts` | TokenUsage schema accepts/rejects token shapes |
+| `opencode-adapter/adapter.test.ts` | Adapter parses usage from event stream |
+| `runtime/fake.test.ts` | FakeRuntime scripts usage reports |
+| `storage/storage.test.ts` | Migration 9 columns + repository round-trips |
+| `server/executions.test.ts` | Service persists usage on completion |
+
+### Phase 8B: Usage Aggregation — COMPLETE
+
+**Goal:** read-only accounting over persisted usage. This layer only sums what
+the runtime actually reported — no budgets, no pricing, no reservations.
+
+#### Implementation
+
+`packages/storage` (`repos.ts`, exported via `index.ts`):
+
+- `summarizeRunUsage(db, runId)` — aggregates every execution belonging to a
+  pipeline run (per-task linkage `executions.task_id -> tasks.run_id`, plus
+  legacy `executions.run_id` linkage; set-union, counted once) with a
+  per-task breakdown.
+- `summarizeTaskUsage(db, taskId)` — aggregates every execution attributed to
+  a single task.
+
+Unknown semantics (documented on `aggregateUsage`):
+
+- A NULL/missing `usage` is **UNKNOWN**, never zero; increments
+  `unknownExecutionCount`.
+- Mixing a known and an unknown value for a dimension makes that aggregate
+  dimension `null` — nothing is fabricated, no partial sum is presented as
+  truth.
+- An empty scope returns truthful zero totals with `unknownExecutionCount: 0`.
+- All arithmetic is integer-only (tokens and micro-USD).
+- `currency`/`usageSource` are a single common value when the cost is fully
+  known and homogeneous, otherwise `null`.
+
+#### Acceptance Criteria
+
+- [x] `summarizeRunUsage` returns null for an unknown run
+- [x] `summarizeTaskUsage` returns null for an unknown task
+- [x] Executions are aggregated across both linkage conventions, counted once
+- [x] Aggregation is scoped to the run/task (no cross-entity leakage)
+- [x] NULL-usage executions increment `unknownExecutionCount`
+- [x] Mixed known/unknown aggregates report `null` for the affected dimension
+- [x] Empty scopes report truthful zeros
+- [x] Homogeneous `currency`/`usageSource` are preserved; mixed values are null
+- [x] Per-task breakdown carries `taskId`/`runId`/`role`/`title`
+
+#### Required Tests
+
+| File | Tests |
+|---|---|
+| `storage/storage.test.ts` | Run-level and task-level aggregation, linkage set-union, scoping, unknown semantics, empty scopes, homogeneity |
+
+**Estimated new tests: ~11** (actual: 11 added)
+
+### Phase 8C and beyond (Future, Not Yet Started)
+
+These capabilities are referenced in the ADR or README but are out of scope
+for Phases 8A–8B:
 
 | Capability | ADR Ref | Notes |
 |---|---|---|
-| Token/cost budget enforcement | Consequence | Track `usage` from `AgentReply`; enforce per-run and per-task budgets |
+| Token/cost pricing and budget enforcement | Consequence | Config-driven cost derivation (`usageSource: "derived"`) then per-run and per-task budget gates |
 | Authentication/authorization | — | Not in ADR; single-user environment |
 | Approval flow | Events catalog | `approval.requested`/`approval.resolved` events exist but not wired to endpoints |
 | Model/provider gateway | Amendment 6 | ADR mentions it; no implementation exists |
@@ -896,7 +986,16 @@ of scope for Phase 7:
 
 ---
 
-## Appendix: Test File Inventory (post Phase 7F)
+## Phase 8 Total
+
+| Sub-phase | Focus | Tests | Status | Key Risk (as assessed) |
+|---|---|---|---|---|
+| 8A | Usage reporting + persistence | ~6 (adapter, runtime, storage, service) | done | Low — additive columns + boundary validation |
+| 8B | Usage aggregation | 11 new storage tests | done | Low — pure read-only SQL aggregation |
+
+---
+
+## Appendix: Test File Inventory (post Phase 8B)
 
 | File | Tests | Area |
 |---|---|---|
@@ -911,7 +1010,7 @@ of scope for Phase 7:
 | `runtime/src/fake.test.ts` | 6 | FakeRuntime (incl. structured output) |
 | `agents/src/agents.test.ts` | 8 | Registry + builtins |
 | `opencode-adapter/src/adapter.test.ts` | 7 | Adapter integration |
-| `storage/src/storage.test.ts` | 68 | All repositories + migrations + diagnostics |
+| `storage/src/storage.test.ts` | 83 | All repositories + migrations + diagnostics + usage aggregation |
 | `workspace/src/git.test.ts` | 20 | Git operations + checkpoints |
 | `workspace/src/locks.test.ts` | 6 | MutexMap |
 | `workspace/src/paths.test.ts` | 5 | Path safety |

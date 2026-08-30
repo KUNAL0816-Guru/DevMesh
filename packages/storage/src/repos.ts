@@ -1255,6 +1255,186 @@ export function pipelineHealth(db: Database, projectId: string): PipelineHealth 
 }
 
 // ---------------------------------------------------------------------------
+// Usage aggregation (Phase 8B) — read-only accounting. No budgets, no pricing,
+// no reservations: this layer only sums what the runtime actually reported.
+// ---------------------------------------------------------------------------
+
+export interface TaskUsageSummary {
+  taskId: string;
+  runId: string;
+  role: string;
+  title: string;
+  executionCount: number;
+  unknownExecutionCount: number;
+  totals: ExecutionUsage;
+}
+
+export interface RunUsageSummary {
+  runId: string;
+  projectId: string;
+  executionCount: number;
+  unknownExecutionCount: number;
+  totals: ExecutionUsage;
+  /** Per-task breakdown, one entry per task belonging to the run. */
+  perTask: TaskUsageSummary[];
+}
+
+/**
+ * Aggregate token/cost usage across executions.
+ *
+ * Unknown semantics (per requirement):
+ * - A NULL/missing `usage` is UNKNOWN, never zero.
+ * - Mixing a known and an unknown value for a dimension makes that aggregate
+ *   dimension null (nothing fabricated, never a partial sum presented as truth).
+ * - An execution with `usage === null` increments `unknownExecutionCount`.
+ * - An empty scope has zero totals with `unknownExecutionCount: 0` — nothing
+ *   was consumed, so zero is truthful.
+ * - All arithmetic is integer-only (token and micro-USD counts).
+ * `currency`/`usageSource` are a single common value when the cost is fully
+ * known and homogeneous, otherwise null.
+ */
+function aggregateUsage(
+  executions: ReadonlyArray<Pick<ExecutionRecord, "usage">>,
+): { totals: ExecutionUsage; unknownExecutionCount: number } {
+  const unknownExecutionCount = executions.reduce(
+    (n, e) => (e.usage === null ? n + 1 : n),
+    0,
+  );
+
+  let inputSum = 0;
+  let outputSum = 0;
+  let costSum = 0;
+  let inputKnown = true;
+  let outputKnown = true;
+  let costKnown = true;
+  const currencies = new Set<string>();
+  const sources = new Set<"reported" | "derived">();
+
+  for (const e of executions) {
+    const u = e.usage;
+    if (u === null) {
+      inputKnown = false;
+      outputKnown = false;
+      costKnown = false;
+      continue;
+    }
+    if (u.inputTokens === null) {
+      inputKnown = false;
+    } else if (inputKnown) {
+      inputSum += u.inputTokens;
+    }
+    if (u.outputTokens === null) {
+      outputKnown = false;
+    } else if (outputKnown) {
+      outputSum += u.outputTokens;
+    }
+    if (u.costUsdMicros === null) {
+      costKnown = false;
+    } else {
+      if (costKnown) costSum += u.costUsdMicros;
+      if (u.currency !== null) currencies.add(u.currency);
+      if (u.usageSource !== null) sources.add(u.usageSource);
+    }
+  }
+
+  const empty = executions.length === 0;
+  const costFullyKnown = !empty && costKnown;
+  return {
+    totals: {
+      inputTokens: empty ? 0 : inputKnown ? inputSum : null,
+      outputTokens: empty ? 0 : outputKnown ? outputSum : null,
+      costUsdMicros: empty ? 0 : costKnown ? costSum : null,
+      currency:
+        costFullyKnown && currencies.size === 1 ? [...currencies][0]! : null,
+      usageSource:
+        costFullyKnown && sources.size === 1 ? [...sources][0]! : null,
+    },
+    unknownExecutionCount,
+  };
+}
+
+function taskUsageSummary(
+  db: Database,
+  task: { id: string; run_id: string; role: string; title: string },
+): TaskUsageSummary {
+  const rows = db
+    .prepare(
+      `SELECT ${EXECUTION_COLUMNS} FROM executions WHERE task_id = ? ORDER BY started_at`,
+    )
+    .all(task.id) as unknown as ExecutionRow[];
+  const executions = rows.map(rowToExecution);
+  const { totals, unknownExecutionCount } = aggregateUsage(executions);
+  return {
+    taskId: task.id,
+    runId: task.run_id,
+    role: task.role,
+    title: task.title,
+    executionCount: executions.length,
+    unknownExecutionCount,
+    totals,
+  };
+}
+
+/**
+ * Aggregate usage for every execution belonging to a pipeline run, plus a
+ * per-task breakdown. An execution belongs to the run when it matches either
+ * linkage convention:
+ * - normal pipeline linkage: `executions.task_id -> tasks.id -> tasks.run_id`
+ * - legacy/seeded linkage:   `executions.run_id === pipelineRunId`
+ * Set-union semantics: an execution matching both conventions is counted
+ * exactly once. Returns null when the pipeline run does not exist.
+ */
+export function summarizeRunUsage(db: Database, runId: string): RunUsageSummary | null {
+  const run = db
+    .prepare(`SELECT ${PR_COLUMNS} FROM pipeline_runs WHERE id = ?`)
+    .get(runId) as unknown as PipelineRunRow | undefined;
+  if (!run) return null;
+
+  const rows = db
+    .prepare(
+      `SELECT ${EXECUTION_COLUMNS} FROM executions
+       WHERE id IN (
+         SELECT id FROM executions WHERE run_id = ?
+         UNION
+         SELECT e.id FROM executions e
+         INNER JOIN tasks t ON e.task_id = t.id
+         WHERE t.run_id = ?
+       )
+       ORDER BY started_at`,
+    )
+    .all(runId, runId) as unknown as ExecutionRow[];
+  const executions = rows.map(rowToExecution);
+  const { totals, unknownExecutionCount } = aggregateUsage(executions);
+
+  const taskRows = db
+    .prepare(
+      "SELECT id, run_id, role, title FROM tasks WHERE run_id = ? ORDER BY created_at",
+    )
+    .all(runId) as unknown as Array<{ id: string; run_id: string; role: string; title: string }>;
+
+  return {
+    runId,
+    projectId: run.project_id,
+    executionCount: executions.length,
+    unknownExecutionCount,
+    totals,
+    perTask: taskRows.map((t) => taskUsageSummary(db, t)),
+  };
+}
+
+/**
+ * Aggregate usage for every execution attributed to a single task via
+ * `executions.task_id`. Returns null when the task does not exist.
+ */
+export function summarizeTaskUsage(db: Database, taskId: string): TaskUsageSummary | null {
+  const task = db
+    .prepare("SELECT id, run_id, role, title FROM tasks WHERE id = ?")
+    .get(taskId) as unknown as { id: string; run_id: string; role: string; title: string } | undefined;
+  if (!task) return null;
+  return taskUsageSummary(db, task);
+}
+
+// ---------------------------------------------------------------------------
 // Cross-entity consistency check (test utility)
 // ---------------------------------------------------------------------------
 

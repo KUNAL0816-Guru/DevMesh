@@ -10,10 +10,11 @@ import {
   newArtifactId,
   newProjectId,
   newRunId,
+  newTaskId,
   taskCardSchema,
   taskIdSchema,
 } from "@devmesh/contracts";
-import { createStorage, pipelineRunSummary, pipelineHealth, type Storage } from "./index.js";
+import { createStorage, pipelineRunSummary, pipelineHealth, summarizeRunUsage, summarizeTaskUsage, type Storage } from "./index.js";
 import { withTransaction, StorageError } from "./db.js";
 import { EventBus } from "./event-bus.js";
 import type { ExecutionRecord, RevisionCycleRecord } from "./repos.js";
@@ -1487,5 +1488,379 @@ describe("stages", () => {
     const last = s2.stages.getLastCompleted(runId);
     expect(last!.id).toBe("dur-1");
     s2.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Usage aggregation (Phase 8B) — summarizeRunUsage / summarizeTaskUsage
+// ---------------------------------------------------------------------------
+
+describe("usage aggregation (Phase 8B)", () => {
+  function seedRun(
+    s: Storage,
+    goal = "aggregate me",
+  ): { projectId: string; runId: string } {
+    const projectId = newProjectId();
+    ensureProject(s, projectId, "agg");
+    const runId = newRunId();
+    s.pipelineRuns.insert({
+      id: runId,
+      projectId,
+      status: "completed",
+      goal,
+      errorMessage: null,
+      createdAt: now(),
+      finishedAt: null,
+      durationMs: null,
+    });
+    return { projectId, runId };
+  }
+
+  it("returns null for an unknown run", () => {
+    const s = fileStorage();
+    expect(summarizeRunUsage(s.db, newRunId())).toBeNull();
+    s.close();
+  });
+
+  it("returns null for an unknown task", () => {
+    const s = fileStorage();
+    expect(summarizeTaskUsage(s.db, newTaskId())).toBeNull();
+    s.close();
+  });
+
+  it("aggregates executions reached through per-task linkage", () => {
+    const s = fileStorage();
+    const { projectId, runId } = seedRun(s);
+    const dev = makeTaskCard({
+      runId,
+      projectId,
+      role: "developer",
+      title: "Implement parser",
+      detail: "build a parser",
+      acceptanceCriteria: ["parses"],
+      dependsOn: [],
+      status: "pending",
+    });
+    s.tasks.insert(dev);
+    s.executions.insert(
+      makeExec({
+        runId,
+        projectId,
+        taskId: dev.id,
+        role: "developer",
+        usage: { inputTokens: 1200, outputTokens: 300, costUsdMicros: null, currency: null, usageSource: null },
+      }),
+    );
+    s.executions.insert(
+      makeExec({
+        runId,
+        projectId,
+        taskId: dev.id,
+        role: "developer",
+        usage: { inputTokens: 800, outputTokens: 100, costUsdMicros: null, currency: null, usageSource: null },
+      }),
+    );
+
+    const summary = summarizeRunUsage(s.db, runId);
+    expect(summary).not.toBeNull();
+    expect(summary!.runId).toBe(runId);
+    expect(summary!.projectId).toBe(projectId);
+    expect(summary!.executionCount).toBe(2);
+    expect(summary!.unknownExecutionCount).toBe(0);
+    expect(summary!.totals).toEqual({
+      inputTokens: 2000,
+      outputTokens: 400,
+      costUsdMicros: null,
+      currency: null,
+      usageSource: null,
+    });
+    expect(summary!.perTask).toHaveLength(1);
+    expect(summary!.perTask[0]).toMatchObject({
+      taskId: dev.id,
+      runId,
+      role: "developer",
+      title: "Implement parser",
+      executionCount: 2,
+      unknownExecutionCount: 0,
+    });
+    expect(summary!.perTask[0]!.totals).toEqual({
+      inputTokens: 2000,
+      outputTokens: 400,
+      costUsdMicros: null,
+      currency: null,
+      usageSource: null,
+    });
+
+    const taskSummary = summarizeTaskUsage(s.db, dev.id);
+    expect(taskSummary).not.toBeNull();
+    expect(taskSummary!.totals).toEqual(summary!.perTask[0]!.totals);
+    s.close();
+  });
+
+  it("also counts legacy executions linked by run_id on the execution", () => {
+    const s = fileStorage();
+    const { projectId, runId } = seedRun(s);
+    s.executions.insert(
+      makeExec({
+        runId,
+        projectId,
+        taskId: null,
+        role: "tester",
+        usage: { inputTokens: 40, outputTokens: 60, costUsdMicros: null, currency: null, usageSource: null },
+      }),
+    );
+
+    const summary = summarizeRunUsage(s.db, runId);
+    expect(summary!.executionCount).toBe(1);
+    expect(summary!.totals.inputTokens).toBe(40);
+    expect(summary!.totals.outputTokens).toBe(60);
+    s.close();
+  });
+
+  it("counts an execution matching both linkage conventions exactly once", () => {
+    const s = fileStorage();
+    const { projectId, runId } = seedRun(s);
+    const dev = makeTaskCard({
+      runId,
+      projectId,
+      role: "developer",
+      title: "Single source of truth",
+      detail: "one execution only",
+      acceptanceCriteria: ["ok"],
+      dependsOn: [],
+      status: "pending",
+    });
+    s.tasks.insert(dev);
+    // Execution carries BOTH the task_id link and a run_id link.
+    s.executions.insert(
+      makeExec({
+        runId,
+        projectId,
+        taskId: dev.id,
+        role: "developer",
+        usage: { inputTokens: 500, outputTokens: 50, costUsdMicros: null, currency: null, usageSource: null },
+      }),
+    );
+
+    const summary = summarizeRunUsage(s.db, runId);
+    expect(summary!.executionCount).toBe(1);
+    expect(summary!.totals.inputTokens).toBe(500);
+    expect(summary!.unknownExecutionCount).toBe(0);
+    s.close();
+  });
+
+  it("is scoped to the run and does not leak other runs' executions", () => {
+    const s = fileStorage();
+    const { projectId, runId } = seedRun(s);
+    const other = newRunId();
+    s.pipelineRuns.insert({
+      id: other,
+      projectId,
+      status: "running",
+      goal: "other",
+      errorMessage: null,
+      createdAt: now(),
+      finishedAt: null,
+      durationMs: null,
+    });
+    s.executions.insert(
+      makeExec({
+        runId,
+        projectId,
+        usage: { inputTokens: 10, outputTokens: 10, costUsdMicros: null, currency: null, usageSource: null },
+      }),
+    );
+    s.executions.insert(
+      makeExec({
+        runId: other,
+        projectId,
+        usage: { inputTokens: 9999, outputTokens: 9999, costUsdMicros: null, currency: null, usageSource: null },
+      }),
+    );
+
+    const summary = summarizeRunUsage(s.db, runId);
+    expect(summary!.executionCount).toBe(1);
+    expect(summary!.totals.inputTokens).toBe(10);
+    s.close();
+  });
+
+  it("unknown semantics: null usage increments the unknown count and nulls mixed aggregates", () => {
+    const s = fileStorage();
+    const { projectId, runId } = seedRun(s);
+    const dev = makeTaskCard({
+      runId,
+      projectId,
+      role: "developer",
+      title: "Partial telemetry",
+      detail: "some runs report, some do not",
+      acceptanceCriteria: ["ok"],
+      dependsOn: [],
+      status: "pending",
+    });
+    s.tasks.insert(dev);
+    s.executions.insert(
+      makeExec({
+        runId,
+        projectId,
+        taskId: dev.id,
+        role: "developer",
+        usage: { inputTokens: 100, outputTokens: 50, costUsdMicros: null, currency: null, usageSource: null },
+      }),
+    );
+    // A second, unmeasured execution: usage is UNKNOWN, not zero.
+    s.executions.insert(makeExec({ runId, projectId, taskId: dev.id, role: "developer", usage: null }));
+
+    const summary = summarizeRunUsage(s.db, runId);
+    expect(summary!.executionCount).toBe(2);
+    expect(summary!.unknownExecutionCount).toBe(1);
+    expect(summary!.totals.inputTokens).toBeNull();
+    expect(summary!.totals.outputTokens).toBeNull();
+    expect(summary!.totals.costUsdMicros).toBeNull();
+
+    const perTask = summary!.perTask[0]!;
+    expect(perTask.unknownExecutionCount).toBe(1);
+    expect(perTask.executionCount).toBe(2);
+    expect(perTask.totals.inputTokens).toBeNull();
+    s.close();
+  });
+
+  it("all-null usage produces all-null totals", () => {
+    const s = fileStorage();
+    const { projectId, runId } = seedRun(s);
+    s.executions.insert(makeExec({ runId, projectId, usage: null }));
+    s.executions.insert(makeExec({ runId, projectId, usage: null }));
+
+    const summary = summarizeRunUsage(s.db, runId);
+    expect(summary!.executionCount).toBe(2);
+    expect(summary!.unknownExecutionCount).toBe(2);
+    expect(summary!.totals).toEqual({
+      inputTokens: null,
+      outputTokens: null,
+      costUsdMicros: null,
+      currency: null,
+      usageSource: null,
+    });
+    s.close();
+  });
+
+  it("empty scopes report truthful zero totals, never an unknown", () => {
+    const s = fileStorage();
+    const { projectId, runId } = seedRun(s);
+
+    const summary = summarizeRunUsage(s.db, runId);
+    expect(summary!.executionCount).toBe(0);
+    expect(summary!.unknownExecutionCount).toBe(0);
+    expect(summary!.totals).toEqual({
+      inputTokens: 0,
+      outputTokens: 0,
+      costUsdMicros: 0,
+      currency: null,
+      usageSource: null,
+    });
+    expect(summary!.perTask).toHaveLength(0);
+
+    // A task that ran no executions is also a truthful zero.
+    const idle = makeTaskCard({
+      runId,
+      projectId,
+      role: "reviewer",
+      title: "Review everything",
+      detail: "no executions happened",
+      acceptanceCriteria: ["ok"],
+      dependsOn: [],
+      status: "pending",
+    });
+    s.tasks.insert(idle);
+    const taskSummary = summarizeTaskUsage(s.db, idle.id);
+    expect(taskSummary!.executionCount).toBe(0);
+    expect(taskSummary!.unknownExecutionCount).toBe(0);
+    expect(taskSummary!.totals.inputTokens).toBe(0);
+    s.close();
+  });
+
+  it("per-task summary scopes to the task, not the run", () => {
+    const s = fileStorage();
+    const { projectId, runId } = seedRun(s);
+    const dev = makeTaskCard({
+      runId,
+      projectId,
+      role: "developer",
+      title: "Dev task",
+      detail: "d",
+      acceptanceCriteria: ["ok"],
+      dependsOn: [],
+      status: "pending",
+    });
+    const tester = makeTaskCard({
+      runId,
+      projectId,
+      role: "tester",
+      title: "Test task",
+      detail: "t",
+      acceptanceCriteria: ["ok"],
+      dependsOn: [dev.id],
+      status: "pending",
+    });
+    s.tasks.insert(dev);
+    s.tasks.insert(tester);
+    s.executions.insert(
+      makeExec({
+        runId,
+        projectId,
+        taskId: dev.id,
+        role: "developer",
+        usage: { inputTokens: 300, outputTokens: 30, costUsdMicros: null, currency: null, usageSource: null },
+      }),
+    );
+
+    const devSummary = summarizeTaskUsage(s.db, dev.id);
+    const testerSummary = summarizeTaskUsage(s.db, tester.id);
+    expect(devSummary!.executionCount).toBe(1);
+    expect(devSummary!.totals.inputTokens).toBe(300);
+    expect(testerSummary!.executionCount).toBe(0);
+    expect(testerSummary!.totals.inputTokens).toBe(0);
+
+    const runSummary = summarizeRunUsage(s.db, runId);
+    expect(runSummary!.executionCount).toBe(1);
+    expect(runSummary!.perTask).toHaveLength(2);
+    s.close();
+  });
+
+  it("keeps a homogeneous currency/usageSource, and nulls them when mixed", () => {
+    const s = fileStorage();
+    const { projectId, runId } = seedRun(s);
+    s.executions.insert(
+      makeExec({
+        runId,
+        projectId,
+        usage: { inputTokens: 1, outputTokens: 1, costUsdMicros: 100, currency: "USD", usageSource: "reported" },
+      }),
+    );
+    s.executions.insert(
+      makeExec({
+        runId,
+        projectId,
+        usage: { inputTokens: 1, outputTokens: 1, costUsdMicros: 50, currency: "USD", usageSource: "reported" },
+      }),
+    );
+
+    let summary = summarizeRunUsage(s.db, runId)!;
+    expect(summary.totals.costUsdMicros).toBe(150);
+    expect(summary.totals.currency).toBe("USD");
+    expect(summary.totals.usageSource).toBe("reported");
+
+    // Inject a differently-priced execution with a second currency.
+    s.executions.insert(
+      makeExec({
+        runId,
+        projectId,
+        usage: { inputTokens: 1, outputTokens: 1, costUsdMicros: 25, currency: "EUR", usageSource: "reported" },
+      }),
+    );
+    summary = summarizeRunUsage(s.db, runId)!;
+    expect(summary.totals.costUsdMicros).toBe(175);
+    expect(summary.totals.currency).toBeNull();
+    expect(summary.totals.usageSource).toBe("reported");
+    s.close();
   });
 });
