@@ -1,9 +1,9 @@
 # DevMesh Development Plan
 
 > Status: active
-> Last updated: 2026-08-30 (post Phase 8C — Phases 0–8C complete; Phases 9–14 planned)
+> Last updated: 2026-09-01 (post Phase 9B — Phases 0–9 complete; Phases 10–14 planned)
 > Reference: docs/adr/0001-approved-architecture.md
-> Test baseline: 506 passed, 5 skipped, 0 failed
+> Test baseline: 530 passed, 5 skipped, 0 failed
 
 ---
 
@@ -36,6 +36,11 @@ agent runtime is OpenCode behind a swappable adapter port.
 - Cost pricing + budget enforcement (Phase 8C): config-driven pricing derives `costUsdMicros`
   (stamped `derived`, reported cost preserved), and per-run/per-task token & micro-USD gates
   reject over-limit starts before they run (HTTP 409 `budget/exhausted`)
+- Approval workflow (Phase 9): user-visible approval requests pause gated actions
+  (destructive git ops, network egress, cost cap releases). `ApprovalGate` persists
+  `approval.requested`/`approval.resolved` via the durable `approvals` table; the
+  orchestrator blocks a gated task as `blocked` until a human approves (resume) or
+  denies (fail), and re-enters the gate on resume so blocked state survives a restart
 
 ---
 
@@ -55,7 +60,8 @@ packages/
   opencode-adapter/ OpenCode CLI adapter (NDJSON, process-group kill, outputFormat)
   server/          Fastify HTTP server, orchestrator, execution service,
                    verification (SHA-256 + independent test replay), artifact
-                   builder (structured-first, text-parsing fallback), SSE streaming
+                   builder (structured-first, text-parsing fallback), SSE streaming,
+                   approval workflow (ApprovalGate + REST endpoints)
 ```
 
 ---
@@ -1040,16 +1046,17 @@ per-task token/cost budgets, so a runaway agent cannot exhaust the device.
 
 **Implemented tests: 47 (5 files, all passing)**
 
-### Phase 9: Approval Flow (Future, Partially Started — 9A Persistence Done)
+### Phase 9: Approval Flow — COMPLETE
 
-**Phase 9A (storage persistence) — complete.**
+**Status:** complete — 9A commit `37b70e7` (storage persistence), 9B commit
+`03cee71` (orchestrator gate + REST API)
 
 **Goal:** Wire the existing `approval.requested` / `approval.resolved` events
 (contracts already define them) into a user-visible approval workflow so
 sensitive actions (e.g. destructive git ops, external network calls, cost cap
 releases) pause the pipeline until a human approves or denies.
 
-#### Phase 9A (Done): Approval Persistence
+#### Phase 9A (complete — commit `37b70e7`): Approval Persistence
 
 1. `packages/storage`: `ApprovalRepository` + `approvals` table (migration 10)
    with approval id, project id, run id, task id, kind, title, detail, risk,
@@ -1060,25 +1067,50 @@ releases) pause the pipeline until a human approves or denies.
    unknown ids (`storage/not-found`) and double-resolution
    (`storage/approval-resolved`).
 
-#### Phase 9B (Future): Orchestrator + REST API
+#### Phase 9B (complete — commit `03cee71`): Orchestrator Gate + REST API
 
-2. `packages/server`: REST endpoints
-   - `POST /approvals` — create an approval request;
-   - `GET /approvals/:id` — fetch status;
-   - `POST /approvals/:id/resolve { decision }` — approve/deny;
+2. `packages/server/src/approvals.ts` — `ApprovalGate`: the single owner of the
+   approval lifecycle, shared by the REST layer and the orchestrator so created
+   and resolved approvals emit their events exactly once and persisted state
+   stays authoritative (no in-memory promise is the source of truth).
+   - `request()` persists and emits `approval.requested`. Idempotent by
+     identity: an existing `(runId, taskId)` record is returned as-is, and a
+     `(runId, kind)` fallback reconstructs prior decisions across Phase 7C
+     resume (which mints fresh task ids for the same stage) — a resolved
+     approval is never re-requested, no duplicate rows/events.
+   - `resolve()` delegates to the atomic `ApprovalRepository.resolve` and emits
+     `approval.resolved` only after the persisted transition succeeds.
+   - `waitForResolution`/`waitAnyResolution` poll the durable `approvals` table
+     (mirrors `waitForTerminal`); the orchestrator's `_cancelled` flag aborts
+     the wait.
+3. `packages/server` REST endpoints:
+   - `POST /approvals` — create an approval request (201; 404 unknown
+     project/run/task);
+   - `GET /approvals/:id` — fetch status (200; 404 `approval/not-found`);
+   - `POST /approvals/:id/resolve { decision: allow|deny }` — approve/deny
+     (200; 409 `storage/approval-resolved` on double resolution; 404 unknown);
    - `GET /projects/:projectId/approvals` — list pending approvals.
-3. Orchestrator hook: when an approval-gated action is reached, the pipeline
-   emits `approval.requested` and transitions the task to `blocked`; it stays
-   blocked until `approval.resolved` arrives (approve → resume, deny → fail).
-4. Persist resolution so resumable pipelines (Phase 7C) restore blocked state.
+   Body/params validated with Zod; `errors-map.ts` maps
+   `storage/approval-resolved` → 409.
+4. Orchestrator hook (`maybeGate`/`finishApprovalGate`): when the configured
+   `gateAction` marks a task as gated, the pipeline emits `approval.requested`
+   and transitions the task to `blocked` (legal `ready` → `blocked`). It stays
+   blocked until `approval.resolved` arrives:
+   - approve → `blocked` → `ready`, execution proceeds;
+   - deny → remaining stages cancelled, task stays `blocked`, pipeline fails
+     with a `run.failed` ("approval denied") event;
+   - cancel while blocked → `run.cancelled`, pipeline cancelled.
+   The gate is hit on both the initial run AND the resumed loop, so a blocked
+   run that was cancelled picks up its decision (approved/denied) or re-requests
+   while still pending — blocked state survives a resume without duplication.
 
 #### Acceptance Criteria
 
-- [ ] `approval.requested`/`approval.resolved` are emitted on the bus
-- [ ] Approval-gated action pauses the task as `blocked`
-- [ ] Approve resumes the task; deny fails it
-- [ ] Pending approvals are listed and resolvable via the API
-- [ ] Blocked state survives a resume
+- [x] `approval.requested`/`approval.resolved` are emitted on the bus
+- [x] Approval-gated action pauses the task as `blocked`
+- [x] Approve resumes the task; deny fails it
+- [x] Pending approvals are listed and resolvable via the API
+- [x] Blocked state survives a resume
 - [x] Approvals are validated (unknown id / double-resolve rejected)
 
 #### Required Tests
@@ -1086,11 +1118,13 @@ releases) pause the pipeline until a human approves or denies.
 | File | Tests |
 |---|---|
 | `contracts/events.test.ts` | Existing approval events (already covered) |
-| `storage/storage.test.ts` | Approval repository + resolution transitions (Phase 9A, done) |
-| `server/app.test.ts` | Approval endpoints (Phase 9B, future) |
-| `server/orchestrator.test.ts` | Blocked-on-approval, resume-on-approve, fail-on-deny (Phase 9B, future) |
+| `storage/storage.test.ts` | Approval repository + resolution transitions (Phase 9A) |
+| `server/app.test.ts` | Approval endpoints (7 tests): create + `approval.requested` emission, run-scoped request, 404 unknown project/run/task, fetch single + list pending, resolve allow/deny (+ `approval.resolved` event), double-resolve 409, resolve unknown 404, malformed payloads |
+| `server/orchestrator.test.ts` | Approval gate (5 tests): gated task blocks then approve resumes + completes, deny fails and leaves task blocked, cancel while blocked, request idempotency (pending + resolved + `(runId, kind)` reconstruction), blocked state survives a resume through `Orchestrator.resume` |
 
-**Estimated new tests: ~10 (Phase 9A storage tests complete; Phase 9B API/orchestrator pending)**
+**Phase 9 tests: 12 new in Phase 9B (7 API + 5 orchestrator); storage/contracts
+coverage from 9A retained. Gate applies to the linear chain and the resume
+loop; plan-task (DAG) gating is not yet wired (see Roadmap note).**
 
 ### Phase 10: Model/Provider Gateway (Future, Not Yet Started)
 
@@ -1267,19 +1301,24 @@ plugin and MCP server.
 | Phase | Focus | ADR Ref | Est. Tests | Status |
 |---|---|---|---|---|
 | 8C | Cost pricing + budget enforcement | Consequence | ~10 | ✅ Complete (47 tests) |
-| 9 | Approval flow | Events catalog | ~10 | Not started |
+| 9 | Approval flow | Events catalog | ~10 | ✅ Complete (12 new Phase 9B tests; 9A storage covered) |
 | 10 | Model/provider gateway | Amendment 6 | ~8 | Not started |
 | 11 | Additional agent roles | Amendment 3 | ~8 | Not started |
 | 12 | Local/offline model adapter | Amendment 9 | ~5 | Not started |
 | 13 | Frontend/UI | Amendment 7 | ~2 | Not started |
 | 14 | Security hardening, permissions, MCP & plugin packaging | ADR/README | ~12 | Not started |
 
-> Phases 9–14 are **planned only** — none are implemented. Detailed goals,
+> Phases 10–14 are **planned only** — none are implemented. Detailed goals,
 > acceptance criteria, and required tests for each appear above.
+>
+> **Roadmap note (Phase 9B boundary):** the approval gate currently guards the
+> linear chain (initial run + resume). Multi-task plan (DAG) tasks — Phase 7F —
+> are not yet gateable; wiring the gate into the DAG scheduler is the natural
+> next increment. All other Phase 9 acceptance criteria are met.
 
 ---
 
-## Appendix: Test File Inventory (post Phase 8C)
+## Appendix: Test File Inventory (post Phase 9B)
 
 | File | Tests | Area |
 |---|---|---|
@@ -1300,8 +1339,8 @@ plugin and MCP server.
 | `workspace/src/locks.test.ts` | 6 | MutexMap |
 | `workspace/src/paths.test.ts` | 5 | Path safety |
 | `workspace/src/service.test.ts` | 13 | Workspace service |
-| `server/src/app.test.ts` | 52 | HTTP API (incl. context/resume endpoints) |
-| `server/src/orchestrator.test.ts` | 105 | Orchestrator (DAG, replay, structured, resume, lifecycle) |
+| `server/src/app.test.ts` | 59 | HTTP API (incl. context/resume/approval endpoints) |
+| `server/src/orchestrator.test.ts` | 110 | Orchestrator (DAG, replay, structured, resume, lifecycle, approval gate) |
 | `server/src/executions.test.ts` | 21 | Execution service |
 | `server/src/executions/verify.test.ts` | 17 | Independent test replay verification |
 | `server/src/executions/pricing.test.ts` | 10 | PriceTable + derived cost (8C) |
@@ -1311,11 +1350,11 @@ plugin and MCP server.
 | `server/src/pipeline-sse.test.ts` | 24 | SSE streaming |
 | `server/src/orchestrator-real.test.ts` | 1 | Real OpenCode (gated) |
 | `server/src/opencode-real.test.ts` | 4 | Real OpenCode E2E (gated) |
-| **Total (listed)** | **479 `it(`/`test(` occurrences summed** | 8C adds 47 across 5 files |
+| **Total (listed)** | **491 `it(`/`test(` occurrences summed** | 9B adds 12 across app + orchestrator suites |
 
 > Counts above reflect the `it(`/`test(` occurrences per file and are
 > approximate (vitest's numeric total includes dynamically-defined subtests);
-> the authoritative number comes from `npm test` (506 passed, 5 skipped, 0 failed).
+> the authoritative number comes from `npm test` (530 passed, 5 skipped, 0 failed).
 
 ### Known Test Gaps — all resolved
 
