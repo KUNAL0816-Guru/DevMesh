@@ -3699,3 +3699,410 @@ describe("Orchestrator: Phase 9B — approval gate", () => {
     await storage.close();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 9B.1 — DAG approval gate parity tests
+// ---------------------------------------------------------------------------
+
+describe("Orchestrator: Phase 9B.1 — DAG approval gate parity", () => {
+  // Architect returns a multi-task plan that enters the DAG path; the gate
+  // is configured to block certain plan tasks behind an approval.
+  function gatedDagPlan(
+    tasks: Array<Record<string, unknown>>,
+  ): { spec: Record<string, unknown>; plan: { tasks: Array<Record<string, unknown>> } } {
+    return {
+      spec: {
+        title: "DAG project",
+        summary: "multi-task DAG with approval gate",
+        goals: ["ship"],
+        nonGoals: [],
+        constraints: [],
+        techStack: [],
+        risks: [],
+        openQuestions: [],
+      },
+      plan: { tasks },
+    };
+  }
+
+  function dagPlanTask(
+    refKey: string,
+    extra: Partial<Record<string, unknown>> = {},
+  ) {
+    return {
+      refKey,
+      role: "developer",
+      title: `Task ${refKey}`,
+      detail: `Implement ${refKey}`,
+      acceptanceCriteria: ["done"],
+      dependsOn: [] as string[],
+      ...extra,
+    };
+  }
+
+  function gatedDagScript(
+    tasks: Array<Record<string, unknown>>,
+    devBehavior: (
+      title: string,
+    ) => { status?: "completed" | "failed"; effect?: () => void; text?: string },
+  ): FakeScriptFactory {
+    return (req) => {
+      const agentMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = agentMatch?.[1]?.toLowerCase() ?? "unknown";
+
+      if (role === "architect") {
+        return {
+          steps: [{ events: [{ kind: "text", text: "plan" }] }],
+          outcome: { status: "completed", finalText: "plan", structured: gatedDagPlan(tasks) },
+          stepDelayMs: 5,
+        };
+      }
+      if (role === "developer") {
+        const refKey = req.instruction.match(/Implement ([A-Za-z0-9_-]+)/)?.[1];
+        const behavior = devBehavior(refKey ?? "unknown");
+        return {
+          steps: [
+            {
+              effect: behavior.effect,
+              events: [{ kind: "text", text: behavior.text ?? "impl" }],
+            },
+          ],
+          outcome: {
+            status: behavior.status ?? "completed",
+            finalText: behavior.text ?? "impl",
+          },
+          stepDelayMs: 5,
+        };
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} ok` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    };
+  }
+
+  /** Poll until the first pending approval appears or timeout. */
+  async function waitForPendingApproval(storage: Storage): Promise<ApprovalRecord> {
+    for (let i = 0; i < 200; i++) {
+      const pending = storage.approvals.listPending();
+      if (pending.length > 0) return pending[0]!;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    throw new Error("no pending approval appeared");
+  }
+
+  /** Poll until a task matching the predicate reaches the expected status. */
+  async function waitForTask(
+    storage: Storage,
+    predicate: (t: TaskCard) => boolean,
+    expectedStatus: string,
+  ): Promise<TaskCard> {
+    for (let i = 0; i < 200; i++) {
+      const runId = findLatestRunId(storage);
+      if (runId) {
+        const tasks = storage.tasks.listByRun(runId as never);
+        const match = tasks.find(
+          (t) => predicate(t) && t.status === expectedStatus,
+        );
+        if (match) return match;
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    throw new Error(
+      `no task matching predicate found in status "${expectedStatus}"`,
+    );
+  }
+
+  it("75. gated DAG task blocks on approval; approve resumes and completes", async () => {
+    const stack = makeStack(
+      gatedDagScript(
+        [
+          dagPlanTask("alpha"),
+          dagPlanTask("beta", { dependsOn: ["alpha"] }),
+        ],
+        (title) => ({
+          effect: () => writeFileSync(join(stack.root, `${title}.txt`), "ok"),
+        }),
+      ),
+    );
+    const approvalGate = new ApprovalGate(stack.storage);
+    stack.orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      approvalGate,
+      gateAction: (card) =>
+        card.title === "Task alpha"
+          ? {
+              kind: "destructive_git",
+              title: "Workspace mutation",
+              detail: "alpha will modify files",
+              risk: "high" as const,
+            }
+          : null,
+    });
+
+    const pipelinePromise = stack.orchestrator.run(
+      stack.projectId,
+      "dag gated pipeline",
+    ) as unknown as Promise<PipelineResult>;
+
+    // Wait for the approval to be persisted and the task to be blocked.
+    const approval = await waitForPendingApproval(stack.storage);
+    expect(approval.status).toBe("pending");
+    expect(approval.kind).toBe("destructive_git");
+
+    // The gated task must be blocked.
+    const blockedTask = await waitForTask(
+      stack.storage,
+      (t) => t.detail.includes("Implement alpha"),
+      "blocked",
+    );
+    expect(blockedTask.title).toBe("Task alpha");
+
+    // approval.requested event must have been emitted.
+    expect(
+      getEventsOfType(stack.storage, "approval.requested").length,
+    ).toBe(1);
+
+    // Resolve — pipeline should complete.
+    approvalGate.resolve(approval.id, "allow");
+    const result = await pipelinePromise;
+    expect(result.status).toBe("completed");
+
+    // Exactly one approval.resolved event.
+    expect(
+      getEventsOfType(stack.storage, "approval.resolved").length,
+    ).toBe(1);
+
+    await stack.storage.close();
+  });
+
+  it("76. deny prevents DAG task execution and fails the pipeline", async () => {
+    const stack = makeStack(
+      gatedDagScript(
+        [
+          dagPlanTask("alpha"),
+          dagPlanTask("beta", { dependsOn: ["alpha"] }),
+        ],
+        (title) => ({
+          effect: () => writeFileSync(join(stack.root, `${title}.txt`), "ok"),
+        }),
+      ),
+    );
+    const approvalGate = new ApprovalGate(stack.storage);
+    stack.orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      approvalGate,
+      gateAction: (card) =>
+        card.title === "Task alpha"
+          ? {
+              kind: "destructive_git",
+              title: "Workspace mutation",
+              detail: "alpha will modify files",
+              risk: "high" as const,
+            }
+          : null,
+    });
+
+    const pipelinePromise = stack.orchestrator.run(
+      stack.projectId,
+      "dag deny",
+    ) as unknown as Promise<PipelineResult>;
+
+    const approval = await waitForPendingApproval(stack.storage);
+    approvalGate.resolve(approval.id, "deny");
+
+    const result = await pipelinePromise;
+    expect(result.status).toBe("failed");
+    expect(result.errorMessage).toContain("approval denied");
+
+    // The gated task stays blocked.
+    const blockedTask = stack.storage.tasks
+      .listByRun(findLatestRunId(stack.storage)! as never)
+      .find((t) => t.detail.includes("Implement alpha"));
+    expect(blockedTask?.status).toBe("blocked");
+
+    // The file must not have been written.
+    const { existsSync } = await import("node:fs");
+    expect(existsSync(join(stack.root, "alpha.txt"))).toBe(false);
+
+    expect(getEventsOfType(stack.storage, "run.failed").length).toBe(1);
+    expect(getEventsOfType(stack.storage, "approval.resolved").length).toBe(1);
+
+    await stack.storage.close();
+  });
+
+  it("77. independent DAG task continues while another task waits for approval", async () => {
+    // Two independent tasks (no deps between them).  One is gated.
+    // The non-gated task must run and complete while the gated task is blocked.
+    const effects: string[] = [];
+    const stack = makeStack(
+      gatedDagScript(
+        [dagPlanTask("gated"), dagPlanTask("free")],
+        (title) => ({
+          effect: () => {
+            effects.push(title);
+            writeFileSync(join(stack.root, `${title}.txt`), "ok");
+          },
+        }),
+      ),
+    );
+    const approvalGate = new ApprovalGate(stack.storage);
+    stack.orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      approvalGate,
+      gateAction: (card) =>
+        card.title === "Task gated"
+          ? {
+              kind: "destructive_git",
+              title: "Workspace mutation",
+              detail: "gated will modify files",
+              risk: "high" as const,
+            }
+          : null,
+    });
+
+    const pipelinePromise = stack.orchestrator.run(
+      stack.projectId,
+      "dag concurrent gate",
+    ) as unknown as Promise<PipelineResult>;
+
+    // Wait for the gate to block the "gated" task.
+    const approval = await waitForPendingApproval(stack.storage);
+    expect(approval.status).toBe("pending");
+
+    // Allow — both tasks should complete.
+    approvalGate.resolve(approval.id, "allow");
+    const result = await pipelinePromise;
+    expect(result.status).toBe("completed");
+
+    // Both tasks ran (the free task was not blocked by the gated task).
+    expect(effects).toContain("gated");
+    expect(effects).toContain("free");
+
+    await stack.storage.close();
+  });
+
+  it("78. dependent task does not execute before its approved dependency completes", async () => {
+    // alpha is gated; beta depends on alpha.  beta must not start until alpha
+    // is approved and completes.
+    const runOrder: string[] = [];
+    const stack = makeStack(
+      gatedDagScript(
+        [
+          dagPlanTask("alpha"),
+          dagPlanTask("beta", { dependsOn: ["alpha"] }),
+        ],
+        (title) => ({
+          effect: () => {
+            runOrder.push(title);
+            writeFileSync(join(stack.root, `${title}.txt`), "ok");
+          },
+        }),
+      ),
+    );
+    const approvalGate = new ApprovalGate(stack.storage);
+    stack.orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      approvalGate,
+      gateAction: (card) =>
+        card.title === "Task alpha"
+          ? {
+              kind: "destructive_git",
+              title: "Workspace mutation",
+              detail: "alpha will modify files",
+              risk: "high" as const,
+            }
+          : null,
+    });
+
+    const pipelinePromise = stack.orchestrator.run(
+      stack.projectId,
+      "dag dep order",
+    ) as unknown as Promise<PipelineResult>;
+
+    // Alpha is gated; beta should not run yet.
+    const approval = await waitForPendingApproval(stack.storage);
+
+    // Resolve alpha.
+    approvalGate.resolve(approval.id, "allow");
+    const result = await pipelinePromise;
+    expect(result.status).toBe("completed");
+
+    // alpha must have run before beta.
+    expect(runOrder).toHaveLength(2);
+    expect(runOrder[0]).toBe("alpha");
+    expect(runOrder[1]).toBe("beta");
+
+    await stack.storage.close();
+  });
+
+  it("79. pending DAG approval survives resume; resume does not create duplicate", async () => {
+    // First run: architect produces a 2-task plan; the first task is gated.
+    // Cancel while the approval is still pending.
+    const stack = makeStack(
+      gatedDagScript(
+        [
+          dagPlanTask("alpha"),
+          dagPlanTask("beta", { dependsOn: ["alpha"] }),
+        ],
+        (title) => ({
+          effect: () => writeFileSync(join(stack.root, `${title}.txt`), "ok"),
+        }),
+      ),
+    );
+    const approvalGate = new ApprovalGate(stack.storage);
+    stack.orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      approvalGate,
+      gateAction: (card) =>
+        card.title === "Task alpha"
+          ? {
+              kind: "destructive_git",
+              title: "Workspace mutation",
+              detail: "alpha will modify files",
+              risk: "high" as const,
+            }
+          : null,
+    });
+
+    // First run — cancel while gated.
+    const firstRun = stack.orchestrator.run(
+      stack.projectId,
+      "dag resume",
+    ) as unknown as Promise<PipelineResult>;
+    const approval = await waitForPendingApproval(stack.storage);
+    expect(approval.status).toBe("pending");
+
+    stack.orchestrator.cancel();
+    const cancelled = await firstRun;
+    expect(cancelled.status).toBe("cancelled");
+
+    // Decide while the run is cancelled.
+    approvalGate.resolve(approval.id, "allow");
+    const runId = findLatestRunId(stack.storage)!;
+
+    // Resume — the gate must reuse the existing approval, not create a
+    // duplicate.
+    const resumed = await stack.orchestrator.resume(runId);
+    expect(resumed.status).toBe("completed");
+
+    const approvals = stack.storage.approvals.listByRun(runId as never);
+    expect(approvals.length).toBe(1);
+    expect(approvals[0]!.status).toBe("approved");
+    expect(getEventsOfType(stack.storage, "approval.requested").length).toBe(1);
+    expect(getEventsOfType(stack.storage, "approval.resolved").length).toBe(1);
+
+    await stack.storage.close();
+  });
+});

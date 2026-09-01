@@ -1764,6 +1764,50 @@ export class Orchestrator {
         if (launched.has(card.id)) continue;
         if (finished.has(card.id)) continue;
         if (!depsSatisfied(card)) continue;
+
+        // --- Approval gate (Phase 9B.1): DAG parity ------------------------
+        // Transition pending → ready first (ready → blocked is legal,
+        // pending → blocked is not) then check the gate BEFORE launching the
+        // execution so a blocked task does not consume a concurrency slot.
+        // Independent tasks whose deps are satisfied continue past the blocked
+        // task; dependent tasks wait for their dependency's gate to resolve.
+        if (canTransition(card.status, "ready")) {
+          this.transitionTask(card, "ready");
+        }
+        const gateApproval = this.maybeGate(card, projectId, runId);
+        if (gateApproval) {
+          const resolved = await this.finishApprovalGate(gateApproval);
+          if (resolved === "denied") {
+            this.transitionTask(card, "blocked");
+            this.blockAllRemaining(tasks, finished);
+            this.cancelRemainingStages(stageRows);
+            this.emitEvent({
+              ts: new Date().toISOString(),
+              runId,
+              projectId,
+              actor: "system",
+              type: "run.failed",
+              reason: `approval denied for plan task ${card.title}`,
+            });
+            return this.result("failed", card.id, projectId,
+              `approval denied for plan task ${card.title}`);
+          }
+          if (resolved === "cancelled") {
+            this.cancelRemainingStages(stageRows);
+            this.emitEvent({
+              ts: new Date().toISOString(),
+              runId,
+              projectId,
+              actor: "system",
+              type: "run.cancelled",
+              reason: "pipeline cancelled while awaiting approval",
+            });
+            return this.result("cancelled", card.id, projectId, "pipeline cancelled");
+          }
+          // approved → restore ready so startDagTask can launch it.
+          this.transitionTask(card, "ready");
+        }
+
         const started = await this.startDagTask(card, projectId, handle.root);
         if (!started || started.kind === "locked") {
           // null = not launchable; locked = project already running another
