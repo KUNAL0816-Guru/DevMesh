@@ -9,12 +9,13 @@ import {
   TerminalStateError,
   newArtifactId,
 } from "@devmesh/contracts";
-import { createStorage, type Storage } from "@devmesh/storage";
+import { createStorage, type ApprovalRecord, type Storage } from "@devmesh/storage";
 import { assertPipelineConsistency } from "@devmesh/storage";
 import { WorkspaceService } from "@devmesh/workspace";
 import { FakeRuntime, type FakeScriptFactory } from "@devmesh/runtime";
 import { createDefaultAgentRegistry } from "@devmesh/agents";
 import { Orchestrator, type PipelineResult } from "./orchestrator.js";
+import { ApprovalGate } from "./approvals.js";
 import { ExecutionService } from "./executions/service.js";
 import { DoomLoopDetector, computeFailureSignature } from "./orchestrator.js";
 import type { Config } from "./config.js";
@@ -3523,5 +3524,178 @@ describe("Orchestrator: Phase 7F — dynamic DAG execution", () => {
     expect(existsSync(join(handle.root, "app.js"))).toBe(false);
 
     await stack.storage.close();
+  });
+});
+
+describe("Orchestrator: Phase 9B — approval gate", () => {
+  /** Stack whose developer task is gated behind an approval request. */
+  function gatedStack() {
+    const stack = makeStack(perAgentScript({
+      architect: { text: "plan" },
+      developer: {
+        effect: () => writeFileSync(join(stack.root, "f.txt"), "v1"),
+        text: "impl",
+      },
+      tester: { text: "pass" },
+      reviewer: { text: "APPROVED" },
+    }));
+    const approvalGate = new ApprovalGate(stack.storage);
+    stack.orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      approvalGate,
+      gateAction: (card) =>
+        card.role === "developer"
+          ? {
+              kind: "destructive_git",
+              title: "Workspace mutation",
+              detail: "developer will modify workspace files",
+              risk: "high" as const,
+            }
+          : null,
+    });
+    return { storage: stack.storage, orchestrator: stack.orchestrator, approvalGate, projectId: stack.projectId };
+  }
+
+  async function waitForPendingApproval(storage: Storage): Promise<ApprovalRecord> {
+    for (let i = 0; i < 200; i++) {
+      const pending = storage.approvals.listPending();
+      if (pending.length > 0) return pending[0]!;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    throw new Error("no pending approval appeared");
+  }
+
+  function developerTask(storage: Storage): { status: string } {
+    const runId = findLatestRunId(storage)!;
+    const dev = storage.tasks.listByRun(runId as never).find((t) => t.role === "developer");
+    if (!dev) throw new Error("no developer task persisted");
+    return dev;
+  }
+
+  it("70. gated task blocks on approval; approve resumes and completes", async () => {
+    const { storage, orchestrator, approvalGate, projectId } = gatedStack();
+
+    const pipelinePromise = orchestrator.run(projectId, "gated pipeline") as unknown as Promise<PipelineResult>;
+    const approval = await waitForPendingApproval(storage);
+
+    expect(approval.status).toBe("pending");
+    expect(approval.kind).toBe("destructive_git");
+    expect(developerTask(storage).status).toBe("blocked");
+    expect(getEventsOfType(storage, "approval.requested").length).toBe(1);
+
+    approvalGate.resolve(approval.id, "allow");
+
+    const result = await pipelinePromise;
+    expect(result.status).toBe("completed");
+    expect(getEventsOfType(storage, "approval.resolved").length).toBe(1);
+    await storage.close();
+  });
+
+  it("71. deny fails the pipeline and leaves the task blocked", async () => {
+    const { storage, orchestrator, approvalGate, projectId } = gatedStack();
+
+    const pipelinePromise = orchestrator.run(projectId, "gated deny") as unknown as Promise<PipelineResult>;
+    const approval = await waitForPendingApproval(storage);
+
+    approvalGate.resolve(approval.id, "deny");
+
+    const result = await pipelinePromise;
+    expect(result.status).toBe("failed");
+    expect(result.errorMessage).toBe("approval denied");
+    expect(developerTask(storage).status).toBe("blocked");
+    expect(getEventsOfType(storage, "run.failed").length).toBe(1);
+    expect(getEventsOfType(storage, "approval.resolved").length).toBe(1);
+    await storage.close();
+  });
+
+  it("72. cancel while blocked returns cancelled", async () => {
+    const { storage, orchestrator, projectId } = gatedStack();
+
+    const pipelinePromise = orchestrator.run(projectId, "gated cancel") as unknown as Promise<PipelineResult>;
+    const approval = await waitForPendingApproval(storage);
+    expect(approval.status).toBe("pending");
+
+    orchestrator.cancel();
+
+    const result = await pipelinePromise;
+    expect(result.status).toBe("cancelled");
+    expect(getEventsOfType(storage, "run.cancelled").length).toBe(1);
+    await storage.close();
+  });
+
+  it("73. request is idempotent for a pending (runId, taskId) pair", async () => {
+    const { storage, approvalGate } = gatedStack();
+    const projectId = storage.projects.list()[0]?.id ?? "00000000-0000-4000-8000-000000000000" as never;
+    const runId = "00000000-0000-4000-8000-000000000001" as never;
+    const taskId = "00000000-0000-4000-8000-000000000002";
+
+    const spec = {
+      kind: "cost_release",
+      title: "Raise cap",
+      detail: "",
+      risk: "medium" as const,
+    };
+    const first = approvalGate.request({ projectId: projectId as never, runId, taskId: taskId as never, spec });
+    const second = approvalGate.request({ projectId: projectId as never, runId, taskId: taskId as never, spec });
+
+    expect(second.id).toBe(first.id);
+    expect(storage.approvals.listPending().length).toBe(1);
+    expect(getEventsOfType(storage, "approval.requested").length).toBe(1);
+
+    // An already-resolved approval is never re-requested.
+    approvalGate.resolve(first.id, "deny");
+    const third = approvalGate.request({ projectId: projectId as never, runId, taskId: taskId as never, spec });
+    expect(third.id).toBe(first.id);
+    expect(third.status).toBe("denied");
+    expect(getEventsOfType(storage, "approval.requested").length).toBe(1);
+
+    // Resume reconstruction: a NEW task id for the same gate kind reuses the
+    // prior decision instead of minting a fresh request (Phase 7C recreates
+    // task cards under fresh ids when it rebuilds the staged pipeline).
+    const otherTaskId = "00000000-0000-4000-8000-000000000003";
+    const fourth = approvalGate.request({
+      projectId: projectId as never,
+      runId,
+      taskId: otherTaskId as never,
+      spec,
+    });
+    expect(fourth.id).toBe(first.id);
+    expect(fourth.status).toBe("denied");
+    expect(storage.approvals.listByRun(runId as never).length).toBe(1);
+    expect(getEventsOfType(storage, "approval.requested").length).toBe(1);
+
+    await storage.close();
+  });
+
+  it("74. blocked state survives a resume: prior decision is honored, not re-requested", async () => {
+    const { storage, orchestrator, approvalGate, projectId } = gatedStack();
+
+    // First run: the developer task is gated → blocked; cancel while the
+    // decision is still pending.
+    const firstRun = orchestrator.run(projectId, "gated resume") as unknown as Promise<PipelineResult>;
+    const approval = await waitForPendingApproval(storage);
+    expect(approval.status).toBe("pending");
+
+    orchestrator.cancel();
+    const cancelled = await firstRun;
+    expect(cancelled.status).toBe("cancelled");
+
+    // Decide while the run is cancelled, then resume from the last completed
+    // stage. Resume recreates the developer card under a new id; the gate must
+    // reconstruct the persisted (approved) approval instead of re-requesting.
+    approvalGate.resolve(approval.id, "allow");
+    const runId = findLatestRunId(storage)!;
+
+    const resumed = await orchestrator.resume(runId);
+    expect(resumed.status).toBe("completed");
+
+    const approvals = storage.approvals.listByRun(runId as never);
+    expect(approvals.length).toBe(1);
+    expect(approvals[0]!.status).toBe("approved");
+    expect(getEventsOfType(storage, "approval.requested").length).toBe(1);
+    expect(getEventsOfType(storage, "approval.resolved").length).toBe(1);
+    await storage.close();
   });
 });

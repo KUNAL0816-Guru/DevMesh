@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import {
+  approvalIdSchema,
   artifactKindSchema,
   contextEntrySchema,
   contextNamespaceSchema,
@@ -7,6 +8,7 @@ import {
   runIdSchema,
   taskIdSchema,
 } from "@devmesh/contracts";
+import { ApprovalGate } from "./approvals.js";
 import type { Storage } from "@devmesh/storage";
 import type { WorkspaceService, ProjectRecord } from "@devmesh/workspace";
 import type { AgentRuntime } from "@devmesh/runtime";
@@ -50,6 +52,22 @@ const createContextEntryBody = z.strictObject({
   key: z.string().min(1).max(200),
   value: z.unknown(),
   createdBy: z.string().min(1).max(50),
+});
+
+const approvalRiskSchema = z.enum(["low", "medium", "high", "critical"]);
+
+const createApprovalBody = z.strictObject({
+  projectId: projectIdSchema,
+  runId: runIdSchema,
+  taskId: taskIdSchema.nullable().optional(),
+  kind: z.string().min(1).max(120),
+  title: z.string().min(1).max(200),
+  detail: z.string().max(4000).default(""),
+  risk: approvalRiskSchema,
+});
+
+const resolveApprovalBody = z.strictObject({
+  decision: z.enum(["allow", "deny"]),
 });
 
 export interface BuildAppOptions {
@@ -96,6 +114,9 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
   // In-memory registry of active pipeline runs (runId → Orchestrator).
   // Cleared on every terminal path; no memory leak on normal operation.
   const runningPipelines = new Map<string, Orchestrator>();
+
+  // Approval workflow owner: persistence + event emission for create/resolve.
+  const approvals = new ApprovalGate(opts.storage);
 
   const publicExecution = (rec: Awaited<ReturnType<ExecutionService["start"]>>) => ({
     id: rec.id,
@@ -946,6 +967,136 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
     });
     opts.storage.context.put(entry);
     return reply.status(201).send({ context: entry });
+  });
+
+  // -- approvals -------------------------------------------------------------
+
+  // POST /approvals — create an approval request (emits approval.requested).
+  app.post("/approvals", async (req, reply) => {
+    const parsed = createApprovalBody.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: {
+          code: "request/invalid",
+          message: "body must be {projectId, runId, kind, title, detail, risk}",
+        },
+      });
+    }
+    const body = parsed.data;
+    if (!opts.storage.projects.get(body.projectId)) {
+      return reply.status(404).send({
+        error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    if (!opts.storage.pipelineRuns.get(body.runId)) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    if (body.taskId && !opts.storage.tasks.get(body.taskId)) {
+      return reply.status(404).send({
+        error: { code: "task/not-found", message: "no such task" },
+      });
+    }
+    const record = approvals.request({
+      projectId: body.projectId,
+      runId: body.runId,
+      taskId: body.taskId ?? null,
+      spec: {
+        kind: body.kind,
+        title: body.title,
+        detail: body.detail,
+        risk: body.risk,
+      },
+    });
+    return reply.status(201).send({ approval: record });
+  });
+
+  // GET /approvals/:id — fetch approval status.
+  app.get("/approvals/:approvalId", async (req, reply) => {
+    const params = z
+      .strictObject({ approvalId: z.string() })
+      .safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid approval id" },
+      });
+    }
+    const parsedId = approvalIdSchema.safeParse(params.data.approvalId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "approval/not-found", message: "no such approval" },
+      });
+    }
+    const rec = opts.storage.approvals.get(parsedId.data);
+    if (!rec) {
+      return reply.status(404).send({
+        error: { code: "approval/not-found", message: "no such approval" },
+      });
+    }
+    return { approval: rec };
+  });
+
+  // POST /approvals/:id/resolve — approve/deny (emits approval.resolved).
+  app.post("/approvals/:approvalId/resolve", async (req, reply) => {
+    const params = z
+      .strictObject({ approvalId: z.string() })
+      .safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid approval id" },
+      });
+    }
+    const parsedId = approvalIdSchema.safeParse(params.data.approvalId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "approval/not-found", message: "no such approval" },
+      });
+    }
+    const parsedBody = resolveApprovalBody.safeParse(req.body);
+    if (!parsedBody.success) {
+      return reply.status(400).send({
+        error: {
+          code: "request/invalid",
+          message: "body must be {decision: \"allow\"|\"deny\"}",
+        },
+      });
+    }
+    try {
+      const record = approvals.resolve(parsedId.data, parsedBody.data.decision);
+      return reply.status(200).send({ approval: record });
+    } catch (err) {
+      const problem = normalizeError(err);
+      return reply.status(problem.status).send({
+        error: {
+          code: (err as { code?: string }).code ?? problem.code,
+          message: problem.message,
+        },
+      });
+    }
+  });
+
+  // GET /projects/:projectId/approvals — list pending approvals.
+  app.get("/projects/:projectId/approvals", async (req, reply) => {
+    const params = z.strictObject({ projectId: z.string() }).safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid project id" },
+      });
+    }
+    const parsedId = projectIdSchema.safeParse(params.data.projectId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    const rec = opts.storage.projects.get(parsedId.data);
+    if (!rec) {
+      return reply.status(404).send({
+        error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    return { approvals: opts.storage.approvals.listPending(parsedId.data) };
   });
 
   // -- lifecycle ------------------------------------------------------------

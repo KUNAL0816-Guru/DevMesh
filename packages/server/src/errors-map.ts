@@ -17,6 +17,7 @@ const STATUS_BY_CODE: Readonly<Record<string, number>> = {
   "storage/corrupt-row": 500,
   "storage/open-failed": 500,
   "storage/insert-failed": 500,
+  "storage/approval-resolved": 409,
   "runtime/not-configured": 503,
   "runtime/unavailable": 503,
   "runtime/cancel-failed": 409,

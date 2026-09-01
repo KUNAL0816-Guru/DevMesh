@@ -6,9 +6,11 @@ import {
   artifactSchema,
   makeContextEntry,
   makeTaskCard,
+  newApprovalId,
   newArtifactBase,
   newProjectId,
   newRunId,
+  newTaskId,
 } from "@devmesh/contracts";
 import type { Storage } from "@devmesh/storage";
 import { createStorage } from "@devmesh/storage";
@@ -1228,6 +1230,196 @@ describe("POST /pipelines/:runId/resume", () => {
     const body = res.json() as { error: { code: string } };
     expect(body.error.code).toBe("runtime/not-configured");
 
+    await app.close();
+  });
+});
+
+describe("approvals API (Phase 9B)", () => {
+  it("creates a pending approval and emits approval.requested", async () => {
+    const { app, storage } = await buildStack();
+    const { projectId, runId, task1 } = seedPipelineData(storage);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/approvals",
+      payload: {
+        projectId,
+        runId,
+        taskId: task1.id,
+        kind: "destructive_git",
+        title: "Force-push",
+        detail: "overwrite origin/main",
+        risk: "high",
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    const approval = res.json().approval as {
+      id: string;
+      status: string;
+      kind: string;
+      risk: string;
+      runId: string;
+      taskId: string | null;
+    };
+    expect(approval.status).toBe("pending");
+    expect(approval.kind).toBe("destructive_git");
+    expect(approval.risk).toBe("high");
+    expect(approval.runId).toBe(runId);
+    expect(approval.taskId).toBe(task1.id);
+
+    const events = storage.events.listByRun(runId);
+    const req = events.find((e) => e.type === "approval.requested");
+    expect(req && "approvalId" in req && (req as { approvalId: string }).approvalId).toBe(approval.id);
+    await app.close();
+  });
+
+  it("creates a run-scoped approval without a task", async () => {
+    const { app, storage } = await buildStack();
+    const { projectId, runId } = seedPipelineData(storage);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/approvals",
+      payload: { projectId, runId, kind: "cost_release", title: "Raise cap", risk: "medium" },
+    });
+    expect(res.statusCode).toBe(201);
+    const approval = res.json().approval as { status: string; taskId: string | null };
+    expect(approval.status).toBe("pending");
+    expect(approval.taskId).toBeNull();
+    await app.close();
+  });
+
+  it("rejects creation against unknown project / run / task", async () => {
+    const { app, storage } = await buildStack();
+    const { projectId, runId, task1 } = seedPipelineData(storage);
+
+    const cases: Array<{ payload: Record<string, unknown>; code: string }> = [
+      {
+        payload: { projectId: newProjectId(), runId, taskId: task1.id, kind: "k", title: "t", risk: "low" },
+        code: "workspace/not-found",
+      },
+      {
+        payload: { projectId, runId: newRunId(), taskId: task1.id, kind: "k", title: "t", risk: "low" },
+        code: "pipeline/not-found",
+      },
+      {
+        payload: { projectId, runId, taskId: newTaskId(), kind: "k", title: "t", risk: "low" },
+        code: "task/not-found",
+      },
+    ];
+    for (const c of cases) {
+      const res = await app.inject({ method: "POST", url: "/approvals", payload: c.payload });
+      expect(res.statusCode).toBe(404);
+      expect(res.json().error.code).toBe(c.code);
+    }
+    await app.close();
+  });
+
+  it("fetches a single approval and lists pending per project", async () => {
+    const { app, storage } = await buildStack();
+    const { projectId, runId } = seedPipelineData(storage);
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/approvals",
+      payload: { projectId, runId, kind: "network_egress", title: "Call external API", risk: "low" },
+    });
+    const approvalId = created.json().approval.id as string;
+    expect(created.statusCode).toBe(201);
+
+    const one = await app.inject({ method: "GET", url: `/approvals/${approvalId}` });
+    expect(one.statusCode).toBe(200);
+    expect(one.json().approval.id).toBe(approvalId);
+    expect(one.json().approval.status).toBe("pending");
+
+    const missing = await app.inject({ method: "GET", url: `/approvals/${newApprovalId()}` });
+    expect(missing.statusCode).toBe(404);
+    expect(missing.json().error.code).toBe("approval/not-found");
+
+    const list = await app.inject({ method: "GET", url: `/projects/${projectId}/approvals` });
+    expect(list.statusCode).toBe(200);
+    expect(list.json().approvals.map((a: { id: string }) => a.id)).toContain(approvalId);
+    await app.close();
+  });
+
+  it("resolves an approval and rejects double-resolution", async () => {
+    const { app, storage } = await buildStack();
+    const { projectId, runId } = seedPipelineData(storage);
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/approvals",
+      payload: { projectId, runId, kind: "destructive_git", title: "Force-push", risk: "critical" },
+    });
+    const approvalId = created.json().approval.id as string;
+
+    const resolved = await app.inject({
+      method: "POST",
+      url: `/approvals/${approvalId}/resolve`,
+      payload: { decision: "allow" },
+    });
+    expect(resolved.statusCode).toBe(200);
+    expect(resolved.json().approval.status).toBe("approved");
+    expect(resolved.json().approval.decision).toBe("allow");
+
+    const events = storage.events.listByRun(runId);
+    const ev = events.find((e) => e.type === "approval.resolved");
+    expect(ev && "approvalId" in ev && (ev as { approvalId: string }).approvalId).toBe(approvalId);
+
+    const again = await app.inject({
+      method: "POST",
+      url: `/approvals/${approvalId}/resolve`,
+      payload: { decision: "deny" },
+    });
+    expect(again.statusCode).toBe(409);
+    expect(again.json().error.code).toBe("storage/approval-resolved");
+    await app.close();
+  });
+
+  it("deny marks the approval denied, drops it from pending, unknown resolve 404s", async () => {
+    const { app, storage } = await buildStack();
+    const { projectId, runId } = seedPipelineData(storage);
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/approvals",
+      payload: { projectId, runId, kind: "destructive_git", title: "Force-push", risk: "high" },
+    });
+    const approvalId = created.json().approval.id as string;
+
+    const denied = await app.inject({
+      method: "POST",
+      url: `/approvals/${approvalId}/resolve`,
+      payload: { decision: "deny" },
+    });
+    expect(denied.json().approval.status).toBe("denied");
+
+    const list = await app.inject({ method: "GET", url: `/projects/${projectId}/approvals` });
+    expect(list.json().approvals.map((a: { id: string }) => a.id)).not.toContain(approvalId);
+
+    const unknown = await app.inject({
+      method: "POST",
+      url: `/approvals/${newApprovalId()}/resolve`,
+      payload: { decision: "allow" },
+    });
+    expect(unknown.statusCode).toBe(404);
+    expect(unknown.json().error.code).toBe("storage/not-found");
+    await app.close();
+  });
+
+  it("rejects malformed approval payloads", async () => {
+    const { app } = await buildStack();
+    const bad = await app.inject({
+      method: "POST",
+      url: "/approvals",
+      payload: { projectId: "nope", runId: "nope", title: "t", risk: "urgent" },
+    });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json().error.code).toBe("request/invalid");
+
+    const badList = await app.inject({ method: "GET", url: `/projects/${newProjectId()}/approvals` });
+    expect(badList.statusCode).toBe(404);
+    expect(badList.json().error.code).toBe("workspace/not-found");
     await app.close();
   });
 });

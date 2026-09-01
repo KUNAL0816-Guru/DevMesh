@@ -15,7 +15,12 @@ import {
   type PlanPayload,
   type PlanTask,
 } from "@devmesh/contracts";
-import type { Storage, ExecutionRecord, StageRecord } from "@devmesh/storage";
+import type {
+  Storage,
+  ExecutionRecord,
+  StageRecord,
+  ApprovalRecord,
+} from "@devmesh/storage";
 import type { WorkspaceService, GitService } from "@devmesh/workspace";
 import type { ExecutionService } from "./executions/service.js";
 import { runVerificationCommand } from "./executions/commands.js";
@@ -34,6 +39,7 @@ import {
   buildReviewArtifactFromPayload,
   ARTIFACT_OUTPUT_FORMATS,
 } from "./artifact-builder.js";
+import type { ApprovalGate, ApprovalSpec } from "./approvals.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -213,6 +219,18 @@ export interface OrchestratorOptions {
   respectPlanRoles?: boolean;
   /** Roles to try when a plan task's role is not executable (default ["developer"]). */
   fallbackChain?: AgentRole[];
+  /**
+   * Approval workflow (Phase 9B). When provided together with `gateAction`,
+   * a gated task persists an approval, emits `approval.requested`, and blocks
+   * the task until `approval.resolved` arrives. Default: no gate configured
+   * (existing pipeline behavior is unchanged).
+   */
+  approvalGate?: ApprovalGate | null;
+  /**
+   * Returns an approval spec when the given task is approval-gated, or `null`
+   * to run it normally. Only consulted when `approvalGate` is set.
+   */
+  gateAction?: ((card: TaskCard) => ApprovalSpec | null) | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +263,8 @@ export class Orchestrator {
   private readonly maxConcurrency: number;
   private readonly respectPlanRoles: boolean;
   private readonly fallbackChain: AgentRole[];
+  private readonly approvalGate: ApprovalGate | null;
+  private readonly gateAction: ((card: TaskCard) => ApprovalSpec | null) | null;
   private _userTask = "";
   private _currentPipelineRunId: string | null = null;
   private _cancelled = false;
@@ -268,6 +288,8 @@ export class Orchestrator {
     this.maxConcurrency = opts.maxConcurrency ?? 1;
     this.respectPlanRoles = opts.respectPlanRoles ?? true;
     this.fallbackChain = opts.fallbackChain ?? ["developer"];
+    this.approvalGate = opts.approvalGate ?? null;
+    this.gateAction = opts.gateAction ?? null;
   }
 
   /** Return the runId of the most recently started pipeline, or null. */
@@ -478,6 +500,37 @@ export class Orchestrator {
       }
 
       this.transitionTask(card, "ready");
+      const gateApproval = this.maybeGate(card, projectId, runId);
+      if (gateApproval) {
+        const resolved = await this.finishApprovalGate(gateApproval);
+        if (resolved === "denied") {
+          this.cancelRemainingStages(stageRows);
+          this.transitionTask(card, "blocked");
+          this.emitEvent({
+            ts: new Date().toISOString(),
+            runId,
+            projectId,
+            actor: "system",
+            type: "run.failed",
+            reason: `approval denied for ${role}`,
+          });
+          return this.result("failed", card.id, projectId, "approval denied");
+        }
+        if (resolved === "cancelled") {
+          this.cancelRemainingStages(stageRows);
+          this.emitEvent({
+            ts: new Date().toISOString(),
+            runId,
+            projectId,
+            actor: "system",
+            type: "run.cancelled",
+            reason: "pipeline cancelled while awaiting approval",
+          });
+          return this.result("cancelled", card.id, projectId, "pipeline cancelled");
+        }
+        // approved → blocked → ready, then run normally below.
+        this.transitionTask(card, "ready");
+      }
       const instruction = this.assembleInstruction(card, taskChain, handle.root);
 
       // --- Git checkpoint before developer starts modifying files -----------
@@ -1164,6 +1217,39 @@ export class Orchestrator {
       }
 
       this.transitionTask(card, "ready");
+      // Approval gate (Phase 9B) — resumes re-enter the gate so a blocked task
+      // picks up the decision that was made (or re-requests when pending).
+      const gateApproval = this.maybeGate(card, projectId, runId);
+      if (gateApproval) {
+        const resolved = await this.finishApprovalGate(gateApproval);
+        if (resolved === "denied") {
+          this.cancelRemainingStages(stageRows);
+          this.transitionTask(card, "blocked");
+          this.emitEvent({
+            ts: new Date().toISOString(),
+            runId,
+            projectId,
+            actor: "system",
+            type: "run.failed",
+            reason: `approval denied for ${role}`,
+          });
+          return this.result("failed", card.id, projectId, "approval denied");
+        }
+        if (resolved === "cancelled") {
+          this.cancelRemainingStages(stageRows);
+          this.emitEvent({
+            ts: new Date().toISOString(),
+            runId,
+            projectId,
+            actor: "system",
+            type: "run.cancelled",
+            reason: "pipeline cancelled while awaiting approval",
+          });
+          return this.result("cancelled", card.id, projectId, "pipeline cancelled");
+        }
+        // approved → blocked → ready, then run normally below.
+        this.transitionTask(card, "ready");
+      }
       const instruction = this.assembleInstruction(card, taskChain, handle.root);
 
       let rec: ExecutionRecord;
@@ -2164,6 +2250,55 @@ export class Orchestrator {
       if (dep.status !== "done" && dep.status !== "in_review") return false;
     }
     return true;
+  }
+
+  /**
+   * Approval gate (Phase 9B). If the configured `gateAction` marks the task
+   * as gated, persist an approval and emit `approval.requested` via the gate,
+   * then transition the task to `blocked`. Returns the approval (or `null`
+   * when the task is not gated / no gate configured — existing behavior).
+   * Idempotent: an existing pending approval for this task is reused so a
+   * restarted/resumed pipeline reconstructs state instead of re-requesting.
+   */
+  private maybeGate(
+    card: TaskCard,
+    projectId: ProjectId,
+    runId: string,
+  ): ApprovalRecord | null {
+    if (!this.approvalGate || !this.gateAction) return null;
+    const spec = this.gateAction(card);
+    if (!spec) return null;
+    const approval = this.approvalGate.request({
+      projectId,
+      runId: runId as never,
+      taskId: card.id,
+      spec,
+    });
+    const inflight = this.storage.tasks.get(card.id as TaskId);
+    if (inflight && inflight.status !== "blocked" && inflight.status !== "done") {
+      this.transitionTask(card, "blocked");
+    }
+    return approval;
+  }
+
+  /**
+   * Block until the gated approval leaves `pending`, then return its outcome:
+   * "approved" resumes the task, "denied" fails the pipeline, and "cancelled"
+   * means the run was cancelled before any decision arrived. Polls the durable
+   * `approvals` table via `ApprovalGate.waitAnyResolution` (no in-memory
+   * promise), so a resumed pipeline picks up decisions made earlier instead of
+   * re-requesting them.
+   */
+  private async finishApprovalGate(
+    approval: ApprovalRecord,
+  ): Promise<"approved" | "denied" | "cancelled"> {
+    if (!this.approvalGate) return "cancelled";
+    const resolved = await this.approvalGate.waitAnyResolution(
+      [approval.id],
+      () => this._cancelled,
+    );
+    if (resolved === null) return "cancelled";
+    return resolved.status === "approved" ? "approved" : "denied";
   }
 
   private assembleInstruction(
