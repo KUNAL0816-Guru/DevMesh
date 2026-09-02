@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { z } from "zod";
-import { usdToMicros, type PricingRule } from "@devmesh/contracts";
+import { providerModelRefSchema, usdToMicros, type PricingRule } from "@devmesh/contracts";
 import type { BudgetConfig, BudgetProfile } from "./executions/budget.js";
 
 /**
@@ -68,6 +68,21 @@ export const configSchema = z.strictObject({
     .optional(),
   /** Hard wall-clock budget for a single agent execution. */
   execTimeoutMs: z.number().int().min(1000).max(3_600_000).default(300_000),
+  /**
+   * Which ProviderGateway backend to wire at the composition root (Phase 10).
+   * "none" (default) wires an empty gateway whose completions fail with
+   * provider/not-configured; "openai-compatible" is the ADR Amendment 9
+   * integration direction (interface-only until Phase 12 wires the network).
+   */
+  gateway: z.enum(["none", "openai-compatible"]).default("none"),
+  /** OpenAI-compatible base URL (e.g. https://api.openai.com/v1). */
+  gatewayBaseUrl: z.string().url("expected an http(s) URL").optional(),
+  /** Credentials for the OpenAI-compatible endpoint — env/config only, never source code. */
+  gatewayApiKey: z.string().min(1).optional(),
+  /** Neutral provider/model preference for the gateway path, e.g. "openai/gpt-4o". */
+  gatewayModel: providerModelRefSchema.optional(),
+  /** Wall-clock request budget for a single gateway completion. */
+  gatewayTimeoutMs: z.number().int().min(1000).max(600_000).default(60_000),
   /** Optional per-scope cost/token budgets (Phase 8C). Absent = pre-8C. */
   budget: budgetConfigSchema.optional(),
   /** Optional pricing rules for derived cost (Phase 8C). Absent = cost null. */
@@ -123,7 +138,9 @@ function parseJsonEnv(raw: string | undefined, label: string): unknown {
  *   DEVMESH_HOST, DEVMESH_PORT, DEVMESH_DATA_ROOT, DEVMESH_LOG_LEVEL,
  *   DEVMESH_RUNTIME, DEVMESH_OPENCODE_BIN, DEVMESH_OPENCODE_AUTO_APPROVE,
  *   DEVMESH_EXEC_TIMEOUT_MS, DEVMESH_BUDGET (JSON budget config),
- *   DEVMESH_PRICING (JSON array of pricing rules)
+ *   DEVMESH_PRICING (JSON array of pricing rules),
+ *   DEVMESH_GATEWAY, DEVMESH_GATEWAY_BASE_URL, DEVMESH_GATEWAY_API_KEY,
+ *   DEVMESH_GATEWAY_MODEL, DEVMESH_GATEWAY_TIMEOUT_MS
  * Throws a plain Error with a readable message on invalid values.
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -143,6 +160,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       env.DEVMESH_EXEC_TIMEOUT_MS === undefined
         ? undefined
         : Number(env.DEVMESH_EXEC_TIMEOUT_MS),
+    gateway: env.DEVMESH_GATEWAY || undefined,
+    gatewayBaseUrl: env.DEVMESH_GATEWAY_BASE_URL || undefined,
+    gatewayApiKey: env.DEVMESH_GATEWAY_API_KEY || undefined,
+    gatewayModel: env.DEVMESH_GATEWAY_MODEL || undefined,
+    gatewayTimeoutMs:
+      env.DEVMESH_GATEWAY_TIMEOUT_MS === undefined
+        ? undefined
+        : Number(env.DEVMESH_GATEWAY_TIMEOUT_MS),
     budget: env.DEVMESH_BUDGET ? parseJsonEnv(env.DEVMESH_BUDGET, "DEVMESH_BUDGET") : undefined,
     pricing: env.DEVMESH_PRICING
       ? parseJsonEnv(env.DEVMESH_PRICING, "DEVMESH_PRICING")

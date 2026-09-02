@@ -1,8 +1,13 @@
 import { mkdirSync } from "node:fs";
 import type { FastifyInstance } from "fastify";
+import { parseProviderModelRef } from "@devmesh/contracts";
 import { createStorage, type Storage } from "@devmesh/storage";
 import { WorkspaceService } from "@devmesh/workspace";
-import type { AgentRuntime } from "@devmesh/runtime";
+import type { AgentRuntime, ProviderGateway } from "@devmesh/runtime";
+import {
+  CompositeProviderGateway,
+  OpenAiCompatibleProvider,
+} from "@devmesh/runtime";
 import { databasePath, loadConfig, workspacesRoot, type Config } from "./config.js";
 import { buildApp } from "./app.js";
 import { reconcileInterrupted } from "./executions/service.js";
@@ -24,17 +29,36 @@ async function buildRuntime(config: Config): Promise<AgentRuntime | null> {
   return null;
 }
 
+function buildProviderGateway(config: Config): ProviderGateway {
+  const composite = new CompositeProviderGateway();
+  if (config.gateway === "openai-compatible") {
+    composite.register(
+      new OpenAiCompatibleProvider({
+        providerId: config.gatewayModel ? parseProviderModelRef(config.gatewayModel).provider : undefined,
+        baseUrl: config.gatewayBaseUrl,
+        apiKey: config.gatewayApiKey,
+        timeoutMs: config.gatewayTimeoutMs,
+      }),
+    );
+  }
+  return composite;
+}
+
 export interface RunningServer {
   app: FastifyInstance;
   config: Config;
   storage: Storage;
   address: string;
+  /** ProviderGateway wired for DevMesh's own LLM calls (never null). */
+  gateway: ProviderGateway;
   /** Stop listening and release resources (idempotent). */
   shutdown(): Promise<void>;
 }
 
 export interface StartServerOptions {
   config?: Config;
+  /** ProviderGateway override for the composition root (tests and tools). */
+  gateway?: ProviderGateway;
   /** Install SIGINT/SIGTERM handlers (default true; disable in tests). */
   installSignals?: boolean;
 }
@@ -59,6 +83,7 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Runnin
     workspacesRoot: workspacesRoot(config),
   });
   const runtime = await buildRuntime(config);
+  const gateway = opts.gateway ?? buildProviderGateway(config);
   if (runtime && "health" in runtime && runtime.health) {
     const health = await runtime.health();
     storage.events.append({
@@ -99,5 +124,5 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Runnin
   }
 
   app.log.info({ address: bound }, "devmesh server listening");
-  return { app, config, storage, address: bound, shutdown };
+  return { app, config, storage, address: bound, gateway, shutdown };
 }
