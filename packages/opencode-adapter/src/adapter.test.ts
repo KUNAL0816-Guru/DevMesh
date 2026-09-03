@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { OpencodeAdapter } from "./adapter.js";
+import { OpenAiCompatibleRuntime } from "./local-runtime.js";
 
 let dir: string;
 let stubPath: string;
@@ -222,5 +223,237 @@ describe("OpencodeAdapter (stub binary)", () => {
     // Negative input + non-numeric output fail the integer guard -> whole
     // step ignored, total left undefined (never a fabricated 0).
     expect(result.usage).toBeUndefined();
+  });
+});
+
+describe("OpenAiCompatibleRuntime (local endpoint)", () => {
+  const localRequest = (overrides: Record<string, unknown> = {}) => ({
+    executionId: "55555555-5555-4555-8555-555555555555",
+    projectId: "66666666-6666-4666-8666-666666666666",
+    workspaceRoot: dir,
+    instruction: "write a test",
+    timeoutMs: 10_000,
+    ...overrides,
+  });
+
+  interface Captured {
+    url: string;
+    init: RequestInit;
+  }
+
+  function singleCall(calls: Captured[]): Captured {
+    expect(calls).toHaveLength(1);
+    const call = calls[0];
+    if (call === undefined) throw new Error("expected a captured call");
+    return call;
+  }
+
+  function okJson(body: unknown): Response {
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  it("sends the configured base URL, model, api key, and user message", async () => {
+    const calls: Captured[] = [];
+    const runtime = new OpenAiCompatibleRuntime({
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "llama3.2",
+      apiKey: "secret-token",
+      fetch: (url, init) => {
+        calls.push({ url: String(url), init: init ?? {} });
+        return Promise.resolve(
+          okJson({ choices: [{ message: { content: "ok" } }] }),
+        );
+      },
+    });
+    const result = await runtime.start(localRequest()).result;
+
+    expect(result.status).toBe("completed");
+    const call = singleCall(calls);
+    expect(call.url).toBe("http://127.0.0.1:11434/v1/chat/completions");
+    const headers = call.init.headers as Record<string, string>;
+    expect(headers["Authorization"]).toBe("Bearer secret-token");
+    const body = JSON.parse(String(call.init.body));
+    expect(body.model).toBe("llama3.2");
+    expect(body.messages).toEqual([
+      { role: "user", content: "write a test" },
+    ]);
+  });
+
+  it("does not send an Authorization header when no api key is configured", async () => {
+    const calls: Captured[] = [];
+    const runtime = new OpenAiCompatibleRuntime({
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "llama3.2",
+      fetch: (url, init) => {
+        calls.push({ url: String(url), init: init ?? {} });
+        return Promise.resolve(okJson({ choices: [{ message: { content: "ok" } }] }));
+      },
+    });
+    await runtime.start(localRequest()).result;
+    const headers = singleCall(calls).init.headers as Record<string, string>;
+    expect(headers["Authorization"]).toBeUndefined();
+  });
+
+  it("normalizes a base URL so path segments are not duplicated", async () => {
+    const calls: Captured[] = [];
+    const runtime = new OpenAiCompatibleRuntime({
+      baseUrl: "http://127.0.0.1:11434/v1/",
+      model: "llama3.2",
+      fetch: (url, init) => {
+        calls.push({ url: String(url), init: init ?? {} });
+        return Promise.resolve(okJson({ choices: [{ message: { content: "ok" } }] }));
+      },
+    });
+    await runtime.start(localRequest()).result;
+    expect(singleCall(calls).url).toBe("http://127.0.0.1:11434/v1/chat/completions");
+  });
+
+  it("returns a completed result with text, session id, and usage", async () => {
+    const runtime = new OpenAiCompatibleRuntime({
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "llama3.2",
+      fetch: () =>
+        Promise.resolve(
+          okJson({
+            choices: [{ message: { content: "the answer" } }],
+            usage: { prompt_tokens: 5, completion_tokens: 9 },
+          }),
+        ),
+    });
+    const result = await runtime.start(localRequest()).result;
+
+    expect(result.status).toBe("completed");
+    expect(result.exitCode).toBe(0);
+    expect(result.finalText).toBe("the answer");
+    expect(result.sessionId).toBe(localRequest().executionId);
+    expect(result.stderrTail).toBe("");
+    expect(result.usage).toEqual({ inputTokens: 5, outputTokens: 9 });
+  });
+
+  it("omits usage when the endpoint reports none or invalid usage", async () => {
+    const runtime = new OpenAiCompatibleRuntime({
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "llama3.2",
+      fetch: () =>
+        Promise.resolve(okJson({ choices: [{ message: { content: "hi" } }] })),
+    });
+    const result = await runtime.start(localRequest()).result;
+    expect(result.status).toBe("completed");
+    expect(result.usage).toBeUndefined();
+
+    const badUsage = new OpenAiCompatibleRuntime({
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "llama3.2",
+      fetch: () =>
+        Promise.resolve(
+          okJson({
+            choices: [{ message: { content: "hi" } }],
+            usage: { prompt_tokens: -1, completion_tokens: "many" },
+          }),
+        ),
+    });
+    const bad = await badUsage.start(localRequest()).result;
+    expect(bad.status).toBe("completed");
+    expect(bad.usage).toBeUndefined();
+  });
+
+  it("surfaces health via GET /models as healthy on 2xx", async () => {
+    const calls: string[] = [];
+    const runtime = new OpenAiCompatibleRuntime({
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "llama3.2",
+      fetch: (url) => {
+        calls.push(String(url));
+        return Promise.resolve(new Response("{}", { status: 200 }));
+      },
+    });
+    const health = await runtime.health();
+    expect(health.healthy).toBe(true);
+    expect(calls).toEqual(["http://127.0.0.1:11434/v1/models"]);
+  });
+
+  it("reports unhealthy on non-2xx, connection failure, or timeout", async () => {
+    const unhealthy404 = new OpenAiCompatibleRuntime({
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "llama3.2",
+      fetch: () => Promise.resolve(new Response("{}", { status: 500 })),
+    });
+    expect((await unhealthy404.health()).healthy).toBe(false);
+
+    const connectionFail = new OpenAiCompatibleRuntime({
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "llama3.2",
+      fetch: () => Promise.reject(new Error("ECONNREFUSED")),
+    });
+    expect((await connectionFail.health()).healthy).toBe(false);
+  });
+
+  it("maps HTTP failures to a failed result with a meaningful reason", async () => {
+    const runtime = new OpenAiCompatibleRuntime({
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "llama3.2",
+      fetch: () =>
+        Promise.resolve(new Response("denied", { status: 401, statusText: "Unauthorized" })),
+    });
+    const result = await runtime.start(localRequest()).result;
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toContain("401");
+    expect(result.exitCode).toBe(401);
+  });
+
+  it("maps a malformed successful response to a failed result", async () => {
+    const runtime = new OpenAiCompatibleRuntime({
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "llama3.2",
+      fetch: () =>
+        Promise.resolve(
+          okJson({
+            choices: [{ message: { content: 42 } }],
+          }),
+        ),
+    });
+    const result = await runtime.start(localRequest()).result;
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toBe("malformed completion response");
+  });
+
+  it("rejects with runtime/unavailable on connection failure", async () => {
+    const runtime = new OpenAiCompatibleRuntime({
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "llama3.2",
+      fetch: () => Promise.reject(new Error("ECONNREFUSED")),
+    });
+    await expect(runtime.start(localRequest()).result).rejects.toMatchObject({
+      code: "runtime/unavailable",
+    });
+  });
+
+  it("resolves status timeout when the execution exceeds its budget", async () => {
+    const runtime = new OpenAiCompatibleRuntime({
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "llama3.2",
+      fetch: (_url, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(new Error("aborted")),
+          );
+        }).then(
+          () => new Response("{}", { status: 200 }),
+          (err) => {
+            // mirror the real fetch abort behavior
+            const e = new Error(err?.message ?? "aborted");
+            e.name = "AbortError";
+            throw e;
+          },
+        ),
+    });
+    const result = await runtime
+      .start(localRequest({ timeoutMs: 100 }))
+      .result;
+    expect(result.status).toBe("timeout");
+    expect(result.failureReason).toContain("100ms");
   });
 });

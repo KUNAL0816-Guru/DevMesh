@@ -48,7 +48,7 @@ export const configSchema = z.strictObject({
     .enum(["fatal", "error", "warn", "info", "debug", "trace"])
     .default("info"),
   /** Which agent runtime to wire at the composition root ("none" = disabled). */
-  runtime: z.enum(["none", "opencode"]).default("none"),
+  runtime: z.enum(["none", "opencode", "opencode-local"]).default("none"),
   /** Binary used by the OpenCode adapter (PATH-resolvable or absolute). */
   opencodeBin: z.string().min(1).default("opencode"),
   /**
@@ -66,6 +66,14 @@ export const configSchema = z.strictObject({
     .string()
     .regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, "expected provider/model")
     .optional(),
+  /** OpenAI-compatible local/offline endpoint (e.g. Ollama) — Phase 12. */
+  localBaseUrl: z.string().url("expected an http(s) URL").optional(),
+  /** Plain local model id sent to the local OpenAI-compatible endpoint. */
+  localModel: z.string().min(1).optional(),
+  /** Optional credentials for the local endpoint — env/config only, never source. */
+  localApiKey: z.string().min(1).optional(),
+  /** Wall-clock budget for a single local completion call. */
+  localTimeoutMs: z.number().int().min(1000).max(600_000).default(60_000),
   /** Hard wall-clock budget for a single agent execution. */
   execTimeoutMs: z.number().int().min(1000).max(3_600_000).default(300_000),
   /**
@@ -87,6 +95,23 @@ export const configSchema = z.strictObject({
   budget: budgetConfigSchema.optional(),
   /** Optional pricing rules for derived cost (Phase 8C). Absent = cost null. */
   pricing: z.array(pricingProfileSchema).optional(),
+}).superRefine((val, ctx) => {
+  if (val.runtime === "opencode-local") {
+    if (!val.localBaseUrl) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["localBaseUrl"],
+        message: "localBaseUrl is required when runtime is opencode-local",
+      });
+    }
+    if (!val.localModel) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["localModel"],
+        message: "localModel is required when runtime is opencode-local",
+      });
+    }
+  }
 });
 
 export type Config = z.infer<typeof configSchema>;
@@ -140,7 +165,9 @@ function parseJsonEnv(raw: string | undefined, label: string): unknown {
  *   DEVMESH_EXEC_TIMEOUT_MS, DEVMESH_BUDGET (JSON budget config),
  *   DEVMESH_PRICING (JSON array of pricing rules),
  *   DEVMESH_GATEWAY, DEVMESH_GATEWAY_BASE_URL, DEVMESH_GATEWAY_API_KEY,
- *   DEVMESH_GATEWAY_MODEL, DEVMESH_GATEWAY_TIMEOUT_MS
+ *   DEVMESH_GATEWAY_MODEL, DEVMESH_GATEWAY_TIMEOUT_MS,
+ *   DEVMESH_LOCAL_BASE_URL, DEVMESH_LOCAL_MODEL, DEVMESH_LOCAL_API_KEY,
+ *   DEVMESH_LOCAL_TIMEOUT_MS
  * Throws a plain Error with a readable message on invalid values.
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -156,6 +183,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         ? undefined
         : ["1", "true", "yes"].includes(env.DEVMESH_OPENCODE_AUTO_APPROVE.toLowerCase()),
     opencodeModel: env.DEVMESH_OPENCODE_MODEL || undefined,
+    localBaseUrl: env.DEVMESH_LOCAL_BASE_URL || undefined,
+    localModel: env.DEVMESH_LOCAL_MODEL || undefined,
+    localApiKey: env.DEVMESH_LOCAL_API_KEY || undefined,
+    localTimeoutMs:
+      env.DEVMESH_LOCAL_TIMEOUT_MS === undefined
+        ? undefined
+        : Number(env.DEVMESH_LOCAL_TIMEOUT_MS),
     execTimeoutMs:
       env.DEVMESH_EXEC_TIMEOUT_MS === undefined
         ? undefined

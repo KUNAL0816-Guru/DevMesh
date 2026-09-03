@@ -101,3 +101,82 @@ describe("buildProviderGateway (via startServer)", () => {
     }
   });
 });
+
+describe("runtime selection (buildRuntime)", () => {
+  function healthEvents(server: Awaited<ReturnType<typeof startServer>>) {
+    return [...server.storage.events.listAfter(0, 1000)].filter(
+      (e) => e.type === "runtime.health.changed",
+    );
+  }
+
+  it("runtime=opencode-local selects the local runtime and tags health with its name", async () => {
+    // Port 1 is closed on virtually every host -> the local health probe fails
+    // fast, but the health.changed event is still recorded with runtime.name.
+    const config = testConfig({
+      DEVMESH_RUNTIME: "opencode-local",
+      DEVMESH_LOCAL_BASE_URL: "http://127.0.0.1:1/v1",
+      DEVMESH_LOCAL_MODEL: "llama3.2",
+      DEVMESH_LOCAL_TIMEOUT_MS: "1000",
+    });
+    const server = await startServer({ config, installSignals: false });
+    try {
+      const events = healthEvents(server);
+      expect(events.length).toBeGreaterThanOrEqual(1);
+      const last = events[events.length - 1]!;
+      expect(last.runtimeId).toBe("opencode-local");
+    } finally {
+      await server.shutdown();
+    }
+  });
+
+  it("default runtime remains none (no runtime wired)", async () => {
+    const server = await startServer({ config: testConfig(), installSignals: false });
+    try {
+      // No runtime wired => no runtime.health.changed event is emitted.
+      expect(healthEvents(server)).toHaveLength(0);
+    } finally {
+      await server.shutdown();
+    }
+  });
+
+  it("runtime=opencode remains the existing OpenCode path", async () => {
+    // Attempting to select the OpenCode runtime still emits a health event
+    // tagged with the runtime name ("opencode"), independent of whether the
+    // binary is actually installed (health resolves unhealthy but is still
+    // recorded with runtime.name).
+    const config = testConfig({ DEVMESH_RUNTIME: "opencode" });
+    const server = await startServer({ config, installSignals: false });
+    try {
+      const events = healthEvents(server);
+      expect(events.length).toBeGreaterThanOrEqual(1);
+      const last = events[events.length - 1]!;
+      expect(last.runtimeId).toBe("opencode");
+    } finally {
+      await server.shutdown();
+    }
+  });
+
+  it("rejects invalid runtime=opencode-local config missing localModel", () => {
+    expect(() =>
+      testConfig({
+        DEVMESH_RUNTIME: "opencode-local",
+        DEVMESH_LOCAL_BASE_URL: "http://127.0.0.1:11434/v1",
+      }),
+    ).toThrow(/localModel is required/);
+  });
+
+  it("rejects invalid runtime=opencode-local config missing localBaseUrl", () => {
+    expect(() =>
+      testConfig({
+        DEVMESH_RUNTIME: "opencode-local",
+        DEVMESH_LOCAL_MODEL: "llama3.2",
+      }),
+    ).toThrow(/localBaseUrl is required/);
+  });
+
+  it("invalid runtime value is rejected", () => {
+    expect(() => testConfig({ DEVMESH_RUNTIME: "bogus" })).toThrow(
+      /invalid DevMesh configuration/,
+    );
+  });
+});

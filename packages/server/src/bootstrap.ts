@@ -26,6 +26,15 @@ async function buildRuntime(config: Config): Promise<AgentRuntime | null> {
       model: config.opencodeModel,
     });
   }
+  if (config.runtime === "opencode-local") {
+    const { OpenAiCompatibleRuntime } = await import("@devmesh/opencode-adapter");
+    return new OpenAiCompatibleRuntime({
+      baseUrl: config.localBaseUrl ?? "",
+      model: config.localModel ?? "",
+      apiKey: config.localApiKey,
+      timeoutMs: config.localTimeoutMs,
+    });
+  }
   return null;
 }
 
@@ -90,7 +99,7 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Runnin
       ts: new Date().toISOString(),
       actor: "system",
       type: "runtime.health.changed",
-      runtimeId: "opencode",
+      runtimeId: runtime.name,
       healthy: health.healthy,
       version: health.version,
     });

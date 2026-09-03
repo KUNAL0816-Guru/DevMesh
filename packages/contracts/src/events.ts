@@ -135,7 +135,7 @@ export const domainEventSchema = z.discriminatedUnion("type", [
   z.object({
     ...eventBase,
     type: z.literal("runtime.health.changed"),
-    runtimeId: z.literal("opencode"),
+    runtimeId: z.string(),
     healthy: z.boolean(),
     version: z.string().max(40).optional(),
   }),
