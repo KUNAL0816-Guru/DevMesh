@@ -108,16 +108,28 @@ describe("AgentRegistry", () => {
   });
 });
 
-describe("built-in definitions (Phase 4B)", () => {
-  it("defines all four roles and all are executable", () => {
+describe("built-in definitions", () => {
+  const ALL_IDS = [
+    "architect",
+    "debugger",
+    "developer",
+    "devops",
+    "documenter",
+    "planner",
+    "reviewer",
+    "tester",
+  ];
+
+  it("defines all eight roles and all are executable", () => {
     const reg = createDefaultAgentRegistry();
     const ids = reg.list().map((d) => d.id);
-    expect(ids).toEqual(["architect", "developer", "reviewer", "tester"]);
+    expect(ids).toEqual(ALL_IDS);
 
-    for (const id of ["architect", "developer", "tester", "reviewer"]) {
+    for (const id of ALL_IDS) {
       const def = reg.requireExecutable(id);
       expect(def.runtime).toBe("opencode");
       expect(def.systemInstructions.length).toBeGreaterThan(50);
+      expect(def.executable).toBe(true);
     }
   });
 
@@ -136,5 +148,64 @@ describe("built-in definitions (Phase 4B)", () => {
     expect(tester.allowedOperations).toContain("write_files");
     const reviewer = reg.require("reviewer");
     expect(reviewer.allowedOperations).not.toContain("write_files");
+  });
+
+  it("applies the approved least-privilege matrix to the new roles", () => {
+    const reg = createDefaultAgentRegistry();
+    const has = (id: string, op: string) =>
+      reg.require(id).allowedOperations.includes(op as never);
+
+    // planner: read only.
+    const planner = reg.require("planner");
+    expect(planner.allowedOperations).toEqual(["read_files"]);
+    expect(planner.permissions.autoApprove).toBe(false);
+
+    // debugger: read + diagnostics + git history, no writes.
+    const debuggerDef = reg.require("debugger");
+    expect(debuggerDef.allowedOperations).toEqual([
+      "read_files",
+      "run_commands",
+      "git_operations",
+    ]);
+    expect(debuggerDef.permissions.autoApprove).toBe(false);
+
+    // documenter: read + write docs, no commands/git.
+    const documenter = reg.require("documenter");
+    expect(documenter.allowedOperations).toEqual(["read_files", "write_files"]);
+    expect(documenter.permissions.autoApprove).toBe(false);
+
+    // devops: read + write + run + git.
+    const devops = reg.require("devops");
+    expect(new Set(devops.allowedOperations)).toEqual(
+      new Set(["read_files", "write_files", "run_commands", "git_operations"]),
+    );
+    expect(devops.permissions.autoApprove).toBe(false);
+
+    // None of the new roles gets write-only operations beyond the matrix.
+    for (const id of ["planner", "debugger", "documenter", "devops"]) {
+      expect(has(id, "git_operations")).toBe(
+        id === "debugger" || id === "devops",
+      );
+      expect(has(id, "run_commands")).toBe(
+        id === "debugger" || id === "devops",
+      );
+      expect(has(id, "write_files")).toBe(
+        id === "documenter" || id === "devops",
+      );
+      expect(has(id, "read_files")).toBe(true);
+    }
+  });
+
+  it("every new role is executable and has a non-empty prompt", () => {
+    const reg = createDefaultAgentRegistry();
+    for (const id of ["planner", "debugger", "documenter", "devops"]) {
+      const def = reg.requireExecutable(id);
+      expect(def.id).toBe(id);
+      expect(def.role).toBe(id);
+      expect(def.executable).toBe(true);
+      expect(def.runtime).toBe("opencode");
+      expect(def.systemInstructions.trim().length).toBeGreaterThan(0);
+      expect(def.maxAttempts).toBe(2); // non-developer default
+    }
   });
 });

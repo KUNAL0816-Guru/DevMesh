@@ -64,10 +64,18 @@ describe("taskCardSchema / makeTaskCard", () => {
     expect(card.id).toBeTruthy();
   });
 
-  it("rejects empty acceptance criteria and bad roles", () => {
+  it("rejects empty acceptance criteria and unknown roles", () => {
     expect(
       taskCardSchema.safeParse({ ...base(), acceptanceCriteria: [] }).success,
     ).toBe(false);
-    expect(taskCardSchema.safeParse({ ...base(), role: "planner" }).success).toBe(false);
+    expect(taskCardSchema.safeParse({ ...base(), role: "urgent-fix" }).success).toBe(false);
+  });
+
+  it("accepts the new planned roles on a task card", () => {
+    for (const role of ["planner", "debugger", "documenter", "devops"] as const) {
+      const card = makeTaskCard({ ...base(), role });
+      expect(taskCardSchema.safeParse(card).success).toBe(true);
+      expect(card.role).toBe(role);
+    }
   });
 });

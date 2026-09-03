@@ -13,7 +13,7 @@ import { createStorage, type ApprovalRecord, type Storage } from "@devmesh/stora
 import { assertPipelineConsistency } from "@devmesh/storage";
 import { WorkspaceService } from "@devmesh/workspace";
 import { FakeRuntime, type FakeScriptFactory } from "@devmesh/runtime";
-import { createDefaultAgentRegistry } from "@devmesh/agents";
+import { AgentRegistry, createDefaultAgentRegistry } from "@devmesh/agents";
 import { Orchestrator, type PipelineResult } from "./orchestrator.js";
 import { ApprovalGate } from "./approvals.js";
 import { ExecutionService } from "./executions/service.js";
@@ -3524,6 +3524,212 @@ describe("Orchestrator: Phase 7F — dynamic DAG execution", () => {
     expect(existsSync(join(handle.root, "app.js"))).toBe(false);
 
     await stack.storage.close();
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase 11 — additional agent roles (planner, debugger, documenter, devops)
+  // -------------------------------------------------------------------------
+
+  it("executes DAG plan tasks assigned new roles and preserves them", async () => {
+    const stack = makeStack(
+      planScript(
+        [
+          planTask("t1", { role: "planner" }),
+          planTask("t2", { role: "documenter" }),
+        ],
+        () => ({}),
+      ),
+    );
+    stack.orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      respectPlanRoles: true,
+    });
+
+    const result = await stack.orchestrator.run(stack.projectId, "new role tasks");
+    expect(result.status).toBe("completed");
+
+    const runId = findLatestRunId(stack.storage)!;
+    const planTasks = planTasksOf(stack, runId);
+    const roles = planTasks.map((t) => t.role).sort();
+    expect(roles).toEqual(["documenter", "planner"]);
+
+    await stack.storage.close();
+  });
+
+  it("preserves a valid new role under respectPlanRoles=true (no silent fallback)", async () => {
+    const usedRoles = new Set<string>();
+    const stack = makeStack((req) => {
+      const agentMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = agentMatch?.[1]?.toLowerCase() ?? "unknown";
+      usedRoles.add(role);
+      if (role === "architect") {
+        return {
+          steps: [{ events: [{ kind: "text", text: "plan" }] }],
+          outcome: {
+            status: "completed",
+            finalText: "plan",
+            structured: dagPlan([
+              { ...planTask("t1", { role: "planner" }) },
+              { ...planTask("t2", { role: "devops" }) },
+            ]),
+          },
+          stepDelayMs: 5,
+        };
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} ok` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+    stack.orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      respectPlanRoles: true,
+      fallbackChain: ["developer"],
+    });
+
+    const result = await stack.orchestrator.run(stack.projectId, "preserve new roles");
+    expect(result.status).toBe("completed");
+
+    // The new roles themselves executed — they were NOT replaced by developer.
+    expect(usedRoles.has("planner")).toBe(true);
+    expect(usedRoles.has("devops")).toBe(true);
+    expect(usedRoles.has("developer")).toBe(false);
+
+    await stack.storage.close();
+  });
+
+  it("respectPlanRoles=false routes a new-role task to developer", async () => {
+    const stack = makeStack(
+      planScript(
+        [
+          planTask("t1", { role: "devops" }),
+          planTask("t2", { role: "devops", dependsOn: ["t1"] }),
+        ],
+        () => ({}),
+      ),
+    );
+    stack.orchestrator = new Orchestrator({
+      storage: stack.storage,
+      workspaces: stack.ws,
+      executionService: stack.es,
+      respectPlanRoles: false,
+      fallbackChain: ["developer"],
+    });
+
+    const result = await stack.orchestrator.run(stack.projectId, "force developer new role");
+    expect(result.status).toBe("completed");
+
+    const runId = findLatestRunId(stack.storage)!;
+    const planTasks = planTasksOf(stack, runId);
+    expect(planTasks).toHaveLength(2);
+    for (const task of planTasks) expect(task.role).toBe("developer");
+
+    await stack.storage.close();
+  });
+
+  it("falls back to developer when a valid role is not executable", async () => {
+    const storage = createStorage({ path: join(dataRoot, `fallback-${crypto.randomUUID()}.db`) });
+    const workspaces = new WorkspaceService({
+      store: storage.projects,
+      workspacesRoot: join(dataRoot, "fallback-ws"),
+    });
+    const handle = workspaces.create("fallback");
+    const agents = new AgentRegistry();
+    agents.register({
+      id: "architect",
+      role: "architect",
+      displayName: "Architect",
+      systemInstructions: "You are the Architect agent of DevMesh.".repeat(5),
+      permissions: { autoApprove: false },
+      allowedOperations: ["read_files"],
+      runtime: "opencode",
+      timeoutMs: 30_000,
+      maxAttempts: 2,
+      executable: true,
+    });
+    agents.register({
+      id: "developer",
+      role: "developer",
+      displayName: "Developer",
+      systemInstructions: "You are the Developer agent of DevMesh.".repeat(5),
+      permissions: { autoApprove: false },
+      allowedOperations: ["read_files", "write_files", "run_commands", "git_operations"],
+      runtime: "opencode",
+      timeoutMs: 30_000,
+      maxAttempts: 2,
+      executable: true,
+    });
+    // debugger is a VALID contract role but registered non-executable here.
+    agents.register({
+      id: "debugger",
+      role: "debugger",
+      displayName: "Debugger",
+      systemInstructions: "You are the Debugger agent of DevMesh.".repeat(5),
+      permissions: { autoApprove: false },
+      allowedOperations: ["read_files"],
+      runtime: "none",
+      timeoutMs: 30_000,
+      maxAttempts: 2,
+      executable: false,
+    });
+    const runtime = new FakeRuntime((req) => {
+      const agentMatch = req.instruction.match(/You are the (\w+) agent/i);
+      const role = agentMatch?.[1]?.toLowerCase() ?? "unknown";
+      if (role === "architect") {
+        return {
+          steps: [{ events: [{ kind: "text", text: "plan" }] }],
+          outcome: {
+            status: "completed",
+            finalText: "plan",
+            structured: dagPlan([
+              { ...planTask("t1", { role: "debugger" }) },
+              { ...planTask("t2", { role: "developer", dependsOn: ["t1"] }) },
+            ]),
+          },
+          stepDelayMs: 5,
+        };
+      }
+      return {
+        steps: [{ events: [{ kind: "text", text: `${role} ok` }] }],
+        outcome: { status: "completed", finalText: `${role} ok` },
+        stepDelayMs: 5,
+      };
+    });
+    const executionService = new ExecutionService({
+      storage,
+      workspaces,
+      git: {
+        init: () => {},
+        status: () => ({ branch: "HEAD", entries: [] }),
+      } as never,
+      runtime,
+      agents,
+    });
+    const orchestrator = new Orchestrator({
+      storage,
+      workspaces,
+      executionService,
+      respectPlanRoles: true,
+      fallbackChain: ["developer"],
+    });
+
+    const result = await orchestrator.run(handle.projectId, "fallback new role");
+    expect(result.status).toBe("completed");
+
+    const runId = findLatestRunId(storage)!;
+    const planTasks = storage.tasks
+      .listByRun(runId as never)
+      .filter((t) => t.detail.includes("# Task\nYou are the"));
+    expect(planTasks).toHaveLength(2);
+    // debugger was not executable → fell back through fallbackChain to developer.
+    for (const task of planTasks) expect(task.role).toBe("developer");
+
+    await storage.close();
   });
 });
 

@@ -50,7 +50,7 @@ describe("context entries (blackboard)", () => {
         namespace: "spec",
         key: "k",
         value: null,
-        createdBy: "devops",
+        createdBy: "urgent-fix",
         createdAt: new Date().toISOString(),
       }),
     ).toThrow();

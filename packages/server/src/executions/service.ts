@@ -3,6 +3,8 @@ import {
   newRunId,
   taskCardSchema,
   tokenUsageSchema,
+  type AgentRole,
+  type ArtifactProducer,
   type PricingRule,
   type ProjectId,
   type TaskId,
@@ -177,6 +179,17 @@ export class ExecutionService {
 
   get configured(): boolean {
     return this.opts.runtime !== null;
+  }
+
+  /**
+   * Whether an agent (by id/role) is registered and executable. Non-throwing
+   * gate used by the orchestrator to decide whether a plan role may run;
+   * `requireExecutable` (via `start`) remains the final execution authority.
+   */
+  isAgentExecutable(agentId: string): boolean {
+    const def = this.opts.agents.get(agentId);
+    if (!def) return false;
+    return def.executable && def.runtime !== "none";
   }
 
   async start(input: StartExecutionInput): Promise<ExecutionRecord> {
@@ -439,7 +452,7 @@ export class ExecutionService {
             root: workspaceRoot,
             observed,
             ctx: { runId: rec.runId, projectId: rec.projectId, taskId: rec.taskId ?? undefined },
-            producedBy: rec.role as "architect" | "developer" | "tester" | "reviewer",
+            producedBy: rec.role as ArtifactProducer,
             extraChecks,
           });
           for (const artifact of [built.changeSet, built.verification]) {
@@ -518,7 +531,7 @@ export class ExecutionService {
         projectId: rec.projectId,
         actor: "system",
         type: "agent.reply.completed",
-        role: rec.role as "architect" | "developer" | "tester" | "reviewer",
+        role: rec.role as AgentRole,
         sessionId: result.sessionId ?? rec.id,
         durationMs: result.durationMs,
         stoppedReason: STOPPED_REASON[result.status] ?? "error",

@@ -76,7 +76,19 @@ const planOutputSchema: Record<string, unknown> = {
         additionalProperties: false,
         properties: {
           refKey: { type: "string" },
-          role: { type: "string", enum: ["architect", "developer", "tester", "reviewer"] },
+          role: {
+            type: "string",
+            enum: [
+              "architect",
+              "developer",
+              "tester",
+              "reviewer",
+              "planner",
+              "debugger",
+              "documenter",
+              "devops",
+            ],
+          },
           title: { type: "string" },
           detail: { type: "string" },
           acceptanceCriteria: { type: "array", items: { type: "string" } },

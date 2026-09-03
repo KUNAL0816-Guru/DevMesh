@@ -29,6 +29,12 @@ describe("agentManifestSchema", () => {
 
   it("rejects empty capability lists and unknown roles", () => {
     expect(agentManifestSchema.safeParse({ ...valid, capabilities: [] }).success).toBe(false);
-    expect(agentManifestSchema.safeParse({ ...valid, role: "devops" }).success).toBe(false);
+    expect(agentManifestSchema.safeParse({ ...valid, role: "release-engineer" }).success).toBe(false);
+  });
+
+  it("accepts the new planned roles on a manifest", () => {
+    for (const role of ["planner", "debugger", "documenter", "devops"] as const) {
+      expect(agentManifestSchema.safeParse({ ...valid, role }).success).toBe(true);
+    }
   });
 });

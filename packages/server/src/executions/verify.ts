@@ -7,6 +7,7 @@ import {
   newArtifactId,
   type Artifact,
   type ArtifactId,
+  type ArtifactProducer,
   type FileEvidence,
 } from "@devmesh/contracts";
 import type { GitStatus } from "@devmesh/workspace";
@@ -85,7 +86,7 @@ export function buildVerificationArtifacts(input: {
   root: string;
   observed: ObservedChangeSet;
   ctx: { runId: string; projectId: string; taskId?: string };
-  producedBy: "architect" | "developer" | "tester" | "reviewer" | "system";
+  producedBy: ArtifactProducer;
   extraChecks?: Array<Record<string, unknown>>;
 }): VerificationOutcome {
   const { root, observed, ctx } = input;

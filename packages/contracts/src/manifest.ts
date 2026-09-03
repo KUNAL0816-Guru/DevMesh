@@ -36,7 +36,7 @@ export const agentManifestSchema = z.strictObject({
 });
 export type AgentManifest = z.infer<typeof agentManifestSchema>;
 
-/** Sensible baseline profiles for the four initial roles. */
+/** Sensible baseline profiles for all roles. */
 export function baselineProfile(role: AgentRole): PermissionProfile {
   switch (role) {
     case "architect":
@@ -50,5 +50,14 @@ export function baselineProfile(role: AgentRole): PermissionProfile {
       return makeDenyByDefaultProfile({ bash: "allow" });
     case "reviewer":
       return {};
+    case "planner":
+      // Deny-by-default already allows `read`; planner is read-only.
+      return {};
+    case "debugger":
+      return makeDenyByDefaultProfile({ bash: "allow" });
+    case "documenter":
+      return makeDenyByDefaultProfile({ edit: "allow" });
+    case "devops":
+      return makeDenyByDefaultProfile({ edit: "allow", bash: "allow" });
   }
 }

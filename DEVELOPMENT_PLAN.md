@@ -1,9 +1,9 @@
 # DevMesh Development Plan
 
 > Status: active
-> Last updated: 2026-09-01 (post Phase 9B — Phases 0–9 complete; Phases 10–14 planned)
+> Last updated: 2026-09-03 (post Phase 11 — Phases 0–11 complete; Phases 12–14 planned)
 > Reference: docs/adr/0001-approved-architecture.md
-> Test baseline: 530 passed, 5 skipped, 0 failed
+> Test baseline: 590 passed, 5 skipped, 0 failed (Phase 11; historical Phase 10 baseline was 574 passed, 5 skipped, 0 failed)
 
 ---
 
@@ -1161,38 +1161,59 @@ choice is provider-independent.
 
 **Estimated new tests: ~8**
 
-### Phase 11: Additional Agent Roles (Future, Not Yet Started)
+### Phase 11: Additional Agent Roles — COMPLETE
 
-**Goal:** Promote the `PLANNED_AGENT_ROLES` (`planner`, `debugger`,
-`documenter`, `devops`) from intent-only to valid on the wire, enabling richer
-plan/spec graphs.
+**Status:** complete.
+
+**Goal achieved:** `planner`, `debugger`, `documenter`, and `devops` are now valid,
+executable roles that can be assigned to DAG plan tasks and executed through the
+existing `AgentRegistry → ExecutionService → AgentRuntime` flow, while preserving the
+original 4-role pipeline (`architect → developer → tester → reviewer`).
 
 #### Implementation
 
-1. `packages/contracts`: extend `agentRoleSchema` to include the new roles — a
-   deliberate breaking contract change; revisit every downstream switch.
-2. `packages/agents`: add built-in agent manifests with prompts and permissions
-   for `planner`, `debugger`, `documenter`, `devops`.
-3. `packages/server` orchestrator: allow plan tasks (Phase 7F DAG) to assign
-   these roles; update the fallback chain config and permission checks.
+1. `packages/contracts`: added the canonical `ALL_AGENT_ROLES` (all 8 roles) as the
+   source of truth for `agentRoleSchema`/`AgentRole`. `actorRoleSchema`,
+   `artifactProducerSchema`, and `taskCardSchema` widen automatically through the
+   existing schema relationships. `baselineProfile(role)` now handles all 8 roles
+   with the approved least-privilege permission design.
+2. `packages/agents`: added executable built-in manifests for `planner`, `debugger`,
+   `documenter`, and `devops` (`runtime: opencode`, `autoApprove: false`,
+   `maxAttempts: 2`, non-empty system instructions). The existing
+   architect/developer/tester/reviewer manifests are unchanged.
+3. `packages/server` orchestrator: `resolvePlanRole` is now registry-driven through a
+   new `ExecutionService.isAgentExecutable(role)` helper, replacing the hardcoded
+   4-role executable set. Valid registered new roles are preserved and executed (no
+   silent replacement with developer); genuinely unavailable/unexecutable roles still
+   fall back through the `fallbackChain`. `respectPlanRoles=false` still routes to
+   developer. `planOutputSchema` now accepts all 8 agent roles.
+
+Key properties:
+
+- DAG plan tasks can preserve and execute the new roles.
+- Backward compatible with the original 4-role pipeline.
+- Least-privilege permissions for the new roles.
+- No changes to the ProviderGateway / Phase 10 boundary.
+- Approval and budget gates remain role-agnostic.
 
 #### Acceptance Criteria
 
-- [ ] New roles are valid `agentRoleSchema` values
-- [ ] Each role has a manifest (prompt + permissions)
-- [ ] Plan tasks can be assigned new roles and execute
-- [ ] `respectPlanRoles` respects new roles
-- [ ] Existing 4-role pipelines still work (backward compatibility)
+- [x] New roles are valid `agentRoleSchema` values
+- [x] Each role has a manifest (prompt + permissions)
+- [x] Plan tasks can be assigned new roles and execute
+- [x] `respectPlanRoles` respects new roles
+- [x] Existing 4-role pipelines still work (backward compatibility)
 
-#### Required Tests
+#### Tests
 
-| File | Tests |
+| Scope | Result |
 |---|---|
-| `contracts/roles.test.ts` | Schema accepts new roles, rejects unknown |
-| `agents/agents.test.ts` | Registry returns new manifests |
-| `server/orchestrator.test.ts` | DAG executes a plan task with a new role |
-
-**Estimated new tests: ~8**
+| Contracts | 120 passed |
+| Agents | 10 passed |
+| Server | 286 passed |
+| Full suite | 590 passed, 5 skipped, 0 failed |
+| Typecheck | clean |
+| Lint | clean |
 
 ### Phase 12: Golden-Hammer / Local-Model Adapter (Future, Not Yet Started)
 
@@ -1302,13 +1323,13 @@ plugin and MCP server.
 |---|---|---|---|---|
 | 8C | Cost pricing + budget enforcement | Consequence | ~10 | ✅ Complete (47 tests) |
 | 9 | Approval flow | Events catalog | ~10 | ✅ Complete (12 new Phase 9B tests; 9A storage covered) |
-| 10 | Model/provider gateway | Amendment 6 | ~8 | Not started |
-| 11 | Additional agent roles | Amendment 3 | ~8 | Not started |
+| 10 | Model/provider gateway | Amendment 6 | ~8 | ✅ Complete |
+| 11 | Additional agent roles | Amendment 3 | ~8 | ✅ Complete |
 | 12 | Local/offline model adapter | Amendment 9 | ~5 | Not started |
 | 13 | Frontend/UI | Amendment 7 | ~2 | Not started |
 | 14 | Security hardening, permissions, MCP & plugin packaging | ADR/README | ~12 | Not started |
 
-> Phases 10–14 are **planned only** — none are implemented. Detailed goals,
+> Phases 12–14 are **planned only** — none are implemented. Detailed goals,
 > acceptance criteria, and required tests for each appear above.
 >
 > **Roadmap note (Phase 9B boundary):** the approval gate currently guards the
@@ -1354,7 +1375,7 @@ plugin and MCP server.
 
 > Counts above reflect the `it(`/`test(` occurrences per file and are
 > approximate (vitest's numeric total includes dynamically-defined subtests);
-> the authoritative number comes from `npm test` (530 passed, 5 skipped, 0 failed).
+> the authoritative number comes from `npm test` (590 passed, 5 skipped, 0 failed).
 
 ### Known Test Gaps — all resolved
 

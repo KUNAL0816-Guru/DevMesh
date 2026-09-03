@@ -2076,20 +2076,16 @@ export class Orchestrator {
 
   /**
    * Resolve the agent role for a plan task, honoring `respectPlanRoles` and
-   * the `fallbackChain`. Non-executable/unknown roles fall back to developer.
+   * the `fallbackChain`. When `respectPlanRoles` is enabled, a plan role that
+   * is registered and executable is preserved as-is; only genuinely
+   * unavailable/unexecutable roles fall back to the `fallbackChain`.
    */
   private resolvePlanRole(pt: PlanTask): AgentRole {
     if (!this.respectPlanRoles) return "developer" as AgentRole;
-    const EXECUTABLE: ReadonlySet<string> = new Set([
-      "architect",
-      "developer",
-      "tester",
-      "reviewer",
-    ]);
     const candidate = pt.role as AgentRole;
-    if (EXECUTABLE.has(candidate)) return candidate;
+    if (this.executionService.isAgentExecutable(candidate)) return candidate;
     for (const fallback of this.fallbackChain) {
-      if (EXECUTABLE.has(fallback)) return fallback;
+      if (this.executionService.isAgentExecutable(fallback)) return fallback;
     }
     return "developer" as AgentRole;
   }
