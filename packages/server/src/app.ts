@@ -1,4 +1,8 @@
 import Fastify, { type FastifyInstance } from "fastify";
+import fastifyStatic from "@fastify/static";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import {
   approvalIdSchema,
   artifactKindSchema,
@@ -83,6 +87,9 @@ export interface BuildAppOptions {
   runtime?: AgentRuntime | null;
   /** Agent definitions; defaults are provided when omitted (tests). */
   agents?: AgentRegistry;
+  /** Override for the client dist directory (tests). Resolved to
+   *  packages/client/dist when omitted. */
+  staticRoot?: string;
 }
 
 /** Construct the DevMesh control-plane HTTP application (not yet listening). */
@@ -165,7 +172,24 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
     });
   });
 
-  app.setNotFoundHandler((_req, reply) => {
+  // -- static frontend (SPA fallback) ---------------------------------------
+  const serverDir = dirname(fileURLToPath(import.meta.url));
+  const defaultStaticRoot = opts.staticRoot ?? join(serverDir, "..", "..", "client", "dist");
+
+  if (existsSync(defaultStaticRoot)) {
+    app.register(fastifyStatic, {
+      root: defaultStaticRoot,
+      prefix: "/",
+      wildcard: true,
+    });
+  }
+
+  app.setNotFoundHandler((req, reply) => {
+    const isApi = req.url.startsWith("/api") || req.url.startsWith("/health");
+    if (!isApi && existsSync(defaultStaticRoot)) {
+      void reply.sendFile("index.html");
+      return;
+    }
     void reply.status(404).send({
       error: { code: "request/not-found", message: "no such route" },
     });

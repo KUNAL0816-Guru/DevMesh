@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -233,10 +233,10 @@ describe("HTTP API", () => {
     const malformed = await app.inject({ method: "GET", url: "/projects/not-a-uuid" });
     expect(malformed.statusCode).toBe(404);
 
-    // unknown route
+    // unknown route → SPA fallback serves index.html
     const noRoute = await app.inject({ method: "GET", url: "/nope" });
-    expect(noRoute.statusCode).toBe(404);
-    expect(noRoute.json().error.code).toBe("request/not-found");
+    expect(noRoute.statusCode).toBe(200);
+    expect(noRoute.headers["content-type"]).toContain("text/html");
     await app.close();
   });
 
@@ -1481,6 +1481,95 @@ describe("GET /pipelines/:runId/usage", () => {
     expect(body.usage.unknownExecutionCount).toBe(0);
     expect(body.usage.totals.inputTokens).toBe(0);
     expect(body.usage.totals.outputTokens).toBe(0);
+    await app.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 13C: Static frontend serving
+// ---------------------------------------------------------------------------
+
+describe("static frontend serving (Phase 13C)", () => {
+  let fixtureDir: string;
+
+  beforeEach(() => {
+    fixtureDir = mkdtempSync(join(tmpdir(), "devmesh-static-"));
+    mkdirSync(join(fixtureDir, "assets"), { recursive: true });
+    writeFileSync(
+      join(fixtureDir, "index.html"),
+      "<!DOCTYPE html><html><head><title>DevMesh</title></head><body><div id=\"root\"></div></body></html>",
+    );
+    writeFileSync(join(fixtureDir, "assets", "app.js"), "console.log('hello');");
+  });
+
+  afterEach(() => {
+    rmSync(fixtureDir, { recursive: true, force: true });
+  });
+
+  it("GET / returns the frontend index.html", async () => {
+    const config = testConfig();
+    const storage = createStorage({ path: join(config.dataRoot, "test.db") });
+    const workspaces = new WorkspaceService({
+      store: storage.projects,
+      workspacesRoot: join(config.dataRoot, "workspaces"),
+    });
+    const app = buildApp({ config, storage, workspaces, staticRoot: fixtureDir });
+
+    const res = await app.inject({ method: "GET", url: "/" });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-type"]).toContain("text/html");
+    expect(res.body).toContain("DevMesh");
+    expect(res.body).toContain('id="root"');
+    await app.close();
+  });
+
+  it("static assets under /assets/ are served successfully", async () => {
+    const config = testConfig();
+    const storage = createStorage({ path: join(config.dataRoot, "test.db") });
+    const workspaces = new WorkspaceService({
+      store: storage.projects,
+      workspacesRoot: join(config.dataRoot, "workspaces"),
+    });
+    const app = buildApp({ config, storage, workspaces, staticRoot: fixtureDir });
+
+    const res = await app.inject({ method: "GET", url: "/assets/app.js" });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain("console.log");
+    await app.close();
+  });
+
+  it("API routes are still handled by the API (not the SPA fallback)", async () => {
+    const config = testConfig();
+    const storage = createStorage({ path: join(config.dataRoot, "test.db") });
+    const workspaces = new WorkspaceService({
+      store: storage.projects,
+      workspacesRoot: join(config.dataRoot, "workspaces"),
+    });
+    const app = buildApp({ config, storage, workspaces, staticRoot: fixtureDir });
+
+    const health = await app.inject({ method: "GET", url: "/health" });
+    expect(health.statusCode).toBe(200);
+    expect(health.json().ok).toBe(true);
+
+    const missing = await app.inject({ method: "GET", url: "/health/nonexistent" });
+    expect(missing.statusCode).toBe(404);
+    expect(missing.json().error.code).toBe("request/not-found");
+    await app.close();
+  });
+
+  it("SPA fallback serves index.html for unknown frontend routes", async () => {
+    const config = testConfig();
+    const storage = createStorage({ path: join(config.dataRoot, "test.db") });
+    const workspaces = new WorkspaceService({
+      store: storage.projects,
+      workspacesRoot: join(config.dataRoot, "workspaces"),
+    });
+    const app = buildApp({ config, storage, workspaces, staticRoot: fixtureDir });
+
+    const res = await app.inject({ method: "GET", url: "/some-frontend-route" });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-type"]).toContain("text/html");
+    expect(res.body).toContain("DevMesh");
     await app.close();
   });
 });

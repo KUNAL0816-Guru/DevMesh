@@ -12,7 +12,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build --if-present -w @devmesh/contracts && npm run build --if-present -w @devmesh/agents && npm run build --if-present -w @devmesh/storage && npm run build --if-present -w @devmesh/workspace && npm run build --if-present -w @devmesh/runtime && npm run build --if-present -w @devmesh/opencode-adapter && npm run build --if-present -w @devmesh/server",
+    "build": "npm run build --if-present -w @devmesh/contracts && npm run build --if-present -w @devmesh/agents && npm run build --if-present -w @devmesh/storage && npm run build --if-present -w @devmesh/workspace && npm run build --if-present -w @devmesh/runtime && npm run build --if-present -w @devmesh/opencode-adapter && npm run build --if-present -w @devmesh/server && npm run build --if-present -w @devmesh/client",
     "typecheck": "npm run build && npm run typecheck --workspaces --if-present",
     "lint": "eslint .",
     "test": "bash scripts/run-tests.sh",
