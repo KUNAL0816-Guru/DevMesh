@@ -10,6 +10,7 @@ import {
 } from "@devmesh/contracts";
 import { ApprovalGate } from "./approvals.js";
 import type { Storage } from "@devmesh/storage";
+import { summarizeRunUsage } from "@devmesh/storage";
 import type { WorkspaceService, ProjectRecord } from "@devmesh/workspace";
 import type { AgentRuntime } from "@devmesh/runtime";
 import type { AgentRegistry } from "@devmesh/agents";
@@ -767,6 +768,35 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
     }
     const allExecs = opts.storage.executions.listByProject(rec.projectId);
     return { executions: allExecs.filter((e) => e.runId === parsedId.data) };
+  });
+
+  // GET /pipelines/:runId/usage
+  app.get("/pipelines/:runId/usage", async (req, reply) => {
+    const params = z.strictObject({ runId: z.string() }).safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid run id" },
+      });
+    }
+    const parsedId = runIdSchema.safeParse(params.data.runId);
+    if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    const rec = opts.storage.pipelineRuns.get(parsedId.data);
+    if (!rec) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    const summary = summarizeRunUsage(opts.storage.db, parsedId.data);
+    if (!summary) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    return { usage: summary };
   });
 
   // GET /projects/:projectId/tasks

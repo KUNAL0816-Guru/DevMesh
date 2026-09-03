@@ -13,7 +13,7 @@ import {
   newTaskId,
 } from "@devmesh/contracts";
 import type { Storage } from "@devmesh/storage";
-import { createStorage } from "@devmesh/storage";
+import { createStorage, summarizeRunUsage } from "@devmesh/storage";
 import { WorkspaceService } from "@devmesh/workspace";
 import { FakeRuntime } from "@devmesh/runtime";
 import { createDefaultAgentRegistry } from "@devmesh/agents";
@@ -1420,6 +1420,67 @@ describe("approvals API (Phase 9B)", () => {
     const badList = await app.inject({ method: "GET", url: `/projects/${newProjectId()}/approvals` });
     expect(badList.statusCode).toBe(404);
     expect(badList.json().error.code).toBe("workspace/not-found");
+    await app.close();
+  });
+});
+
+describe("GET /pipelines/:runId/usage", () => {
+  it("returns usage summary for an existing pipeline run", async () => {
+    const { app, storage } = await buildStack();
+    const { runId } = seedPipelineData(storage);
+    const res = await app.inject({ method: "GET", url: `/pipelines/${runId}/usage` });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      usage: {
+        runId: string;
+        executionCount: number;
+        unknownExecutionCount: number;
+        totals: Record<string, unknown>;
+      };
+    };
+    expect(body.usage.runId).toBe(runId);
+    expect(body.usage.executionCount).toBeGreaterThanOrEqual(1);
+
+    const expected = summarizeRunUsage(storage.db, runId)!;
+    expect(body.usage.executionCount).toBe(expected.executionCount);
+    expect(body.usage.unknownExecutionCount).toBe(expected.unknownExecutionCount);
+    expect(body.usage.totals).toEqual(expected.totals);
+    await app.close();
+  });
+
+  it("returns 404 for a nonexistent pipeline run", async () => {
+    const { app, storage } = await buildStack();
+    seedPipelineData(storage);
+    const missingRun = newRunId();
+    const res = await app.inject({ method: "GET", url: `/pipelines/${missingRun}/usage` });
+    expect(res.statusCode).toBe(404);
+    expect((res.json() as { error: { code: string } }).error.code).toBe("pipeline/not-found");
+    await app.close();
+  });
+
+  it("returns usage with zero totals for a run with no executions", async () => {
+    const { app, storage } = await buildStack();
+    const projectId = newProjectId();
+    const runId = newRunId();
+    const now = "2026-08-01T10:00:00.000Z";
+    storage.projects.insert({ id: projectId, name: "empty-run", rootPath: "/tmp/empty", createdAt: now });
+    storage.pipelineRuns.insert({
+      id: runId,
+      projectId,
+      status: "completed",
+      goal: "nothing",
+      errorMessage: null,
+      createdAt: now,
+      finishedAt: now,
+      durationMs: 0,
+    });
+    const res = await app.inject({ method: "GET", url: `/pipelines/${runId}/usage` });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { usage: { executionCount: number; unknownExecutionCount: number; totals: { inputTokens: number; outputTokens: number } } };
+    expect(body.usage.executionCount).toBe(0);
+    expect(body.usage.unknownExecutionCount).toBe(0);
+    expect(body.usage.totals.inputTokens).toBe(0);
+    expect(body.usage.totals.outputTokens).toBe(0);
     await app.close();
   });
 });
