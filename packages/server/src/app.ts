@@ -185,7 +185,14 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
   }
 
   app.setNotFoundHandler((req, reply) => {
-    const isApi = req.url.startsWith("/api") || req.url.startsWith("/health");
+    const p = req.url.split("?")[0] ?? "";
+    const isApi =
+      p.startsWith("/health") ||
+      p.startsWith("/projects") ||
+      p.startsWith("/pipelines") ||
+      p.startsWith("/executions") ||
+      p.startsWith("/approvals") ||
+      p.startsWith("/api");
     if (!isApi && existsSync(defaultStaticRoot)) {
       void reply.sendFile("index.html");
       return;

@@ -14,6 +14,9 @@
   --color-muted: #8b949e;
   --color-accent: #58a6ff;
   --color-error: #f85149;
+  --color-success: #3fb950;
+  --color-warning: #d29922;
+  --color-pending: #8b949e;
   font-family: system-ui, -apple-system, sans-serif;
   color: var(--color-text);
   background: var(--color-bg);
@@ -22,6 +25,11 @@
 
 body {
   min-height: 100vh;
+}
+
+.mono {
+  font-family: ui-monospace, "Cascadia Code", "Fira Code", monospace;
+  font-size: 0.85em;
 }
 
 .app {
@@ -38,6 +46,15 @@ body {
   font-size: 1.75rem;
 }
 
+.header-link {
+  color: var(--color-text);
+  text-decoration: none;
+}
+
+.header-link:hover {
+  color: var(--color-accent);
+}
+
 .subtitle {
   color: var(--color-muted);
   font-size: 0.875rem;
@@ -47,20 +64,21 @@ body {
   margin-bottom: 3rem;
 }
 
-.section h2 {
+.main h2 {
   font-size: 1.125rem;
   margin-bottom: 0.75rem;
 }
 
-.card {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 0.75rem 1rem;
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  background: var(--color-surface);
+.main h3 {
+  font-size: 1rem;
+  margin-top: 1.5rem;
   margin-bottom: 0.5rem;
+  color: var(--color-muted);
+}
+
+.section h2 {
+  font-size: 1.125rem;
+  margin-bottom: 0.75rem;
 }
 
 .muted {
@@ -74,4 +92,370 @@ body {
 .footer {
   border-top: 1px solid var(--color-border);
   padding-top: 1rem;
+}
+
+/* Cards */
+
+.card {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-surface);
+  margin-bottom: 0.5rem;
+}
+
+.card--clickable {
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.card--clickable:hover {
+  border-color: var(--color-accent);
+}
+
+.card--clickable:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+.card-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.card-title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.25rem;
+}
+
+.card-meta {
+  display: flex;
+  gap: 0.75rem;
+  font-size: 0.8rem;
+  flex-wrap: wrap;
+}
+
+/* Status badges */
+
+.status-badge {
+  display: inline-block;
+  padding: 0.1em 0.5em;
+  border-radius: 3px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.status-badge--running {
+  background: #1f3a5f;
+  color: var(--color-accent);
+}
+
+.status-badge--completed {
+  background: #1a3a2a;
+  color: var(--color-success);
+}
+
+.status-badge--failed {
+  background: #3d1a1a;
+  color: var(--color-error);
+}
+
+.status-badge--cancelled {
+  background: #2d2315;
+  color: var(--color-warning);
+}
+
+.status-badge--timeout {
+  background: #3d1a1a;
+  color: var(--color-error);
+}
+
+.status-badge--done {
+  background: #1a3a2a;
+  color: var(--color-success);
+}
+
+.status-badge--pending {
+  background: #21262d;
+  color: var(--color-muted);
+}
+
+.status-badge--ready {
+  background: #1f3a5f;
+  color: var(--color-accent);
+}
+
+.status-badge--in_review {
+  background: #3d2e0a;
+  color: #e3b341;
+}
+
+.status-badge--revising {
+  background: #3d2e0a;
+  color: var(--color-warning);
+}
+
+.status-badge--blocked {
+  background: #2d2315;
+  color: var(--color-warning);
+}
+
+/* Pipeline detail */
+
+.btn-back {
+  background: none;
+  border: 1px solid var(--color-border);
+  color: var(--color-accent);
+  padding: 0.35rem 0.75rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  margin-bottom: 1rem;
+}
+
+.btn-back:hover {
+  background: var(--color-surface);
+}
+
+.run-summary {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.run-summary-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+
+@media (max-width: 600px) {
+  .run-summary-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.run-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.run-label {
+  font-size: 0.7rem;
+  color: var(--color-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.run-value {
+  font-size: 0.9rem;
+}
+
+/* Task list */
+
+.task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.task-card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+}
+
+.task-card-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.25rem;
+}
+
+.task-role {
+  color: var(--color-accent);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.task-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-card-meta {
+  display: flex;
+  gap: 0.75rem;
+  font-size: 0.75rem;
+  margin-bottom: 0.25rem;
+}
+
+.task-detail {
+  font-size: 0.85rem;
+  color: var(--color-muted);
+  margin-top: 0.25rem;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Task graph (DAG) */
+
+.task-graph {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 1rem;
+  overflow-x: auto;
+}
+
+.task-graph-level {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.task-graph-connector {
+  color: var(--color-muted);
+  font-size: 1.2rem;
+  line-height: 1;
+  padding: 0.15rem 0;
+}
+
+.task-graph-nodes {
+  display: flex;
+  gap: 0.75rem;
+  justify-content: center;
+  flex-wrap: wrap;
+  width: 100%;
+}
+
+.task-graph-node {
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+  min-width: 140px;
+  max-width: 220px;
+  flex: 1 1 140px;
+  background: var(--color-bg);
+}
+
+.task-graph-node--done {
+  border-color: #2ea04377;
+}
+
+.task-graph-node--running {
+  border-color: #58a6ff77;
+}
+
+.task-graph-node--failed {
+  border-color: #f8514977;
+}
+
+.task-graph-node--cancelled {
+  border-color: #d2992277;
+}
+
+.task-graph-node-header {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.task-graph-node-title {
+  font-size: 0.8rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-graph-node-meta {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.2rem;
+}
+
+.task-graph-node-role {
+  font-size: 0.7rem;
+  color: var(--color-accent);
+  text-transform: uppercase;
+}
+
+/* Status dots */
+
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.status-dot--done {
+  background: var(--color-success);
+}
+
+.status-dot--running {
+  background: var(--color-accent);
+}
+
+.status-dot--failed {
+  background: var(--color-error);
+}
+
+.status-dot--cancelled {
+  background: var(--color-warning);
+}
+
+.status-dot--pending {
+  background: var(--color-muted);
+}
+
+.status-dot--ready {
+  background: var(--color-accent);
+  opacity: 0.6;
+}
+
+.status-dot--in_review {
+  background: #e3b341;
+}
+
+.status-dot--revising {
+  background: var(--color-warning);
+}
+
+.status-dot--blocked {
+  background: var(--color-warning);
+  opacity: 0.6;
+}
+
+/* Dep lines between levels */
+
+.task-graph-deps {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  font-size: 0.7rem;
+  padding: 0.25rem 0;
+}
+
+.task-graph-dep-line {
+  font-style: italic;
 }
