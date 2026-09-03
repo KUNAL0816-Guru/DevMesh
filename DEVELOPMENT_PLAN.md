@@ -1,9 +1,9 @@
 # DevMesh Development Plan
 
 > Status: active
-> Last updated: 2026-09-03 (post Phase 11 — Phases 0–11 complete; Phases 12–14 planned)
+> Last updated: 2026-09-03 (post Phase 12 — Phases 0–12 complete; Phases 13–14 planned)
 > Reference: docs/adr/0001-approved-architecture.md
-> Test baseline: 590 passed, 5 skipped, 0 failed (Phase 11; historical Phase 10 baseline was 574 passed, 5 skipped, 0 failed)
+> Test baseline: 607 passed, 5 skipped, 0 failed (Phase 12; historical: Phase 11 was 590 passed, Phase 10 was 574 passed)
 
 ---
 
@@ -1126,7 +1126,7 @@ releases) pause the pipeline until a human approves or denies.
 coverage from 9A retained. Gate applies to the linear chain and the resume
 loop; plan-task (DAG) gating is not yet wired (see Roadmap note).**
 
-### Phase 10: Model/Provider Gateway (Future, Not Yet Started)
+### Phase 10: Model/Provider Gateway — COMPLETE
 
 **Goal:** Honor ADR Amendment 6 — route DevMesh's own LLM calls and neutral
 `provider/model-id` preferences through a `ProviderGateway` port so model
@@ -1134,32 +1134,36 @@ choice is provider-independent.
 
 #### Implementation
 
-1. `packages/runtime` (or new `packages/provider`): `ProviderGateway` port with
+1. `packages/runtime` (`provider.ts`): `ProviderGateway` port with
    `complete({ provider, model, messages, maxTokens })`; keep the existing
-   `AgentRuntime` adapter for coding agents separate.
-2. `packages/contracts`: `ProviderRequest`/`ProviderResult` schemas.
-3. A neutral model preference string (`provider/model-id`) is validated by the
-   gateway; unknown providers fail with a typed error rather than a fallback.
-4. `packages/server` bootstrap wires a default gateway (OpenAI-compatible
-   shape per ADR Amendment 9) and exposes config to select it.
+   `AgentRuntime` adapter for coding agents separate. `CompositeProviderGateway`
+   routes by `provider` prefix. `FakeProviderGateway` for tests.
+2. `packages/contracts` (`provider.ts`): `ProviderRequest`/`ProviderResult`
+   schemas with neutral `provider/model-id` validation.
+3. Neutral model preference string validated by the gateway; unknown providers
+   fail with `ProviderError` (typed error).
+4. `packages/server` `bootstrap.ts` (`buildProviderGateway`) wires a default
+   gateway; config schema accepts `gateway: "none" | "openai-compatible"`.
+5. `OpenAiCompatibleProvider` in `opencode-adapter` provides the live HTTP
+   adapter (interface-complete in Phase 10; live transport in Phase 12).
 
 #### Acceptance Criteria
 
-- [ ] `ProviderGateway` port is defined against contracts
-- [ ] Neutral `provider/model-id` strings are validated
-- [ ] Unknown provider model fails with a typed error
-- [ ] Coding-agent runtime stays behind `AgentRuntime` (unchanged)
-- [ ] Default gateway is configurable at bootstrap
+- [x] `ProviderGateway` port is defined against contracts
+- [x] Neutral `provider/model-id` strings are validated
+- [x] Unknown provider model fails with a typed error
+- [x] Coding-agent runtime stays behind `AgentRuntime` (unchanged)
+- [x] Default gateway is configurable at bootstrap
 
 #### Required Tests
 
 | File | Tests |
 |---|---|
-| `contracts/provider.test.ts` (new) | Request/result schemas |
-| `runtime/provider.test.ts` (new) | Gateway port contract + fake |
+| `contracts/provider.test.ts` | Request/result schemas, neutral ref parsing |
+| `runtime/provider.test.ts` | Gateway port contract + CompositeProviderGateway + FakeProviderGateway |
 | `server/bootstrap.test.ts` | Gateway wiring + config selection |
 
-**Estimated new tests: ~8**
+**Implemented tests: 8**
 
 ### Phase 11: Additional Agent Roles — COMPLETE
 
@@ -1215,38 +1219,62 @@ Key properties:
 | Typecheck | clean |
 | Lint | clean |
 
-### Phase 12: Golden-Hammer / Local-Model Adapter (Future, Not Yet Started)
+### Phase 12: Local/OpenAI-Compatible Runtime — COMPLETE
 
 **Goal:** Satisfy ADR Amendment 9 — support an OpenAI-compatible local/offline
 model (e.g. Ollama) behind the `AgentRuntime` port without changing core.
 
 #### Implementation
 
-1. `packages/opencode-adapter`: add a runtime variant/switching hook so an
-   OpenAI-compatible local endpoint (e.g. Ollama) can back agent execution.
-2. Keep the adapter shape provider-independent (Amendment 6) so core unchanged.
-3. Add an `opencode`-independent fake/local runtime for tests and offline dev.
+1. `packages/opencode-adapter` (`local-runtime.ts`): `OpenAiCompatibleRuntime`
+   — a full `AgentRuntime` implementation that sends
+   `POST {baseUrl}/chat/completions` to a local endpoint (e.g. Ollama).
+   Runtime name: `opencode-local`.
+2. Local model configuration: `DEVMESH_LOCAL_BASE_URL` (required),
+   `DEVMESH_LOCAL_MODEL` (required), `DEVMESH_LOCAL_API_KEY` (optional),
+   `DEVMESH_LOCAL_TIMEOUT_MS` (optional).
+3. Local health probe: `GET {baseUrl}/models` — reports runtime health via
+   `runtime.health.changed` event on bootstrap.
+4. Failure/timeout semantics match the existing OpenCode adapter: provider
+   failures mapped to `provider_failure`, connection failures mapped to
+   `process_failure`, timeout abort via `AbortController`.
+5. `packages/server` `bootstrap.ts` (`buildRuntime`): selects
+   `opencode-local` → `OpenAiCompatibleRuntime` when `DEVMESH_RUNTIME` is set.
+   Config schema at `config.ts` validates `localBaseUrl`/`localModel`
+   as required when runtime is `opencode-local`.
+6. Core/orchestrator unchanged — runtime swapped at the `AgentRuntime` port.
 
 #### Acceptance Criteria
 
-- [ ] A local OpenAI-compatible endpoint can back an agent session
-- [ ] Core/orchestrator is unchanged (runtime swapped at the port)
-- [ ] Health probe reports the local runtime
-- [ ] Failure/timeout semantics match the existing adapter
+- [x] A local OpenAI-compatible endpoint can back an agent session
+- [x] Core/orchestrator is unchanged (runtime swapped at the port)
+- [x] Health probe reports the local runtime
+- [x] Failure/timeout semantics match the existing adapter
 
 #### Required Tests
 
 | File | Tests |
 |---|---|
-| `opencode-adapter/adapter.test.ts` | Local-endpoint variant config, health, failure handling |
-| `server/bootstrap.test.ts` | Selecting the local runtime |
+| `opencode-adapter/adapter.test.ts` | OpenAiCompatibleRuntime: request payload, auth header, base-URL normalization, usage parsing, health probe, failure mapping, timeout, connection failure |
+| `server/bootstrap.test.ts` | `runtime=opencode-local` selection + health event tagging, config validation |
 
-**Estimated new tests: ~5**
+**Implemented tests: 17 (all passing)**
+
+**Test baseline after Phase 12 (actual):** 607 passed, 5 skipped, 0 failed.
+Typecheck clean. Lint clean.
 
 ### Phase 13: Frontend/UI (Future, Not Yet Started)
 
 **Goal:** ADR Amendment 7 explicitly defers a frontend; when pursued it should
 surface pipeline runs, live SSE events (Phase 6C), artifacts, and usage.
+
+#### Prerequisite Note
+
+The existing backend exposes pipeline, task, SSE, artifact, and approval APIs.
+Usage summaries already exist in storage (`summarizeRunUsage`,
+`summarizeTaskUsage` in `repos.ts`) but require a minimal
+`GET /pipelines/:runId/usage` REST endpoint before the usage acceptance
+criterion can be satisfied. This is the only backend gap.
 
 #### Implementation
 
@@ -1325,17 +1353,22 @@ plugin and MCP server.
 | 9 | Approval flow | Events catalog | ~10 | ✅ Complete (12 new Phase 9B tests; 9A storage covered) |
 | 10 | Model/provider gateway | Amendment 6 | ~8 | ✅ Complete |
 | 11 | Additional agent roles | Amendment 3 | ~8 | ✅ Complete |
-| 12 | Local/offline model adapter | Amendment 9 | ~5 | Not started |
+| 12 | Local/offline model adapter | Amendment 9 | ~5 | ✅ Complete (17 tests) |
 | 13 | Frontend/UI | Amendment 7 | ~2 | Not started |
 | 14 | Security hardening, permissions, MCP & plugin packaging | ADR/README | ~12 | Not started |
 
-> Phases 12–14 are **planned only** — none are implemented. Detailed goals,
+> Phases 13–14 are **planned only** — none are implemented. Detailed goals,
 > acceptance criteria, and required tests for each appear above.
 >
 > **Roadmap note (Phase 9B boundary):** the approval gate currently guards the
 > linear chain (initial run + resume). Multi-task plan (DAG) tasks — Phase 7F —
 > are not yet gateable; wiring the gate into the DAG scheduler is the natural
 > next increment. All other Phase 9 acceptance criteria are met.
+>
+> **Phase 13 prerequisite:** usage summaries exist in storage
+> (`summarizeRunUsage`/`summarizeTaskUsage`) but require a minimal
+> `GET /pipelines/:runId/usage` REST endpoint before the usage acceptance
+> criterion can be satisfied.
 
 ---
 
@@ -1375,7 +1408,7 @@ plugin and MCP server.
 
 > Counts above reflect the `it(`/`test(` occurrences per file and are
 > approximate (vitest's numeric total includes dynamically-defined subtests);
-> the authoritative number comes from `npm test` (590 passed, 5 skipped, 0 failed).
+> the authoritative number comes from `npm test` (607 passed, 5 skipped, 0 failed).
 
 ### Known Test Gaps — all resolved
 
