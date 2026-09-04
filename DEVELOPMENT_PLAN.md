@@ -1,7 +1,7 @@
 # DevMesh Development Plan
 
 > Status: active
-> Last updated: 2026-09-03 (post Phase 12 — Phases 0–12 complete; Phases 13–14 planned)
+> Last updated: 2026-09-04 (post Phase 13F — Phases 0–12 complete; Phases 13A–13F complete; Phase 13G next; Phase 14 planned)
 > Reference: docs/adr/0001-approved-architecture.md
 > Test baseline: 607 passed, 5 skipped, 0 failed (Phase 12; historical: Phase 11 was 590 passed, Phase 10 was 574 passed)
 
@@ -41,6 +41,10 @@ agent runtime is OpenCode behind a swappable adapter port.
   `approval.requested`/`approval.resolved` via the durable `approvals` table; the
   orchestrator blocks a gated task as `blocked` until a human approves (resume) or
   denies (fail), and re-enters the gate on resume so blocked state survives a restart
+- Frontend pipeline dashboard (Phases 13B–13F): React SPA served from Fastify
+  with pipeline list/detail views, live SSE event stream, task DAG graph,
+  artifact listing with bounded payload preview, and per-run usage summary with
+  per-task breakdown. Approval UI is not yet implemented (Phase 13G).
 
 ---
 
@@ -1263,39 +1267,126 @@ model (e.g. Ollama) behind the `AgentRuntime` port without changing core.
 **Test baseline after Phase 12 (actual):** 607 passed, 5 skipped, 0 failed.
 Typecheck clean. Lint clean.
 
-### Phase 13: Frontend/UI (Future, Not Yet Started)
+### Phase 13: Frontend/UI — Phases 13A–13F COMPLETE; 13G NOT STARTED
 
 **Goal:** ADR Amendment 7 explicitly defers a frontend; when pursued it should
 surface pipeline runs, live SSE events (Phase 6C), artifacts, and usage.
 
-#### Prerequisite Note
+Phase 13 is delivered as sub-phases. Phases 13A–13F are complete; Phase 13G
+(approval UI) is the remaining sub-phase.
 
-The existing backend exposes pipeline, task, SSE, artifact, and approval APIs.
-Usage summaries already exist in storage (`summarizeRunUsage`,
-`summarizeTaskUsage` in `repos.ts`) but require a minimal
-`GET /pipelines/:runId/usage` REST endpoint before the usage acceptance
-criterion can be satisfied. This is the only backend gap.
+#### Phase 13A: Usage API — COMPLETE (commit `69e5d69`)
 
-#### Implementation
+**Goal:** Expose usage summaries via REST so the frontend can display
+per-run and per-task usage/cost data.
 
-1. Serve a static UI from the Fastify server (or a separate client package)
-   consuming the existing REST + SSE APIs — no new backend surface required.
-2. Views: pipeline list/detail, live event stream, artifact viewer, task DAG,
-   usage/cost rollups (Phase 8B), approval queue (Phase 9).
-
-#### Acceptance Criteria
-
-- [ ] Read-only views over existing APIs, no backend changes (or minimal)
-- [ ] Live SSE pipeline event stream rendered in-browser
-- [ ] Usage rollups displayed from run/task summaries
-
-#### Required Tests
-
-| File | Tests |
+| Deliverable | Status |
 |---|---|
-| `server/app.test.ts` | Static route served; API contracts unchanged |
+| `GET /pipelines/:runId/usage` — run-level usage summary via `summarizeRunUsage` | done |
+| `GET /pipelines/:runId/usage/tasks/:taskId` — per-task usage via `summarizeTaskUsage` | done |
+| Project ownership enforcement, 404 for missing pipeline/task | done |
+| ~8 usage endpoint tests in `app.test.ts` | done |
 
-**Estimated new tests: ~2** (mostly manual/visual)
+#### Phase 13B: Frontend Foundation — COMPLETE (commit `9ad83da`)
+
+**Goal:** Scaffold the React client package with routing, API client, and type
+definitions.
+
+| Deliverable | Status |
+|---|---|
+| `packages/client` — Vite + React + TypeScript SPA scaffold | done |
+| `api/client.ts` — typed HTTP client wrapping all existing REST endpoints | done |
+| `api/types.ts` — TypeScript types matching backend Zod schemas | done |
+| Hash-based routing (`useHashRoute` hook) | done |
+| `App.tsx` — root layout with pipeline list/detail routing | done |
+
+#### Phase 13C: Static Serving — COMPLETE (commit `ea8c4ba`)
+
+**Goal:** Serve the built client SPA from the Fastify server.
+
+| Deliverable | Status |
+|---|---|
+| `GET /*` serves static files from `packages/client/dist` via `@fastify/static` | done |
+| SPA fallback: unknown paths return `index.html` for client-side routing | done |
+| Static-serving tests in `app.test.ts` (route served, 404 for missing assets) | done |
+
+#### Phase 13D: Pipeline Dashboard — COMPLETE (commit `2699220`)
+
+**Goal:** Render pipeline list and detail views with task graph visualization.
+
+| Deliverable | Status |
+|---|---|
+| `PipelineList` — lists project pipelines with status badges | done |
+| `PipelineDetail` — shows a single pipeline run with task table and metadata | done |
+| `TaskGraph` — DAG visualization of plan tasks with dependency edges | done |
+| `TaskList` — tabular task listing with role, status, and attempt info | done |
+| `useHashRoute` — client-side hash routing between list and detail views | done |
+| Minor backend route for serving the SPA | done |
+
+#### Phase 13E: Live SSE — COMPLETE (commit `f0cf8f6`)
+
+**Goal:** Render the live pipeline event stream in the browser using the
+existing SSE endpoint (Phase 6C).
+
+| Deliverable | Status |
+|---|---|
+| `usePipelineStream` hook — connects to `GET /pipelines/:runId/events/stream`, parses SSE events, manages reconnection | done |
+| `PipelineActivity` component — renders live events as a scrolling activity feed | done |
+| `PipelineDetail` integration — activity feed embedded in detail view | done |
+| `refreshToken` pattern — SSE events bump a counter to trigger data refreshes in sibling components | done |
+| `usePipelineStream.test.ts` — hook unit tests (SSE parsing, event handling, reconnection) | done |
+
+#### Phase 13F: Artifact + Usage UI — COMPLETE (commit `7ec9dcd`)
+
+**Goal:** Display pipeline artifacts with bounded preview and show per-run
+usage summaries with per-task breakdown.
+
+| Deliverable | Status |
+|---|---|
+| `ArtifactSection` — lists artifacts for a run, allows selection, shows detail view | done |
+| `previewArtifactPayload()` — bounded (12K char) JSON serialization with truncation indicator | done |
+| `UsageSection` — displays run-level usage summary (tokens, cost) with per-task breakdown table | done |
+| `format.ts` — pure formatting helpers (`formatTokenCount`, `formatCostUsdMicros`, `isKnown`, `totalTokens`) | done |
+| `format.test.ts` — unit tests for all formatting helpers | done |
+| SSE refresh integration — artifact and usage sections re-fetch on SSE `refreshToken` bump | done |
+| No new backend endpoint introduced by 13F | — |
+| No frontend pricing/accounting logic (display-only) | — |
+
+#### Phase 13G: Approval UI — NOT STARTED / NEXT
+
+**Goal:** Wire the existing approval REST endpoints (Phase 9) into the
+frontend so users can view pending approvals and approve/deny from the
+browser.
+
+| Deliverable | Status |
+|---|---|
+| Approval queue view | not started |
+| Approve/deny actions from the UI | not started |
+
+#### Phase 13 Acceptance Criteria
+
+- [x] Read-only views over existing APIs; minimal backend additions only (13A)
+- [x] Live SSE pipeline event stream rendered in-browser (13E)
+- [x] Usage rollups displayed from run/task summaries (13F)
+- [x] Artifact listing with bounded payload preview (13F)
+- [ ] Approval queue rendered in-browser (13G — not started)
+
+#### Phase 13 Sub-Phase Summary
+
+| Sub-phase | Focus | Status | Commit |
+|---|---|---|---|
+| 13A | Usage API endpoint | ✅ Complete | `69e5d69` |
+| 13B | Frontend client foundation | ✅ Complete | `9ad83da` |
+| 13C | Static serving from Fastify | ✅ Complete | `ea8c4ba` |
+| 13D | Pipeline dashboard (list/detail/DAG) | ✅ Complete | `2699220` |
+| 13E | Live SSE event stream | ✅ Complete | `f0cf8f6` |
+| 13F | Artifact + Usage UI | ✅ Complete | `7ec9dcd` |
+| 13G | Approval UI | ⬜ Not started | — |
+
+**Test baseline note:** The Phase 13 frontend tests (`format.test.ts`,
+`usePipelineStream.test.ts`) run in a separate Vitest config and are not
+included in the backend test baseline (607 passed). Backend tests added in
+13A and 13C are included in that baseline.
 
 ### Phase 14: Security Hardening — AuthN/Z, Permissions, MCP & Plugin Packaging (Future, Not Yet Started)
 
@@ -1354,25 +1445,24 @@ plugin and MCP server.
 | 10 | Model/provider gateway | Amendment 6 | ~8 | ✅ Complete |
 | 11 | Additional agent roles | Amendment 3 | ~8 | ✅ Complete |
 | 12 | Local/offline model adapter | Amendment 9 | ~5 | ✅ Complete (17 tests) |
-| 13 | Frontend/UI | Amendment 7 | ~2 | Not started |
+| 13 | Frontend/UI | Amendment 7 | ~2 | 13A–13F ✅ Complete; 13G ⬜ Next |
 | 14 | Security hardening, permissions, MCP & plugin packaging | ADR/README | ~12 | Not started |
 
-> Phases 13–14 are **planned only** — none are implemented. Detailed goals,
-> acceptance criteria, and required tests for each appear above.
+> Phases 13–14 are tracked in the roadmap. Phase 13A–13F are implemented;
+> Phase 13G (approval UI) is next. Detailed goals, acceptance criteria, and
+> required tests for each appear above.
 >
 > **Roadmap note (Phase 9B boundary):** the approval gate currently guards the
 > linear chain (initial run + resume). Multi-task plan (DAG) tasks — Phase 7F —
 > are not yet gateable; wiring the gate into the DAG scheduler is the natural
 > next increment. All other Phase 9 acceptance criteria are met.
 >
-> **Phase 13 prerequisite:** usage summaries exist in storage
-> (`summarizeRunUsage`/`summarizeTaskUsage`) but require a minimal
-> `GET /pipelines/:runId/usage` REST endpoint before the usage acceptance
-> criterion can be satisfied.
+> **Phase 13 prerequisite:** the `GET /pipelines/:runId/usage` endpoint
+> (`summarizeRunUsage`/`summarizeTaskUsage`) was added in Phase 13A.
 
 ---
 
-## Appendix: Test File Inventory (post Phase 9B)
+## Appendix: Test File Inventory (post Phase 13F)
 
 | File | Tests | Area |
 |---|---|---|
@@ -1393,7 +1483,7 @@ plugin and MCP server.
 | `workspace/src/locks.test.ts` | 6 | MutexMap |
 | `workspace/src/paths.test.ts` | 5 | Path safety |
 | `workspace/src/service.test.ts` | 13 | Workspace service |
-| `server/src/app.test.ts` | 59 | HTTP API (incl. context/resume/approval endpoints) |
+| `server/src/app.test.ts` | 59 | HTTP API (incl. context/resume/approval/usage endpoints, static serving) |
 | `server/src/orchestrator.test.ts` | 110 | Orchestrator (DAG, replay, structured, resume, lifecycle, approval gate) |
 | `server/src/executions.test.ts` | 21 | Execution service |
 | `server/src/executions/verify.test.ts` | 17 | Independent test replay verification |
@@ -1404,11 +1494,15 @@ plugin and MCP server.
 | `server/src/pipeline-sse.test.ts` | 24 | SSE streaming |
 | `server/src/orchestrator-real.test.ts` | 1 | Real OpenCode (gated) |
 | `server/src/opencode-real.test.ts` | 4 | Real OpenCode E2E (gated) |
+| `client/src/utils/format.test.ts` | ~10 | Formatting helpers (Phase 13F) |
+| `client/src/hooks/usePipelineStream.test.ts` | ~6 | SSE stream hook (Phase 13E) |
 | **Total (listed)** | **491 `it(`/`test(` occurrences summed** | 9B adds 12 across app + orchestrator suites |
 
 > Counts above reflect the `it(`/`test(` occurrences per file and are
 > approximate (vitest's numeric total includes dynamically-defined subtests);
 > the authoritative number comes from `npm test` (607 passed, 5 skipped, 0 failed).
+> Frontend tests (client package) run in a separate Vitest config and are not
+> included in that count.
 
 ### Known Test Gaps — all resolved
 
