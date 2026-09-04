@@ -1,9 +1,9 @@
 # DevMesh Development Plan
 
 > Status: active
-> Last updated: 2026-09-04 (post Phase 13F — Phases 0–12 complete; Phases 13A–13F complete; Phase 13G next; Phase 14 planned)
+> Last updated: 2026-09-04 (post Phase 13G — Phases 0–12 complete; Phases 13A–13G complete; Phase 13H next; Phase 14 planned)
 > Reference: docs/adr/0001-approved-architecture.md
-> Test baseline: 607 passed, 5 skipped, 0 failed (Phase 12; historical: Phase 11 was 590 passed, Phase 10 was 574 passed)
+> Test baseline: 645 passed, 5 skipped, 0 failed (Phase 13G; historical: Phase 12 was 607 passed, Phase 11 was 590 passed, Phase 10 was 574 passed)
 
 ---
 
@@ -41,10 +41,10 @@ agent runtime is OpenCode behind a swappable adapter port.
   `approval.requested`/`approval.resolved` via the durable `approvals` table; the
   orchestrator blocks a gated task as `blocked` until a human approves (resume) or
   denies (fail), and re-enters the gate on resume so blocked state survives a restart
-- Frontend pipeline dashboard (Phases 13B–13F): React SPA served from Fastify
+- Frontend pipeline dashboard (Phases 13B–13G): React SPA served from Fastify
   with pipeline list/detail views, live SSE event stream, task DAG graph,
-  artifact listing with bounded payload preview, and per-run usage summary with
-  per-task breakdown. Approval UI is not yet implemented (Phase 13G).
+  artifact listing with bounded payload preview, per-run usage summary with
+  per-task breakdown, and approval queue with approve/reject actions (Phase 13G).
 
 ---
 
@@ -1267,13 +1267,14 @@ model (e.g. Ollama) behind the `AgentRuntime` port without changing core.
 **Test baseline after Phase 12 (actual):** 607 passed, 5 skipped, 0 failed.
 Typecheck clean. Lint clean.
 
-### Phase 13: Frontend/UI — Phases 13A–13F COMPLETE; 13G NOT STARTED
+### Phase 13: Frontend/UI — Phases 13A–13G COMPLETE; 13H NOT STARTED
 
 **Goal:** ADR Amendment 7 explicitly defers a frontend; when pursued it should
-surface pipeline runs, live SSE events (Phase 6C), artifacts, and usage.
+surface pipeline runs, live SSE events (Phase 6C), artifacts, usage, and
+approval actions.
 
-Phase 13 is delivered as sub-phases. Phases 13A–13F are complete; Phase 13G
-(approval UI) is the remaining sub-phase.
+Phase 13 is delivered as sub-phases. Phases 13A–13G are complete; Phase 13H
+is the next sub-phase.
 
 #### Phase 13A: Usage API — COMPLETE (commit `69e5d69`)
 
@@ -1352,7 +1353,7 @@ usage summaries with per-task breakdown.
 | No new backend endpoint introduced by 13F | — |
 | No frontend pricing/accounting logic (display-only) | — |
 
-#### Phase 13G: Approval UI — NOT STARTED / NEXT
+#### Phase 13G: Approval UI — COMPLETE (commit `b4c9fd5`)
 
 **Goal:** Wire the existing approval REST endpoints (Phase 9) into the
 frontend so users can view pending approvals and approve/deny from the
@@ -1360,8 +1361,27 @@ browser.
 
 | Deliverable | Status |
 |---|---|
-| Approval queue view | not started |
-| Approve/deny actions from the UI | not started |
+| `getProjectApprovals(projectId)` — fetches pending approvals via existing `GET /projects/:projectId/approvals` | done |
+| `resolveApproval(id, decision)` — posts `{ decision: "allow" | "deny" }` via existing `POST /approvals/:id/resolve` | done |
+| `Approval` TypeScript type matching the server's `ApprovalRecord` shape (no rejection-reason field; contract does not provide one) | done |
+| `ApprovalSection` component — renders pending approvals filtered to the current pipeline run | done |
+| `ApprovalCard` — shows status badge, risk level, kind, title, detail, task ID, timestamps, and resolved-info when non-pending | done |
+| Approve action sends `"allow"` decision; reject action sends `"deny"` decision | done |
+| No rejection-reason input field — the existing contract does not carry a rejection reason | — |
+| Loading state while fetching approvals | done |
+| Submission-in-progress duplicate prevention (button disabled, early return on in-flight request) | done |
+| Error display on failed resolve action | done |
+| Refresh on successful resolution: `onRefresh` callback re-fetches the approval list | done |
+| `filterApprovalsForRun()` — narrows project-scoped list to the displayed run | done |
+| `isApprovalPending()` — determines whether approve/reject buttons are shown | done |
+| `approvalStatusLabel()` — human-readable status label for display | done |
+| `ApprovalSection` integrated into `PipelineDetail` as a sibling of `UsageSection` and `ArtifactSection` | done |
+| SSE refresh lifecycle integration — `ApprovalSection` receives `refreshToken` from `PipelineDetail.detailVersion`; bumped by the existing `usePipelineStream` debounced-refresh on `approval.requested` / `approval.resolved` events | done |
+| No second `EventSource` — reuses the existing `usePipelineStream` SSE connection established by `PipelineDetail` | done |
+| No new backend endpoint — frontend calls the Phase 9 `GET /projects/:projectId/approvals` and `POST /approvals/:id/resolve` | — |
+| No new dependency — pure React + existing `fetch`-based client | — |
+| CSS styles for approval section, cards, badges, and risk indicators | done |
+| `format.test.ts` — unit tests for `approvalStatusLabel`, `isApprovalPending`, `filterApprovalsForRun` | done |
 
 #### Phase 13 Acceptance Criteria
 
@@ -1369,7 +1389,7 @@ browser.
 - [x] Live SSE pipeline event stream rendered in-browser (13E)
 - [x] Usage rollups displayed from run/task summaries (13F)
 - [x] Artifact listing with bounded payload preview (13F)
-- [ ] Approval queue rendered in-browser (13G — not started)
+- [x] Approval queue rendered in-browser (13G)
 
 #### Phase 13 Sub-Phase Summary
 
@@ -1381,11 +1401,11 @@ browser.
 | 13D | Pipeline dashboard (list/detail/DAG) | ✅ Complete | `2699220` |
 | 13E | Live SSE event stream | ✅ Complete | `f0cf8f6` |
 | 13F | Artifact + Usage UI | ✅ Complete | `7ec9dcd` |
-| 13G | Approval UI | ⬜ Not started | — |
+| 13G | Approval UI | ✅ Complete | `b4c9fd5` |
 
 **Test baseline note:** The Phase 13 frontend tests (`format.test.ts`,
 `usePipelineStream.test.ts`) run in a separate Vitest config and are not
-included in the backend test baseline (607 passed). Backend tests added in
+included in the backend test baseline (645 passed). Backend tests added in
 13A and 13C are included in that baseline.
 
 ### Phase 14: Security Hardening — AuthN/Z, Permissions, MCP & Plugin Packaging (Future, Not Yet Started)
@@ -1445,11 +1465,11 @@ plugin and MCP server.
 | 10 | Model/provider gateway | Amendment 6 | ~8 | ✅ Complete |
 | 11 | Additional agent roles | Amendment 3 | ~8 | ✅ Complete |
 | 12 | Local/offline model adapter | Amendment 9 | ~5 | ✅ Complete (17 tests) |
-| 13 | Frontend/UI | Amendment 7 | ~2 | 13A–13F ✅ Complete; 13G ⬜ Next |
+| 13 | Frontend/UI | Amendment 7 | ~2 | 13A–13G ✅ Complete; 13H ⬜ Next |
 | 14 | Security hardening, permissions, MCP & plugin packaging | ADR/README | ~12 | Not started |
 
-> Phases 13–14 are tracked in the roadmap. Phase 13A–13F are implemented;
-> Phase 13G (approval UI) is next. Detailed goals, acceptance criteria, and
+> Phases 13–14 are tracked in the roadmap. Phase 13A–13G are implemented;
+> Phase 13H is the next sub-phase. Detailed goals, acceptance criteria, and
 > required tests for each appear above.
 >
 > **Roadmap note (Phase 9B boundary):** the approval gate currently guards the
@@ -1462,7 +1482,7 @@ plugin and MCP server.
 
 ---
 
-## Appendix: Test File Inventory (post Phase 13F)
+## Appendix: Test File Inventory (post Phase 13G)
 
 | File | Tests | Area |
 |---|---|---|
@@ -1494,13 +1514,13 @@ plugin and MCP server.
 | `server/src/pipeline-sse.test.ts` | 24 | SSE streaming |
 | `server/src/orchestrator-real.test.ts` | 1 | Real OpenCode (gated) |
 | `server/src/opencode-real.test.ts` | 4 | Real OpenCode E2E (gated) |
-| `client/src/utils/format.test.ts` | ~10 | Formatting helpers (Phase 13F) |
+| `client/src/utils/format.test.ts` | ~20 | Formatting helpers (Phase 13F + Phase 13G approval display) |
 | `client/src/hooks/usePipelineStream.test.ts` | ~6 | SSE stream hook (Phase 13E) |
-| **Total (listed)** | **491 `it(`/`test(` occurrences summed** | 9B adds 12 across app + orchestrator suites |
+| **Total (listed)** | **~501 `it(`/`test(` occurrences summed** | 13G adds ~10 across format.test.ts |
 
 > Counts above reflect the `it(`/`test(` occurrences per file and are
 > approximate (vitest's numeric total includes dynamically-defined subtests);
-> the authoritative number comes from `npm test` (607 passed, 5 skipped, 0 failed).
+> the authoritative number comes from `npm test` (645 passed, 5 skipped, 0 failed).
 > Frontend tests (client package) run in a separate Vitest config and are not
 > included in that count.
 
