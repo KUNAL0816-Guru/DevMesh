@@ -1,8 +1,10 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import type { PipelineRun, TaskCard, Project } from "../api/types.js";
 import { getPipeline, getPipelineTasks, getProject } from "../api/client.js";
+import { usePipelineStream } from "../hooks/usePipelineStream.js";
 import TaskList from "./TaskList.js";
 import TaskGraph from "./TaskGraph.js";
+import PipelineActivity from "./PipelineActivity.js";
 
 interface Props {
   runId: string;
@@ -42,6 +44,21 @@ export default function PipelineDetail({ runId, onBack }: Props) {
     load();
     return () => { cancelled = true; };
   }, [runId]);
+
+  const refresh = useCallback(async () => {
+    try {
+      const [pipe, taskList] = await Promise.all([
+        getPipeline(runId),
+        getPipelineTasks(runId),
+      ]);
+      setPipeline(pipe);
+      setTasks(taskList);
+    } catch {
+      // Ignore transient refresh errors; REST data remains as last known.
+    }
+  }, [runId]);
+
+  const { connectionStatus, recentEvents } = usePipelineStream(runId, refresh);
 
   if (loading) return <p className="muted">Loading pipeline…</p>;
   if (error) return <p className="error">{error}</p>;
@@ -107,6 +124,8 @@ export default function PipelineDetail({ runId, onBack }: Props) {
           )}
         </div>
       </div>
+
+      <PipelineActivity status={connectionStatus} events={recentEvents} />
 
       {tasks.length > 0 && (
         <>

@@ -459,3 +459,127 @@ body {
 .task-graph-dep-line {
   font-style: italic;
 }
+
+/* Live activity / SSE */
+
+.pipeline-activity {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.pipeline-activity .activity-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+
+.pipeline-activity .activity-header h3 {
+  margin: 0;
+}
+
+.live-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.15em 0.6em;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border: 1px solid var(--color-border);
+}
+
+.live-badge .live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.live-connecting {
+  color: var(--color-accent);
+  background: #1f3a5f;
+}
+
+.live-connecting .live-dot {
+  animation: pulse 1s infinite;
+}
+
+.live-live {
+  color: var(--color-success);
+  background: #1a3a2a;
+}
+
+.live-live .live-dot {
+  animation: pulse 1.6s infinite;
+}
+
+.live-disconnected {
+  color: var(--color-warning);
+  background: #2d2315;
+}
+
+.live-closed {
+  color: var(--color-muted);
+  background: #21262d;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.activity-empty {
+  font-size: 0.85rem;
+}
+
+.activity-list {
+  list-style: none;
+  max-height: 320px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.activity-item {
+  display: grid;
+  grid-template-columns: auto auto 1fr auto;
+  gap: 0.5rem;
+  align-items: baseline;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--color-border);
+  font-size: 0.8rem;
+}
+
+.activity-type {
+  color: var(--color-accent);
+  font-weight: 600;
+}
+
+.activity-seq {
+  color: var(--color-muted);
+}
+
+.activity-summary {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-time {
+  font-size: 0.7rem;
+}
+
+@media (max-width: 600px) {
+  .activity-item {
+    grid-template-columns: auto 1fr;
+  }
+  .activity-summary {
+    grid-column: 1 / -1;
+  }
+}
