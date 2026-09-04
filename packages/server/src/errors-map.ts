@@ -33,6 +33,7 @@ const STATUS_BY_CODE: Readonly<Record<string, number>> = {
   "agent/not-executable": 409,
   "task/exhausted": 409,
   "budget/exhausted": 409,
+  "auth/unauthenticated": 401,
 };
 
 export interface NormalizedError {

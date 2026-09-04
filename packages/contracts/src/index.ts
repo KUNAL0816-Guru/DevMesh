@@ -13,3 +13,4 @@ export * from "./usage.js";
 export * from "./pricing.js";
 export * from "./provider.js";
 export * from "./pipeline.js";
+export * from "./auth-principal.js";

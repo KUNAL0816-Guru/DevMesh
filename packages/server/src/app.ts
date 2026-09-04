@@ -21,8 +21,9 @@ import type { AgentRegistry } from "@devmesh/agents";
 import { createDefaultAgentRegistry } from "@devmesh/agents";
 import { z } from "zod";
 import type { Config } from "./config.js";
-import { budgetConfigFromConfig, pricingRulesFromConfig } from "./config.js";
+import { authConfigFromConfig, budgetConfigFromConfig, pricingRulesFromConfig } from "./config.js";
 import { normalizeError } from "./errors-map.js";
+import { registerAuth } from "./auth.js";
 import { GitService } from "@devmesh/workspace";
 import { ExecutionService } from "./executions/service.js";
 import { createPriceTable } from "./executions/pricing.js";
@@ -172,6 +173,9 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
     });
   });
 
+  // -- Phase 14A: Bearer authentication ------------------------------------
+  registerAuth(app, authConfigFromConfig(opts.config));
+
   // -- static frontend (SPA fallback) ---------------------------------------
   const serverDir = dirname(fileURLToPath(import.meta.url));
   const defaultStaticRoot = opts.staticRoot ?? join(serverDir, "..", "..", "client", "dist");
@@ -192,6 +196,7 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
       p.startsWith("/pipelines") ||
       p.startsWith("/executions") ||
       p.startsWith("/approvals") ||
+      p.startsWith("/auth") ||
       p.startsWith("/api");
     if (!isApi && existsSync(defaultStaticRoot)) {
       void reply.sendFile("index.html");
@@ -218,6 +223,13 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
       checks: { storage: storageOk ? "ok" : "fail" },
     };
     return body;
+  });
+
+  // -- auth/me (Phase 14A) --------------------------------------------------
+  app.get("/auth/me", async (request) => {
+    if (request.auth) return request.auth;
+    // Auth disabled: return a synthetic principal for backward compatibility.
+    return { id: "devmesh:default", method: "bearer" };
   });
 
   // -- projects / workspaces ------------------------------------------------

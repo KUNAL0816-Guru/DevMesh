@@ -95,6 +95,17 @@ export const configSchema = z.strictObject({
   budget: budgetConfigSchema.optional(),
   /** Optional pricing rules for derived cost (Phase 8C). Absent = cost null. */
   pricing: z.array(pricingProfileSchema).optional(),
+  /**
+   * Phase 14A: Authentication configuration.
+   * Absent or bearerToken absent => no authentication (single-user mode).
+   * When bearerToken is set, API routes require a valid Bearer token.
+   */
+  auth: z
+    .strictObject({
+      /** API token used for Bearer authentication. Absent = no auth. */
+      bearerToken: z.string().min(1).optional(),
+    })
+    .optional(),
 }).superRefine((val, ctx) => {
   if (val.runtime === "opencode-local") {
     if (!val.localBaseUrl) {
@@ -149,6 +160,19 @@ export function pricingRulesFromConfig(config: Config): PricingRule[] {
   }));
 }
 
+/** Phase 14A: Extract auth configuration for the authentication hook. */
+export interface AuthConfig {
+  enabled: true;
+  bearerToken: string;
+}
+
+export function authConfigFromConfig(config: Config): AuthConfig | null {
+  if (config.auth?.bearerToken) {
+    return { enabled: true, bearerToken: config.auth.bearerToken };
+  }
+  return null;
+}
+
 function parseJsonEnv(raw: string | undefined, label: string): unknown {
   if (raw === undefined || raw === "") return undefined;
   try {
@@ -167,7 +191,8 @@ function parseJsonEnv(raw: string | undefined, label: string): unknown {
  *   DEVMESH_GATEWAY, DEVMESH_GATEWAY_BASE_URL, DEVMESH_GATEWAY_API_KEY,
  *   DEVMESH_GATEWAY_MODEL, DEVMESH_GATEWAY_TIMEOUT_MS,
  *   DEVMESH_LOCAL_BASE_URL, DEVMESH_LOCAL_MODEL, DEVMESH_LOCAL_API_KEY,
- *   DEVMESH_LOCAL_TIMEOUT_MS
+ *   DEVMESH_LOCAL_TIMEOUT_MS,
+ *   DEVMESH_AUTH_TOKEN (Phase 14A: API token for Bearer authentication)
  * Throws a plain Error with a readable message on invalid values.
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -205,6 +230,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     budget: env.DEVMESH_BUDGET ? parseJsonEnv(env.DEVMESH_BUDGET, "DEVMESH_BUDGET") : undefined,
     pricing: env.DEVMESH_PRICING
       ? parseJsonEnv(env.DEVMESH_PRICING, "DEVMESH_PRICING")
+      : undefined,
+    auth: env.DEVMESH_AUTH_TOKEN
+      ? { bearerToken: env.DEVMESH_AUTH_TOKEN }
       : undefined,
   });
   if (!parsed.success) {
