@@ -583,3 +583,234 @@ body {
     grid-column: 1 / -1;
   }
 }
+
+/* Usage section */
+
+.usage-section {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.usage-section h3 {
+  margin: 0 0 0.75rem;
+}
+
+.usage-card {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.usage-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 0.5rem;
+}
+
+.usage-tile {
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.usage-label {
+  font-size: 0.7rem;
+  color: var(--color-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.usage-value {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.usage-value--unknown {
+  color: var(--color-muted);
+  font-weight: 400;
+}
+
+.usage-subtitle {
+  font-size: 0.85rem;
+  color: var(--color-muted);
+  margin-bottom: 0.25rem;
+}
+
+.usage-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+
+.usage-table th,
+.usage-table td {
+  text-align: left;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.usage-table th {
+  color: var(--color-muted);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.usage-table td.num,
+.usage-table th.num {
+  text-align: right;
+}
+
+.usage-table tr:last-child td {
+  border-bottom: none;
+}
+
+/* Artifact section */
+
+.artifact-section {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.artifact-section h3 {
+  margin: 0 0 0.75rem;
+}
+
+.artifact-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.artifact-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.artifact-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 0.4rem 0.6rem;
+  color: var(--color-text);
+  font-size: 0.8rem;
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.15s;
+}
+
+.artifact-row:hover {
+  border-color: var(--color-accent);
+}
+
+.artifact-row--active {
+  border-color: var(--color-accent);
+  background: #1f3a5f;
+}
+
+.artifact-kind {
+  display: inline-block;
+  padding: 0.1em 0.45em;
+  border-radius: 3px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  background: #21262d;
+  color: var(--color-muted);
+  flex-shrink: 0;
+}
+
+.artifact-kind--spec { color: var(--color-accent); }
+.artifact-kind--plan { color: var(--color-warning); }
+.artifact-kind--change_set { background: #1a3a2a; color: var(--color-success); }
+.artifact-kind--test_report { background: #3d1a1a; color: var(--color-error); }
+.artifact-kind--review { color: var(--color-warning); }
+.artifact-kind--verification { background: #1a3a2a; color: var(--color-success); }
+
+.artifact-id {
+  color: var(--color-muted);
+  flex-shrink: 0;
+}
+
+.artifact-producer {
+  color: var(--color-accent);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+
+.artifact-task {
+  color: var(--color-muted);
+  flex-shrink: 0;
+}
+
+.artifact-time {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: 0.7rem;
+}
+
+.artifact-preview {
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-bg);
+  overflow: hidden;
+}
+
+.artifact-preview-header {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid var(--color-border);
+  font-size: 0.8rem;
+  flex-wrap: wrap;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.artifact-preview-pre {
+  max-height: 480px;
+  overflow: auto;
+  padding: 0.75rem;
+  margin: 0;
+  font-family: ui-monospace, "Cascadia Code", "Fira Code", monospace;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--color-text);
+}
+
+@media (max-width: 600px) {
+  .usage-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+  .artifact-row {
+    flex-wrap: wrap;
+  }
+  .artifact-time {
+    margin-left: 0;
+    width: 100%;
+  }
+}

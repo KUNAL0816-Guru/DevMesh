@@ -112,22 +112,40 @@ export interface DomainEvent {
   [key: string]: unknown;
 }
 
+/**
+ * Aggregate token/cost usage for a set of executions, mirroring the server's
+ * `ExecutionUsage` returned by `GET /pipelines/:runId/usage`.
+ *
+ * Semantics (server-side aggregation, not re-derived in the client):
+ * - A null dimension is UNKNOWN (not zero): some executions had no usage or
+ *   mixed known/unknown values, so that total cannot be truthfully summed.
+ * - An empty scope yields `0` totals with `unknownExecutionCount: 0`.
+ */
+export interface ExecutionUsage {
+  inputTokens: number | null;
+  outputTokens: number | null;
+  costUsdMicros: number | null;
+  currency: string | null;
+  usageSource: "reported" | "derived" | null;
+}
+
+export interface TaskUsageSummary {
+  taskId: string;
+  runId: string;
+  role: string;
+  title: string;
+  executionCount: number;
+  unknownExecutionCount: number;
+  totals: ExecutionUsage;
+}
+
 export interface RunUsage {
   runId: string;
-  totalInputTokens: number | null;
-  totalOutputTokens: number | null;
-  totalCostUsdMicros: number | null;
-  currency: string | null;
+  projectId: string;
+  executionCount: number;
   unknownExecutionCount: number;
-  taskBreakdown: Array<{
-    taskId: string;
-    runId: string;
-    role: AgentRole | null;
-    title: string | null;
-    inputTokens: number | null;
-    outputTokens: number | null;
-    costUsdMicros: number | null;
-  }>;
+  totals: ExecutionUsage;
+  perTask: TaskUsageSummary[];
 }
 
 export interface ApiError {

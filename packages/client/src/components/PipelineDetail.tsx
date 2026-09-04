@@ -5,6 +5,8 @@ import { usePipelineStream } from "../hooks/usePipelineStream.js";
 import TaskList from "./TaskList.js";
 import TaskGraph from "./TaskGraph.js";
 import PipelineActivity from "./PipelineActivity.js";
+import ArtifactSection from "./ArtifactSection.js";
+import UsageSection from "./UsageSection.js";
 
 interface Props {
   runId: string;
@@ -17,6 +19,10 @@ export default function PipelineDetail({ runId, onBack }: Props) {
   const [tasks, setTasks] = useState<TaskCard[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Incremented on SSE-driven refresh so artifact/usage sections reload only
+  // when the live stream indicates data changed — debounced upstream, no
+  // polling loop.
+  const [detailVersion, setDetailVersion] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -46,6 +52,8 @@ export default function PipelineDetail({ runId, onBack }: Props) {
   }, [runId]);
 
   const refresh = useCallback(async () => {
+    // Notify artifact/usage sections that fresh data may be available.
+    setDetailVersion((v) => v + 1);
     try {
       const [pipe, taskList] = await Promise.all([
         getPipeline(runId),
@@ -142,6 +150,10 @@ export default function PipelineDetail({ runId, onBack }: Props) {
           No tasks recorded for this pipeline run.
         </p>
       )}
+
+      <UsageSection runId={runId} refreshToken={detailVersion} />
+
+      <ArtifactSection runId={runId} refreshToken={detailVersion} />
     </div>
   );
 }
