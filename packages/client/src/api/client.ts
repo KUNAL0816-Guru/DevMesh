@@ -1,5 +1,7 @@
 import type {
   ApiError,
+  Approval,
+  ApprovalDecision,
   Artifact,
   ArtifactKind,
   DomainEvent,
@@ -175,6 +177,43 @@ export async function getPipelineEvents(
   if (opts?.limit !== undefined) params.set("limit", String(opts.limit));
   const qs = params.toString();
   return request(`/pipelines/${runId}/events${qs ? `?${qs}` : ""}`);
+}
+
+// ---------------------------------------------------------------------------
+// Approvals
+// ---------------------------------------------------------------------------
+
+/**
+ * List PENDING approval requests for a project (oldest first). The existing
+ * REST contract exposes only pending requests at this endpoint; resolved ones
+ * are dropped from this list (matches `ApprovalRepository.listPending`).
+ */
+export async function getProjectApprovals(
+  projectId: string,
+): Promise<Approval[]> {
+  const data = await request<{ approvals: Approval[] }>(
+    `/projects/${projectId}/approvals`,
+  );
+  return data.approvals;
+}
+
+/**
+ * Resolve an approval. The existing contract accepts `{ decision }` where the
+ * decision is `"allow"` (approve) or `"deny"` (reject). There is no rejection
+ * reason field in the contract.
+ */
+export async function resolveApproval(
+  approvalId: string,
+  decision: ApprovalDecision,
+): Promise<Approval> {
+  const data = await request<{ approval: Approval }>(
+    `/approvals/${approvalId}/resolve`,
+    {
+      method: "POST",
+      body: JSON.stringify({ decision }),
+    },
+  );
+  return data.approval;
 }
 
 // ---------------------------------------------------------------------------

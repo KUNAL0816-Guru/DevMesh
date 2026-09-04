@@ -7,6 +7,7 @@ import TaskGraph from "./TaskGraph.js";
 import PipelineActivity from "./PipelineActivity.js";
 import ArtifactSection from "./ArtifactSection.js";
 import UsageSection from "./UsageSection.js";
+import ApprovalSection from "./ApprovalSection.js";
 
 interface Props {
   runId: string;
@@ -154,6 +155,14 @@ export default function PipelineDetail({ runId, onBack }: Props) {
       <UsageSection runId={runId} refreshToken={detailVersion} />
 
       <ArtifactSection runId={runId} refreshToken={detailVersion} />
+
+      {project && (
+        <ApprovalSection
+          runId={runId}
+          projectId={project.id}
+          refreshToken={detailVersion}
+        />
+      )}
     </div>
   );
 }

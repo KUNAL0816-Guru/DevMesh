@@ -95,3 +95,39 @@ export function totalTokens(
   if (isKnown(input) && isKnown(output)) return input + output;
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// Approval display helpers (Phase 13G). Kept pure so they can be unit-tested
+// directly, mirroring the approval contract in api/types.ts.
+// ---------------------------------------------------------------------------
+
+/** Human label for an approval status enum value. */
+export function approvalStatusLabel(status: string): string {
+  switch (status) {
+    case "pending":
+      return "Pending";
+    case "approved":
+      return "Approved";
+    case "denied":
+      return "Denied";
+    default:
+      return status;
+  }
+}
+
+/** True when an approval is still awaiting a decision (actionable). */
+export function isApprovalPending(status: string): boolean {
+  return status === "pending";
+}
+
+/**
+ * Filter a list of project approvals down to those belonging to a specific
+ * pipeline run. The existing list endpoint is project-scoped, so the client
+ * narrows to the run shown on the pipeline detail page.
+ */
+export function filterApprovalsForRun<T extends { runId: string }>(
+  approvals: readonly T[],
+  runId: string,
+): T[] {
+  return approvals.filter((a) => a.runId === runId);
+}

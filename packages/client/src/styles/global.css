@@ -802,6 +802,132 @@ body {
   color: var(--color-text);
 }
 
+/* Approval section */
+
+.approval-section {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.approval-section h3 {
+  margin: 0 0 0.75rem;
+}
+
+.approval-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.approval-card {
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.approval-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  font-size: 0.75rem;
+}
+
+.approval-risk {
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  padding: 0.05rem 0.5rem;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.approval-risk--low { color: var(--color-success); }
+.approval-risk--medium { color: var(--color-warning); }
+.approval-risk--high { color: #db6d28; }
+.approval-risk--critical { color: var(--color-error); }
+
+.approval-status--pending {
+  background: rgba(139, 148, 158, 0.15);
+  color: var(--color-pending);
+}
+.approval-status--approved {
+  background: rgba(63, 185, 80, 0.15);
+  color: var(--color-success);
+}
+.approval-status--denied {
+  background: rgba(248, 81, 73, 0.15);
+  color: var(--color-error);
+}
+
+.approval-kind {
+  color: var(--color-muted);
+}
+
+.approval-requested {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: 0.7rem;
+}
+
+.approval-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.approval-detail {
+  font-size: 0.8rem;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.approval-meta {
+  font-size: 0.7rem;
+}
+
+.approval-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+}
+
+.approval-actions button {
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 0.35rem 0.9rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+
+.approval-actions button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.approval-actions .btn-approve {
+  border-color: var(--color-success);
+  color: var(--color-success);
+}
+
+.approval-actions .btn-deny {
+  border-color: var(--color-error);
+  color: var(--color-error);
+}
+
+.approval-error {
+  margin-top: 0.25rem;
+}
+
 @media (max-width: 600px) {
   .usage-grid {
     grid-template-columns: 1fr 1fr;

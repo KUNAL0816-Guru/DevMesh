@@ -5,6 +5,9 @@ import {
   previewArtifactPayload,
   totalTokens,
   isKnown,
+  approvalStatusLabel,
+  isApprovalPending,
+  filterApprovalsForRun,
 } from "./format.js";
 
 describe("isKnown", () => {
@@ -100,5 +103,43 @@ describe("totalTokens", () => {
     expect(totalTokens(null, 50)).toBeNull();
     expect(totalTokens(100, null)).toBeNull();
     expect(totalTokens(null, null)).toBeNull();
+  });
+});
+
+describe("approvalStatusLabel", () => {
+  it("labels each status enum value", () => {
+    expect(approvalStatusLabel("pending")).toBe("Pending");
+    expect(approvalStatusLabel("approved")).toBe("Approved");
+    expect(approvalStatusLabel("denied")).toBe("Denied");
+  });
+
+  it("falls back to the raw value for unknown statuses", () => {
+    expect(approvalStatusLabel("weird")).toBe("weird");
+  });
+});
+
+describe("isApprovalPending", () => {
+  it("is true only for pending approvals", () => {
+    expect(isApprovalPending("pending")).toBe(true);
+    expect(isApprovalPending("approved")).toBe(false);
+    expect(isApprovalPending("denied")).toBe(false);
+  });
+});
+
+describe("filterApprovalsForRun", () => {
+  it("keeps only approvals belonging to the given run", () => {
+    const approvals = [
+      { runId: "run-1" },
+      { runId: "run-2" },
+      { runId: "run-1" },
+    ];
+    expect(filterApprovalsForRun(approvals, "run-1").map((a) => a.runId)).toEqual([
+      "run-1",
+      "run-1",
+    ]);
+  });
+
+  it("returns an empty list when the run has no approvals", () => {
+    expect(filterApprovalsForRun([{ runId: "other" }], "run-1")).toEqual([]);
   });
 });

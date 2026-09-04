@@ -148,6 +148,36 @@ export interface RunUsage {
   perTask: TaskUsageSummary[];
 }
 
+export type ApprovalRisk = "low" | "medium" | "high" | "critical";
+
+export type ApprovalStatus = "pending" | "approved" | "denied";
+
+export type ApprovalDecision = "allow" | "deny";
+
+/**
+ * Mirrors the server/storage `ApprovalRecord` returned by the approvals REST
+ * endpoints. `status` is a small state machine: pending → approved|denied once
+ * (resolution is atomic; an approval is never double-resolved).
+ *
+ * Rejection is the `deny` decision. The existing contract does NOT carry a
+ * rejection reason field; do not infer one.
+ */
+export interface Approval {
+  id: string;
+  projectId: string;
+  runId: string;
+  taskId: string | null;
+  kind: string;
+  title: string;
+  detail: string;
+  risk: ApprovalRisk;
+  status: ApprovalStatus;
+  requestedAt: string;
+  resolvedAt: string | null;
+  decision: ApprovalDecision | null;
+  decidedBy: string | null;
+}
+
 export interface ApiError {
   error: { code: string; message: string };
 }

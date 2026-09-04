@@ -39,6 +39,8 @@ const DATA_EVENT_TYPES = new Set([
   "checkpoint.created",
   "agent.session.opened",
   "agent.reply.completed",
+  "approval.requested",
+  "approval.resolved",
 ]);
 
 function str(v: unknown, max: number): string {
