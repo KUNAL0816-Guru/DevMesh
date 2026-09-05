@@ -43,6 +43,10 @@ if (action.writeFile) {
   mkdirSync(dirname(action.writeFile), { recursive: true });
   writeFileSync(action.writeFile, action.content ?? "created by stub agent\\n");
 }
+if (process.argv.includes("--auto")) {
+  const { writeFileSync } = await import("node:fs");
+  writeFileSync("auto-flag.txt", "1");
+}
 if (action.sleepMs) await new Promise((r) => setTimeout(r, action.sleepMs));
 if (action.usage) {
   // Verified opencode shape: step_finish carries { part: { tokens: { input, output, ... } } }
@@ -155,6 +159,41 @@ describe("OpencodeAdapter (stub binary)", () => {
     expect(existsSync(join(dir, "output-schema.json"))).toBe(true);
     const written = readFileSync(join(dir, "output-schema.json"), "utf8");
     expect(JSON.parse(written)).toEqual(schema);
+  });
+
+  it("per-request autoApprove overrides the adapter default", async () => {
+    const { existsSync, readFileSync } = await import("node:fs");
+
+    // Adapter says --auto by default, but the request explicitly opts out:
+    // the policy only ever passes --auto for an ALLOW decision, so a request
+    // value must win over the composition-root default.
+    const noAuto = mkdtempSync(join(tmpdir(), "devmesh-noauto-"));
+    await new OpencodeAdapter({ binaryPath: stubPath, autoApprove: true })
+      .start(
+        request({
+          workspaceRoot: noAuto,
+          autoApprove: false,
+          instruction: JSON.stringify({}),
+        }),
+      )
+      .result;
+    expect(existsSync(join(noAuto, "auto-flag.txt"))).toBe(false);
+    rmSync(noAuto, { recursive: true, force: true });
+
+    // Default adapter (no --auto), request opts in explicitly.
+    const withAuto = mkdtempSync(join(tmpdir(), "devmesh-withauto-"));
+    await new OpencodeAdapter({ binaryPath: stubPath })
+      .start(
+        request({
+          workspaceRoot: withAuto,
+          autoApprove: true,
+          instruction: JSON.stringify({}),
+        }),
+      )
+      .result;
+    expect(existsSync(join(withAuto, "auto-flag.txt"))).toBe(true);
+    expect(readFileSync(join(withAuto, "auto-flag.txt"), "utf8")).toBe("1");
+    rmSync(withAuto, { recursive: true, force: true });
   });
 
   it("parses a structured output event into result.structured", async () => {

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  baselineProfile,
   isArtifactKind,
   makeTaskCard,
   newRunId,
@@ -18,6 +19,7 @@ import { createDefaultAgentRegistry, type AgentDefinitionInput } from "@devmesh/
 import { buildApp } from "./app.js";
 import type { Config } from "./config.js";
 import { reconcileInterrupted } from "./executions/service.js";
+import type { ProfileProvider } from "./policy.js";
 
 let dataRoot: string;
 
@@ -32,7 +34,11 @@ type RuntimeFactory = (
   handle: { projectId: ProjectId; root: string },
 ) => FakeRuntime | null;
 
-function makeStack(runtimeFn?: RuntimeFactory, overrides: Partial<Config> = {}) {
+function makeStack(
+  runtimeFn?: RuntimeFactory,
+  overrides: Partial<Config> = {},
+  policyBaselines?: ProfileProvider,
+) {
   const storage = createStorage({ path: join(dataRoot, `t-${crypto.randomUUID()}.db`) });
   const workspaces = new WorkspaceService({
     store: storage.projects,
@@ -55,6 +61,7 @@ function makeStack(runtimeFn?: RuntimeFactory, overrides: Partial<Config> = {}) 
     storage,
     workspaces,
     runtime,
+    ...(policyBaselines ? { policyBaselines } : {}),
   });
   return { app, storage, workspaces, handle };
 }
@@ -542,6 +549,26 @@ describe("Phase 3: agent gating via the registry", () => {
     expect(res.statusCode).toBe(409);
     expect(res.json().error.code).toBe("task/exhausted");
     // never reached the runtime: no execution row was even inserted
+    expect(stack.storage.executions.listByProject(stack.handle.projectId)).toHaveLength(0);
+    await stack.app.close();
+  });
+
+  it("denies a start at the HTTP layer with 422 permission/denied", async () => {
+    const stack = makeStack(
+      (h) => new FakeRuntime(doneScript(h.root)),
+      {},
+      (role) =>
+        role === "developer" ? { read: "deny", edit: "allow" } : baselineProfile(role),
+    );
+
+    const res = await stack.app.inject({
+      method: "POST",
+      url: `/projects/${stack.handle.projectId}/executions`,
+      payload: { instruction: "hello" },
+    });
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe("permission/denied");
+    // policy verdict arrived before any row was persisted or runtime was reached
     expect(stack.storage.executions.listByProject(stack.handle.projectId)).toHaveLength(0);
     await stack.app.close();
   });

@@ -15,7 +15,8 @@ export interface OpencodeAdapterOptions {
   /**
    * Map to the CLI's `--auto` flag (approve permission requests). DevMesh
    * defaults this to FALSE: headless opencode then auto-rejects any tool
-   * permission request, which is the safe posture.
+   * permission request, which is the safe posture. A per-request
+   * `request.autoApprove` value wins over this default when present.
    */
   autoApprove?: boolean;
   /** Grace period between SIGTERM and SIGKILL for the process group. */
@@ -264,7 +265,7 @@ export class OpencodeAdapter implements AgentRuntime {
       "--title",
       `devmesh-${request.executionId.slice(0, 18)}`,
     ];
-    if (this.opts.autoApprove) args.push("--auto");
+    if (request.autoApprove ?? this.opts.autoApprove) args.push("--auto");
     const model = request.model || this.opts.model || undefined;
     if (model) args.push("-m", model);
     if (request.outputFormat) {

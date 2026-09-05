@@ -578,12 +578,29 @@ export class Orchestrator {
           instruction,
           taskId: card.id,
           agentId: role,
+          isCancelled: () => this._cancelled,
           ...(role === "architect" || role === "tester" || role === "reviewer"
             ? { outputFormat: ARTIFACT_OUTPUT_FORMATS[role] }
             : {}),
         });
       } catch (err) {
-        const isBudget = (err as { code?: string })?.code === "budget/exhausted";
+        const errCode = (err as { code?: string })?.code;
+        // A permission approval wait ended because the pipeline was cancelled
+        // (either the cancel flag flipped or the gate surfaced permission/cancelled).
+        if (this._cancelled || errCode === "permission/cancelled") {
+          this.finishStage(currentStage, "cancelled");
+          this.cancelRemainingStages(stageRows);
+          this.emitEvent({
+            ts: new Date().toISOString(),
+            runId,
+            projectId,
+            actor: "system",
+            type: "run.cancelled",
+            reason: "pipeline cancelled while awaiting permission",
+          });
+          return this.result("cancelled", card.id, projectId, "pipeline cancelled");
+        }
+        const isBudget = errCode === "budget/exhausted";
         this.finishStage(currentStage, "failed");
         this.cancelRemainingStages(stageRows);
         // ready -> failed is illegal; a budget-exhausted stage can never start,
@@ -1272,12 +1289,29 @@ export class Orchestrator {
           instruction,
           taskId: card.id,
           agentId: role,
+          isCancelled: () => this._cancelled,
           ...(role === "architect" || role === "tester" || role === "reviewer"
             ? { outputFormat: ARTIFACT_OUTPUT_FORMATS[role] }
             : {}),
         });
       } catch (err) {
-        const isBudget = (err as { code?: string })?.code === "budget/exhausted";
+        const errCode = (err as { code?: string })?.code;
+        // A permission approval wait ended because the pipeline was cancelled
+        // (either the cancel flag flipped or the gate surfaced permission/cancelled).
+        if (this._cancelled || errCode === "permission/cancelled") {
+          this.finishStage(currentStage, "cancelled");
+          this.cancelRemainingStages(stageRows);
+          this.emitEvent({
+            ts: new Date().toISOString(),
+            runId,
+            projectId,
+            actor: "system",
+            type: "run.cancelled",
+            reason: "pipeline cancelled while awaiting permission",
+          });
+          return this.result("cancelled", card.id, projectId, "pipeline cancelled");
+        }
+        const isBudget = errCode === "budget/exhausted";
         this.finishStage(currentStage, "failed");
         this.cancelRemainingStages(stageRows);
         // ready -> failed is illegal; a budget-exhausted stage can never start,
@@ -1831,6 +1865,25 @@ export class Orchestrator {
         running.set(card, started.rec);
       }
 
+      // The pipeline was cancelled while a task awaited its permission
+      // approval and nothing else got launched: exit as cancelled, not as a
+      // deadlock failure.
+      if (this._cancelled) {
+        this.cancelRemainingStages(stageRows);
+        for (const t of tasks) {
+          if (!finished.has(t.id) && t.status === "pending") this.transitionTask(t, "blocked");
+        }
+        this.emitEvent({
+          ts: new Date().toISOString(),
+          runId,
+          projectId,
+          actor: "system",
+          type: "run.cancelled",
+          reason: "pipeline cancelled while awaiting permission",
+        });
+        return this.result("cancelled", tasks[0]!.id, projectId, "pipeline cancelled");
+      }
+
       if (running.size === 0) {
         // No task can make progress — block the remaining tasks and fail.
         for (const t of tasks) {
@@ -2108,6 +2161,7 @@ export class Orchestrator {
     | { kind: "error"; message: string }
     | null
   > {
+    if (this._cancelled) return null;
     if (!this.areDependenciesSatisfied(card)) return null;
     const current = this.storage.tasks.get(card.id as TaskId);
     const from = current?.status ?? "pending";
@@ -2156,6 +2210,7 @@ export class Orchestrator {
         instruction,
         taskId: card.id,
         agentId: card.role,
+        isCancelled: () => this._cancelled,
         ...(card.role === "architect" || card.role === "tester" || card.role === "reviewer"
           ? { outputFormat: ARTIFACT_OUTPUT_FORMATS[card.role] }
           : {}),
@@ -2163,6 +2218,11 @@ export class Orchestrator {
       return { kind: "started", rec };
     } catch (err) {
       const code = (err as { code?: string })?.code;
+      // Cancelled while awaiting a permission approval: the caller re-checks
+      // the cancel flag next loop pass and exits the run as cancelled.
+      if (this._cancelled || code === "permission/cancelled") {
+        return null;
+      }
       // The project already has a running execution — this is concurrency
       // pressure, not a failure. The caller retries on the next iteration.
       if (code === "workspace/locked") {

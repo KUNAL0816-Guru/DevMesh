@@ -1,4 +1,5 @@
 import {
+  baselineProfile,
   canTransition,
   newRunId,
   taskCardSchema,
@@ -7,6 +8,7 @@ import {
   type ArtifactProducer,
   type PricingRule,
   type ProjectId,
+  type RunId,
   type TaskId,
 } from "@devmesh/contracts";
 import type { Storage, ExecutionRecord, ExecutionUsage } from "@devmesh/storage";
@@ -16,7 +18,7 @@ import {
   type AgentRuntime,
   type RunningExecution,
 } from "@devmesh/runtime";
-import { AgentRegistryError, type AgentRegistry } from "@devmesh/agents";
+import { AgentRegistryError, type AgentDefinition, type AgentRegistry } from "@devmesh/agents";
 import {
   summarizeTaskCommittedUsage,
   aggregateCommittedRunUsage,
@@ -34,6 +36,14 @@ import { usageWithDerivedCost, type PriceTable } from "./pricing.js";
 import { buildVerificationArtifacts, observeChanges } from "./verify.js";
 import { classifyResult, classifyStartError } from "./classify.js";
 import { runVerificationCommand } from "./commands.js";
+import type { ApprovalGate } from "../approvals.js";
+import {
+  decisionForExecution,
+  effectiveAutoApprove,
+  PermissionError,
+  type ExecutionPermissionResult,
+  type ProfileProvider,
+} from "../policy.js";
 
 export interface StartExecutionInput {
   projectId: ProjectId;
@@ -57,6 +67,13 @@ export interface StartExecutionInput {
     name: string;
     schema: Record<string, unknown>;
   };
+  /**
+   * Cooperative cancellation signal for pre-start gates (a Phase 14C ASK whose
+   * approval is still pending). The orchestrator passes its run-cancel flag so
+   * a cancelled pipeline aborts instead of blocking forever. Absent = never
+   * cancelled (direct HTTP executions wait indefinitely, like the 9B gate).
+   */
+  isCancelled?: () => boolean;
 }
 
 export interface ExecutionServiceOptions {
@@ -80,6 +97,20 @@ export interface ExecutionServiceOptions {
   pricing?: PriceTable | null;
   /** In-process reservation ledger; defaults to a fresh instance. */
   ledger?: BudgetLedger;
+  /**
+   * Permission policy baselines (Phase 14C). Maps an agent role to its
+   * permission profile. Default: the canonical manifest baselines. Injecting a
+   * provider is how policy deny/ask behavior is exercised (tests) or replaced.
+   */
+  policyBaselines?: ProfileProvider;
+  /**
+   * Gate bridged when an ASK decision occurs. Absent/null = unguarded: an ASK
+   * then fails closed (permission/denied). Direct HTTP executions and the
+   * orchestrator share this gate so a decision is persisted and resumable.
+   */
+  approvalGate?: ApprovalGate | null;
+  /** Composition-root blanket auto-approve (config.opencodeAutoApprove). */
+  autoApprove?: boolean;
 }
 
 /** A scope a start must clear (task executions clear run AND task scopes). */
@@ -193,6 +224,10 @@ export class ExecutionService {
   }
 
   async start(input: StartExecutionInput): Promise<ExecutionRecord> {
+    // Identity is minted up front so policy events, approvals, budget scopes,
+    // and the execution row all share one coherent lineage.
+    const runId = newRunId();
+    const executionId = crypto.randomUUID();
     const runtime = this.opts.runtime;
     if (!runtime) {
       throw new RuntimeError("runtime/not-configured", "no agent runtime is wired up");
@@ -239,11 +274,24 @@ export class ExecutionService {
       }
     }
 
+    // -- permission policy (Phase 14C) ------------------------------------
+    // Authoritative on every start path; placed here so a denied or blocked
+    // start persists/creates nothing (no execution row, no budget reservation,
+    // no task card transition). DENY throws; ASK bridges to the approval gate
+    // and blocks the start until a human decides or the caller cancels.
+    const permission = await this.enforcePermissionGate(
+      card,
+      handle.projectId,
+      def,
+      input,
+      runId,
+      executionId,
+    );
+
     // -- cost/token budget gate (Phase 8C) ---------------------------------
     // Authoritative for every execution path: direct/API executions and both
     // orchestrator schedulers land here. Throws BudgetError (HTTP 409
     // budget/exhausted) before anything is persisted or started.
-    const runId = newRunId();
     const scopes = this.resolveBudgetScopes(card, runId);
     this.evaluateBudgetGate(scopes, runId, handle.projectId);
     const reservation = this.reservationsFor(scopes);
@@ -258,6 +306,7 @@ export class ExecutionService {
     const fullInstruction = `${def.systemInstructions}\n\n# Task\n\n${input.instruction}`;
 
     const rec = this.opts.storage.executions.insert({
+      id: executionId,
       runId,
       projectId: handle.projectId,
       taskId: input.taskId ?? null,
@@ -310,6 +359,10 @@ export class ExecutionService {
         instruction: fullInstruction,
         timeoutMs,
         model,
+        autoApprove: effectiveAutoApprove(
+          this.opts.autoApprove ?? false,
+          permission.decision,
+        ),
         ...(input.outputFormat ? { outputFormat: input.outputFormat } : {}),
       });
     } catch (err) {
@@ -402,6 +455,132 @@ export class ExecutionService {
       taskId: updated.id,
       from: card.status,
       to: outcome,
+    });
+  }
+
+  // -- Phase 14C permission gate ------------------------------------------
+
+  /**
+   * Evaluate the role policy for this start and enforce the run-level
+   * decision. Called AFTER the attempt budget (card resolved) and BEFORE the
+   * cost/token budget gate, so a denied/blocked start persists NOTHING.
+   *
+   * - permit: returns the decision (nothing emitted, runtime starts).
+   * - deny: emits `permission.resolved(deny)` and throws permission/denied.
+   * - ask:   emits `permission.requested`, creates an approval via the shared
+   *   ApprovalGate, and blocks until a human approves (start proceeds with
+   *   autoApprove=false), denies (throws approval/denied), or the caller's
+   *   `isCancelled` flips (throws permission/cancelled).
+   *
+   * Events are tagged with the pipeline run id when a task card exists so they
+   * appear on the pipeline SSE stream; direct executions use their own run id.
+   */
+  private async enforcePermissionGate(
+    card: { id: TaskId; runId: RunId } | null,
+    projectId: ProjectId,
+    def: AgentDefinition,
+    input: StartExecutionInput,
+    runId: RunId,
+    executionId: string,
+  ): Promise<ExecutionPermissionResult> {
+    const provider = this.opts.policyBaselines ?? baselineProfile;
+    const result = decisionForExecution({
+      role: def.role,
+      allowedOperations: def.allowedOperations,
+      profile: provider(def.role),
+    });
+
+    const pipelineRunId = card ? card.runId : runId;
+    const taskSuffix = card ? card.id : "direct";
+    const permissionId = `policy:${def.role}:${pipelineRunId}:${taskSuffix}`.slice(0, 128);
+
+    if (result.decision === "deny") {
+      this.emitPermissionResolved(executionId, permissionId, pipelineRunId, projectId, "deny");
+      throw new PermissionError("permission/denied", result.summary);
+    }
+
+    if (result.decision === "ask") {
+      const gate = this.opts.approvalGate ?? null;
+      if (!gate) {
+        throw new PermissionError(
+          "permission/denied",
+          `approval gate not configured; ASK policy for ${def.role} cannot be serviced`,
+        );
+      }
+      // The resource(s) that actually gate this run are the ASK contributions;
+      // surface the first of those as the requested permission's tool.
+      const primary = result.reasons.find((r) => r.action === "ask") ?? result.reasons[0];
+      // Persist/reconstruct the durable approval FIRST. ApprovalGate is
+      // idempotent by gate identity: a resumed/restarted run reuses the
+      // existing record (approved or denied) instead of creating a new one.
+      // `permission.requested` is therefore only emitted for a freshly created,
+      // still-pending request — an already-decided approval is never re-asked
+      // and never re-emits that event.
+      const approval = gate.request({
+        projectId,
+        runId: pipelineRunId,
+        taskId: card?.id ?? null,
+        spec: {
+          kind: "permission",
+          title: `Permission request: ${result.reasons.map((r) => r.resource).join(", ")} (${def.role})`,
+          detail: result.reasons
+            .map((r) => `${r.resource}: ${r.action} — ${r.reason}`)
+            .join("\n")
+            .slice(0, 4000),
+          risk: "high",
+        },
+      });
+      if (approval.status === "pending") {
+        this.emit({
+          ts: new Date().toISOString(),
+          runId: pipelineRunId,
+          projectId,
+          actor: "system",
+          type: "permission.requested",
+          sessionId: executionId,
+          permissionId,
+          tool: primary?.resource ?? "permission",
+        });
+      }
+      const resolved = await gate.waitAnyResolution([approval.id], () =>
+        input.isCancelled?.() ?? false,
+      );
+      if (resolved === null) {
+        throw new PermissionError(
+          "permission/cancelled",
+          "pipeline cancelled while awaiting permission approval",
+        );
+      }
+      if (resolved.status !== "approved") {
+        this.emitPermissionResolved(executionId, permissionId, pipelineRunId, projectId, "deny");
+        throw new PermissionError(
+          "approval/denied",
+          `permission denied for ${def.role}: ${result.summary}`,
+        );
+      }
+      this.emitPermissionResolved(executionId, permissionId, pipelineRunId, projectId, "allow");
+    }
+
+    return result;
+  }
+
+  /** Emit the canonical resolved event for a consumed permission decision. */
+  private emitPermissionResolved(
+    executionId: string,
+    permissionId: string,
+    runId: string,
+    projectId: string,
+    decision: "allow" | "deny",
+  ): void {
+    this.emit({
+      ts: new Date().toISOString(),
+      runId,
+      projectId,
+      actor: "system",
+      type: "permission.resolved",
+      sessionId: executionId,
+      permissionId,
+      decision,
     });
   }
 

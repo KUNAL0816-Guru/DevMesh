@@ -27,6 +27,14 @@ export interface AgentExecutionRequest {
     /** JSON Schema the structured output should conform to. */
     schema: Record<string, unknown>;
   };
+  /**
+   * Per-request auto-approval override (Phase 14C). DevMesh core decides this
+   * from the permission policy BEFORE the runtime is started; `true` asks the
+   * runtime to blanket-approve permission prompts (OpenCode `--auto`),
+   * `false`/absent keeps the runtime's configured default. Only an ALLOW
+   * policy decision ever sets this to true.
+   */
+  autoApprove?: boolean;
 }
 
 export type AgentStreamEvent =

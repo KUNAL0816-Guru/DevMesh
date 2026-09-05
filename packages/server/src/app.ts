@@ -38,6 +38,7 @@ import { VERIFICATION_COMMAND_PATTERN } from "./executions/commands.js";
 import { Orchestrator } from "./orchestrator.js";
 import type { DomainEvent } from "@devmesh/contracts";
 import { PipelineEventStream } from "./pipeline-sse.js";
+import type { ProfileProvider } from "./policy.js";
 
 export const APP_VERSION = "0.1.0";
 
@@ -98,6 +99,12 @@ export interface BuildAppOptions {
   /** Override for the client dist directory (tests). Resolved to
    *  packages/client/dist when omitted. */
   staticRoot?: string;
+  /**
+   * Phase 14C: overrides the canonical permission baselines for every agent
+   * role. Tests inject profiles that produce deny/ask policy decisions; the
+   * production composition root omits it and uses the manifest baselines.
+   */
+  policyBaselines?: ProfileProvider;
 }
 
 /** Construct the DevMesh control-plane HTTP application (not yet listening). */
@@ -115,6 +122,10 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
   const git = new GitService();
   const budgetConfig = budgetConfigFromConfig(opts.config);
   const priceRules = pricingRulesFromConfig(opts.config);
+  // Approval workflow owner (Phase 9B): the single gate shared by the REST
+  // layer and the orchestrator. Constructed before ExecutionService so a
+  // Phase 14C ASK policy can be bridged through it.
+  const approvals = new ApprovalGate(opts.storage);
   const executions = new ExecutionService({
     storage: opts.storage,
     workspaces: opts.workspaces,
@@ -125,14 +136,14 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
     defaultModel: opts.config.opencodeModel,
     ...(budgetConfig ? { budget: budgetConfig } : {}),
     ...(priceRules.length > 0 ? { pricing: createPriceTable(priceRules) } : {}),
+    approvalGate: approvals,
+    autoApprove: opts.config.opencodeAutoApprove,
+    ...(opts.policyBaselines ? { policyBaselines: opts.policyBaselines } : {}),
   });
 
   // In-memory registry of active pipeline runs (runId → Orchestrator).
   // Cleared on every terminal path; no memory leak on normal operation.
   const runningPipelines = new Map<string, Orchestrator>();
-
-  // Approval workflow owner: persistence + event emission for create/resolve.
-  const approvals = new ApprovalGate(opts.storage);
 
   const publicExecution = (rec: Awaited<ReturnType<ExecutionService["start"]>>) => ({
     id: rec.id,
