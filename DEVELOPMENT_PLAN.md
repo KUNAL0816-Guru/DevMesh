@@ -1,9 +1,9 @@
 # DevMesh Development Plan
 
 > Status: active
-> Last updated: 2026-09-04 (post Phase 13G — Phases 0–12 complete; Phases 13A–13G complete; Phase 13H next; Phase 14 planned)
+> Last updated: 2026-09-05 (post Phase 14B — Phases 0–12 complete; Phases 13A–13G complete; Phase 13H next; Phase 14A and 14B complete; Phase 14C next)
 > Reference: docs/adr/0001-approved-architecture.md
-> Test baseline: 645 passed, 5 skipped, 0 failed (Phase 13G; historical: Phase 12 was 607 passed, Phase 11 was 590 passed, Phase 10 was 574 passed)
+> Test baseline: 700 passed, 5 skipped, 0 failed (Phase 14B; historical: Phase 14A was 679 passed, Phase 13G was 645 passed, Phase 12 was 607 passed, Phase 11 was 590 passed, Phase 10 was 574 passed)
 
 ---
 
@@ -29,7 +29,7 @@ agent runtime is OpenCode behind a swappable adapter port.
 - Context blackboard REST API (Phase 7A)
 - Terminal-state-safe lifecycle mutations and classified error handling (Phase 6E)
 - 4 agent definitions with role-specific permissions and system prompts
-- SQLite storage with 8 migrations, 8+ repositories
+- SQLite storage with 11 migrations, 10 repositories
 - Workspace service with symlink escape protection and FIFO mutex locking
 - Usage reporting + persistence (Phase 8A): runtime-reported tokens recorded per execution
 - Usage aggregation (Phase 8B): read-only run/task rollups with correct unknown semantics
@@ -45,6 +45,20 @@ agent runtime is OpenCode behind a swappable adapter port.
   with pipeline list/detail views, live SSE event stream, task DAG graph,
   artifact listing with bounded payload preview, per-run usage summary with
   per-task breakdown, and approval queue with approve/reject actions (Phase 13G).
+- Bearer authentication (Phase 14A): optional `Authorization: Bearer <token>`
+  auth gated by `DEVMESH_AUTH_TOKEN`. When unset/empty, authentication stays
+  disabled and the existing single-user workflow is preserved unchanged.
+  `/health`, static assets, and SPA fallback remain unauthenticated; protected
+  API prefixes require a valid token (constant-time comparison, no credential
+  leakage, 401 `auth/unauthenticated` for auth failures). `GET /auth/me`
+  returns the authenticated principal (`AuthPrincipal`, `method: "bearer"`).
+- Project authorization & isolation (Phase 14B): projects record an
+  `ownerPrincipalId`; an authenticated principal only lists/accesses projects it
+  owns. Central `authorize.ts` rejects cross-project access with 403
+  (`auth/forbidden`), preserves 404 for missing resources, makes `POST
+  /approvals` authorize and store against the run's authoritative project, and
+  skips all checks in single-user mode (no principal ⇒ existing dev workflows
+  work).
 
 ---
 
@@ -57,15 +71,17 @@ packages/
                    plan integrity validation
   runtime/         AgentRuntime port interface (incl. outputFormat/structured),
                    FakeRuntime, RuntimeError
-  storage/         SQLite persistence (node:sqlite), 9 repositories, 8 migrations,
-                   EventBus, diagnostic queries (pipelineRunSummary/pipelineHealth)
+  storage/         SQLite persistence (node:sqlite), 10 repositories, 11 migrations,
+                   EventBus, diagnostic queries (pipelineRunSummary/pipelineHealth),
+                   project owner + context project scoping (Phase 14B)
   workspace/       Git facade, file I/O, path safety, per-key async mutex
   agents/          AgentRegistry, 4 built-in agent definitions
   opencode-adapter/ OpenCode CLI adapter (NDJSON, process-group kill, outputFormat)
   server/          Fastify HTTP server, orchestrator, execution service,
                    verification (SHA-256 + independent test replay), artifact
                    builder (structured-first, text-parsing fallback), SSE streaming,
-                   approval workflow (ApprovalGate + REST endpoints)
+                   approval workflow (ApprovalGate + REST endpoints),
+                   bearer authentication (Phase 14A) + project authorization (Phase 14B)
 ```
 
 ---
@@ -1408,41 +1424,156 @@ browser.
 included in the backend test baseline (645 passed). Backend tests added in
 13A and 13C are included in that baseline.
 
-### Phase 14: Security Hardening — AuthN/Z, Permissions, MCP & Plugin Packaging (Future, Not Yet Started)
+### Phase 14: Security Hardening — 14A & 14B COMPLETE; 14C NEXT; 14D–14E NOT STARTED
 
 **Goal:** Production-hardening items referenced across the ADR and README:
 authentication/authorization for a multi-user deployment, wiring the existing
 `permission.requested`/`permission.resolved` events, and packaging the OpenCode
 plugin and MCP server.
 
-#### Implementation
+Phase 14 is delivered as sub-phases. Phase 14A (authentication foundation) and
+Phase 14B (authorization & project isolation) are complete; together they
+establish the authentication + project-authorization foundation. Phase 14C
+(permission policy) is the next sub-phase; Phase 14D (OpenCode plugin) and
+Phase 14E (MCP server) are not yet started.
 
-1. **AuthN/Z** (`packages/auth` new): API token / bearer authn, per-project
-   authorization; a single-user mode remains the default.
-2. **Permissions**: route `permission.requested` / `permission.resolved`
-   through a policy check in the orchestrator; deny-by-default for flagged
-   actions.
-3. **OpenCode plugin**: package the plugin shipped into projects.
-4. **MCP server**: expose DevMesh state (pipelines, artifacts, context) to
-   tools over MCP.
+#### Phase 14A: Authentication Foundation — COMPLETE (commit `dddf8c8`)
 
-#### Acceptance Criteria
+**Goal:** Add API-token / bearer authentication so a deployment that sets
+`DEVMESH_AUTH_TOKEN` can require `Authorization: Bearer <token>` on protected
+API routes. When the token is unset or empty, authentication stays disabled and
+the existing single-user behavior is preserved unchanged.
 
-- [ ] Unauthenticated requests are rejected in multi-user mode
-- [ ] Per-project authorization is enforced
+| Deliverable | Status |
+|---|---|
+| `AuthPrincipal` contract (`packages/contracts/src/auth-principal.ts`) — identity-only (`id`, `method: "bearer"`); carries no authorization data (no roles, permissions, memberships) | done |
+| Centralized authentication hook `registerAuth()` (`packages/server/src/auth.ts`) | done |
+| `DEVMESH_AUTH_TOKEN` configuration (`AuthConfig` / `authConfigFromConfig` in `config.ts`); unset/empty ⇒ auth disabled (single-user mode) | done |
+| API-path allowlist — only `/projects`, `/pipelines`, `/executions`, `/approvals`, `/auth` prefixes require authentication; `/health`, static assets, and SPA fallback stay unauthenticated | done |
+| On success the authenticated principal is injected as `request.auth` for downstream authorization (Phase 14B) | done |
+| `GET /auth/me` — returns the authenticated principal, or a synthetic `{ id: "devmesh:default", method: "bearer" }` principal when auth is disabled | done |
+| 401 `auth/unauthenticated` for missing / malformed / invalid credentials (auth failures are 401, never 403) | done |
+| Constant-time token comparison via `crypto.timingSafeEqual` (padded across length mismatch) | done |
+| Credential non-disclosure — Authorization headers are never logged and error responses never echo the supplied or configured token | done |
+| Error mapping — `auth/unauthenticated` → 401 in `errors-map.ts`; standard `{error: {code, message}}` envelope preserved | done |
+| `auth.test.ts` — auth-disabled single-user behavior, valid-token success, missing/malformed/invalid-token 401, principal context, no credential leakage, error-envelope consistency, health/static/SPA boundary, config parsing, `registerAuth` hook, `/auth/me` | done |
+
+**Acceptance criteria (14A):**
+
+- [x] Unauthenticated requests to protected API routes are rejected with 401
+      when auth is enabled
+- [x] Valid `Authorization: Bearer <token>` succeeds on protected API routes
+- [x] `DEVMESH_AUTH_TOKEN` unset/empty ⇒ authentication disabled, existing
+      single-user workflow unchanged
+- [x] `/health`, static assets, and SPA fallback remain unauthenticated
+- [x] Auth failures never disclose credentials and never produce 403
+
+**Out of scope (NOT Phase 14A):** OAuth/OIDC, sessions, JWT, RBAC, admin roles,
+and multi-user membership are not implemented in Phase 14A — it is
+authentication only.
+
+#### Phase 14B: Authorization & Project Isolation — COMPLETE (commit `c5a3058`)
+
+**Goal:** Add centralized project-scoped authorization: an authenticated
+principal may access only resources belonging to projects it owns. With
+authentication disabled (single-user mode) no principal exists and all
+authorization checks are skipped, preserving existing single-user development
+workflows.
+
+**Project ownership:**
+
+| Deliverable | Status |
+|---|---|
+| `ProjectRecord.ownerPrincipalId` (workspace `CreateWorkspaceOptions` + storage `ProjectRecord`/`ProjectRow`) | done |
+| Migration 11 adds `projects.owner_principal_id` (NULL in single-user mode) | done |
+| Project creation associates the authenticated principal as owner (`currentPrincipal(req).id`); single-user mode stamps NULL (no-owner) | done |
+| `GET /projects` lists only owned projects when authenticated (`ProjectRepository.listByOwner`) | done |
+| `GET /projects/:projectId` returns the project for its owner; foreign project → 403 | done |
+
+**Central authorization (`packages/server/src/authorize.ts`):**
+
+| Deliverable | Status |
+|---|---|
+| `currentPrincipal()` — reads `request.auth`; undefined when auth disabled | done |
+| `AuthorizationError` (`code: "auth/forbidden"`) mapped to HTTP 403 in `errors-map.ts` | done |
+| `authorizeProject()` — no principal ⇒ ALLOW (skip); owner match ⇒ ALLOW; otherwise throw `AuthorizationError` (→ 403) | done |
+| `authorizeResource()` — authorizes a project-scoped resource; null resource ⇒ null (route keeps its 404) | done |
+| `authorizeRun()` / `authorizeExecution()` / `authorizeApproval()` — resolve the resource and authorize against its project | done |
+
+**Project/resource isolation:**
+
+| Deliverable | Status |
+|---|---|
+| Project-scoped routes (`/projects/:id/pipelines`, `tasks`, `artifacts`, `context`, `approvals`, `executions`, `POST /projects/:id/pipeline`) authorize via `authorizeProject` | done |
+| Pipeline-scoped routes (get, tasks, events, events/stream SSE, artifacts, executions, usage, cancel, resume) authorize via `authorizeRun` against the run's project | done |
+| Execution get/cancel authorize via `authorizeExecution` | done |
+| Approval get/resolve authorize via `authorizeApproval` | done |
+| Context entries scoped per project — migration 11 adds `context_entries.project_id`; `latestAllProject`/`latestByKeyProject`/`historyProject`/`getProjectId`; POST stores the route's `projectId` | done |
+| `GET /pipelines/:runId/events/stream` (SSE) authorized before the stream opens | done |
+| Cross-project IDOR protection — foreign projects/runs/executions/approvals/artifacts/context return 403 on every route | done |
+| Authorization placed before runtime-state checks where applicable (e.g. `runtime/not-configured` 503 returned only after authorization passes) | done |
+| `POST /approvals` uses the run's persisted `projectId` as authoritative: run authorized first; client-supplied `projectId` must match the run's project (else 400 `request/invalid`); stored approval `projectId` comes from the run | done |
+| Project/run mismatch validation — `body.projectId !== run.projectId` ⇒ 400; `taskId` not belonging to the run ⇒ 400 | done |
+
+**Error semantics (14B):**
+
+- unauthenticated → 401 (`auth/unauthenticated`)
+- authenticated but unauthorized → 403 (`auth/forbidden`)
+- missing resources retain their 404 behavior (authorization returns null and
+  the route handler returns 404)
+- approval/project mismatch → 400 (`request/invalid`)
+
+**Acceptance criteria (14B):**
+
+- [x] Per-project authorization is enforced on all project- and pipeline-scoped
+      routes
+- [x] Cross-project IDOR is blocked with 403
+- [x] Single-user mode (auth disabled) skips authorization — existing dev
+      workflows remain functional
+- [x] Error semantics correct: 401 unauthenticated / 403 unauthorized / 404
+      missing / 400 mismatch
+
+**What Phase 14B does NOT implement:** a membership model, roles/RBAC, admin
+permissions, organization/team membership, OAuth/OIDC, a permission policy
+engine, a permission decision workflow, the OpenCode plugin, and the MCP server.
+A principal either owns a project or is denied — there is no role/membership
+concept yet (that belongs to Phase 14C+).
+
+#### Phase 14C: Permission Policy — NOT STARTED (NEXT)
+
+**Goal:** Route the existing `permission.requested` / `permission.resolved`
+events through a policy check in the orchestrator; deny-by-default for flagged
+actions.
+
+**Acceptance Criteria**
+
 - [ ] Permission request/resolve events drive a policy decision
+
+#### Phase 14D: OpenCode Plugin — NOT STARTED
+
+**Goal:** Package the plugin shipped into projects.
+
+**Acceptance Criteria**
+
 - [ ] OpenCode plugin packages and installs into a project
+
+#### Phase 14E: MCP Server — NOT STARTED
+
+**Goal:** Expose DevMesh state (pipelines, artifacts, context) to tools over MCP.
+
+**Acceptance Criteria**
+
 - [ ] MCP server exposes pipelines/artifacts/context
 
-#### Required Tests
+**Required Tests (remaining Phase 14 sub-phases)**
 
 | File | Tests |
 |---|---|
-| `auth/auth.test.ts` (new) | Token auth, project authorization |
-| `server/app.test.ts` | Auth middleware, permission flow, MCP routes |
-| `integrations/plugin.test.ts` (new) | Plugin packaging/install |
+| `server/app.test.ts` | Permission flow (14C), MCP routes (14E) — auth middleware already covered by 14A/14B via `server/auth.test.ts` |
+| `integrations/plugin.test.ts` (new) | Plugin packaging/install (14D) |
 
-**Estimated new tests: ~12**
+**Estimated new tests: ~12** (14C–14E; 14A delivered 53 tests in `auth.test.ts`,
+14B delivered 2 storage tests plus the `auth.test.ts` authorization matrix)
 
 ---
 
@@ -1466,11 +1597,12 @@ plugin and MCP server.
 | 11 | Additional agent roles | Amendment 3 | ~8 | ✅ Complete |
 | 12 | Local/offline model adapter | Amendment 9 | ~5 | ✅ Complete (17 tests) |
 | 13 | Frontend/UI | Amendment 7 | ~2 | 13A–13G ✅ Complete; 13H ⬜ Next |
-| 14 | Security hardening, permissions, MCP & plugin packaging | ADR/README | ~12 | Not started |
+| 14 | Security hardening, permissions, MCP & plugin packaging | ADR/README | ~12 | 14A ✅ Complete; 14B ✅ Complete; 14C ⬜ Next; 14D–14E ⬜ Not started |
 
-> Phases 13–14 are tracked in the roadmap. Phase 13A–13G are implemented;
-> Phase 13H is the next sub-phase. Detailed goals, acceptance criteria, and
-> required tests for each appear above.
+> Phases 13–14 are tracked in the roadmap. Phase 13A–13G and the Phase 14A/14B
+> security foundation (authentication + project authorization) are implemented;
+> Phase 13H and Phase 14C are the next sub-phases. Detailed goals, acceptance
+> criteria, and required tests for each appear above.
 >
 > **Roadmap note (Phase 9B boundary):** the approval gate currently guards the
 > linear chain (initial run + resume). Multi-task plan (DAG) tasks — Phase 7F —
@@ -1482,7 +1614,7 @@ plugin and MCP server.
 
 ---
 
-## Appendix: Test File Inventory (post Phase 13G)
+## Appendix: Test File Inventory (post Phase 14B)
 
 | File | Tests | Area |
 |---|---|---|
@@ -1498,7 +1630,7 @@ plugin and MCP server.
 | `runtime/src/fake.test.ts` | 6 | FakeRuntime (incl. structured output) |
 | `agents/src/agents.test.ts` | 8 | Registry + builtins |
 | `opencode-adapter/src/adapter.test.ts` | 7 | Adapter integration |
-| `storage/src/storage.test.ts` | 94 | All repositories + migrations + diagnostics + usage aggregation (incl. committed-only 8C variants) + approvals (9A) |
+| `storage/src/storage.test.ts` | 96 | All repositories + migrations + diagnostics + usage aggregation (incl. committed-only 8C variants) + approvals (9A) + project-owner & context project scoping (14B) |
 | `workspace/src/git.test.ts` | 20 | Git operations + checkpoints |
 | `workspace/src/locks.test.ts` | 6 | MutexMap |
 | `workspace/src/paths.test.ts` | 5 | Path safety |
@@ -1512,15 +1644,16 @@ plugin and MCP server.
 | `server/src/executions/budget-service.test.ts` | 9 | Budget gate + derived cost via HTTP (8C) |
 | `server/src/budget-orchestrator.test.ts` | 4 | Orchestrator budget reaction (8C) |
 | `server/src/pipeline-sse.test.ts` | 24 | SSE streaming |
+| `server/src/auth.test.ts` | 53 | Phase 14A bearer auth foundation + Phase 14B per-project authorization / IDOR isolation (14A, 14B) |
 | `server/src/orchestrator-real.test.ts` | 1 | Real OpenCode (gated) |
 | `server/src/opencode-real.test.ts` | 4 | Real OpenCode E2E (gated) |
 | `client/src/utils/format.test.ts` | ~20 | Formatting helpers (Phase 13F + Phase 13G approval display) |
 | `client/src/hooks/usePipelineStream.test.ts` | ~6 | SSE stream hook (Phase 13E) |
-| **Total (listed)** | **~501 `it(`/`test(` occurrences summed** | 13G adds ~10 across format.test.ts |
+| **Total (listed)** | **~556 `it(`/`test(` occurrences summed** | 14A adds 53 in auth.test.ts; 14B adds +2 in storage.test.ts (owner isolation + context scoping) |
 
 > Counts above reflect the `it(`/`test(` occurrences per file and are
 > approximate (vitest's numeric total includes dynamically-defined subtests);
-> the authoritative number comes from `npm test` (645 passed, 5 skipped, 0 failed).
+> the authoritative number comes from `npm test` (700 passed, 5 skipped, 0 failed).
 > Frontend tests (client package) run in a separate Vitest config and are not
 > included in that count.
 
