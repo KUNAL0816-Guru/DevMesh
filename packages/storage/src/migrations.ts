@@ -244,6 +244,19 @@ const MIGRATIONS: readonly Migration[] = [
        CREATE INDEX idx_approvals_run ON approvals(run_id);`,
     ],
   },
+  {
+    version: 11,
+    name: "project-ownership-and-context-isolation",
+    up: [
+      `ALTER TABLE projects ADD COLUMN owner_principal_id TEXT;
+       -- NULL in single-user mode (auth disabled). When auth is enabled,
+       -- set to the principal id of the project creator (e.g. "devmesh:default").`,
+      `ALTER TABLE context_entries ADD COLUMN project_id TEXT;
+       -- NULL for legacy entries created before Phase 14B.
+       -- Required for new entries created in auth-enabled mode.
+       CREATE INDEX idx_context_project ON context_entries(project_id, namespace);`,
+    ],
+  },
 ];
 
 function currentVersion(db: DatabaseSync): number {

@@ -24,6 +24,8 @@ export interface ProjectRecord {
   name: string;
   rootPath: string;
   createdAt: string;
+  /** Phase 14B: Principal who created this project. NULL in single-user mode. */
+  ownerPrincipalId?: string | null;
 }
 
 /** Persistence port for project registrations (implemented by storage). */
@@ -48,6 +50,8 @@ export interface WorkspaceHandle {
 export interface CreateWorkspaceOptions {
   /** Optional explicit creation timestamp override (ISO string). */
   createdAt?: string;
+  /** Phase 14B: Principal who creates this project (sets owner). */
+  ownerPrincipalId?: string | null;
 }
 
 export interface ReadFileOptions {
@@ -128,6 +132,7 @@ export class WorkspaceService {
       name: slug,
       rootPath: root,
       createdAt: options.createdAt ?? new Date().toISOString(),
+      ownerPrincipalId: options.ownerPrincipalId ?? null,
     });
     return { projectId: id, name: slug, root };
   }

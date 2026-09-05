@@ -29,6 +29,7 @@ interface ProjectRow {
   name: string;
   root_path: string;
   created_at: string;
+  owner_principal_id: string | null;
 }
 
 export interface ProjectRecord {
@@ -36,6 +37,8 @@ export interface ProjectRecord {
   name: string;
   rootPath: string;
   createdAt: string;
+  /** Phase 14B: Principal who created this project. NULL in single-user mode. */
+  ownerPrincipalId?: string | null;
 }
 
 const eventJson = <T>(json: string, what: string): T => {
@@ -54,6 +57,7 @@ function rowToProject(r: ProjectRow): ProjectRecord {
     name: r.name,
     rootPath: r.root_path,
     createdAt: r.created_at,
+    ownerPrincipalId: r.owner_principal_id ?? null,
   };
 }
 
@@ -109,10 +113,11 @@ type ContextRow = {
   created_by: string;
   created_at: string;
   supersedes: string | null;
+  project_id: string | null;
 };
 
 const CONTEXT_COLUMNS =
-  "id, namespace, key, value, created_by, created_at, supersedes";
+  "id, namespace, key, value, created_by, created_at, supersedes, project_id";
 
 function rowToContextEntry(r: ContextRow): ContextEntry {
   return contextEntrySchema.parse({
@@ -137,10 +142,10 @@ export class ProjectRepository {
     projectIdSchema.parse(p.id);
     this.db
       .prepare(
-        `INSERT INTO projects (id, name, root_path, created_at)
-         VALUES (?, ?, ?, ?)`,
+        `INSERT INTO projects (id, name, root_path, created_at, owner_principal_id)
+         VALUES (?, ?, ?, ?, ?)`,
       )
-      .run(p.id, p.name, p.rootPath, p.createdAt);
+      .run(p.id, p.name, p.rootPath, p.createdAt, p.ownerPrincipalId ?? null);
   }
 
   get(id: ProjectId): ProjectRecord | null {
@@ -161,6 +166,14 @@ export class ProjectRepository {
     const rows = this.db
       .prepare("SELECT * FROM projects ORDER BY created_at")
       .all() as unknown as ProjectRow[];
+    return rows.map(rowToProject);
+  }
+
+  /** Phase 14B: List projects owned by a specific principal. */
+  listByOwner(ownerPrincipalId: string): ProjectRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM projects WHERE owner_principal_id = ? ORDER BY created_at")
+      .all(ownerPrincipalId) as unknown as ProjectRow[];
     return rows.map(rowToProject);
   }
 }
@@ -389,14 +402,14 @@ export class ArtifactRepository {
 export class ContextRepository {
   constructor(private readonly db: Database) {}
 
-  put(entry: ContextEntry): void {
+  put(entry: ContextEntry, projectId?: string | null): void {
     const e = contextEntrySchema.parse(entry);
     this.db
       .prepare(
-        `INSERT INTO context_entries (id, namespace, key, value, created_by, created_at, supersedes)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO context_entries (id, namespace, key, value, created_by, created_at, supersedes, project_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(e.id, e.namespace, e.key, JSON.stringify(e.value), e.createdBy, e.createdAt, e.supersedes ?? null);
+      .run(e.id, e.namespace, e.key, JSON.stringify(e.value), e.createdBy, e.createdAt, e.supersedes ?? null, projectId ?? null);
   }
 
   get(id: ContextEntryId): ContextEntry | null {
@@ -404,6 +417,14 @@ export class ContextRepository {
       .prepare(`SELECT ${CONTEXT_COLUMNS} FROM context_entries WHERE id = ?`)
       .get(id) as unknown as ContextRow | undefined;
     return row ? rowToContextEntry(row) : null;
+  }
+
+  /** Get the project_id associated with a context entry (for authorization). */
+  getProjectId(id: ContextEntryId): string | null {
+    const row = this.db
+      .prepare(`SELECT project_id FROM context_entries WHERE id = ?`)
+      .get(id) as { project_id: string | null } | undefined;
+    return row?.project_id ?? null;
   }
 
   /** Latest entry per key within a namespace (superseded entries ignored). */
@@ -416,6 +437,24 @@ export class ContextRepository {
          ORDER BY created_at`,
       )
       .all(namespace) as unknown as ContextRow[];
+    const map = new Map<string, ContextEntry>();
+    for (const row of rows) {
+      const entry = rowToContextEntry(row);
+      map.set(entry.key, entry);
+    }
+    return map;
+  }
+
+  /** Latest entry per key within a namespace scoped to a project. */
+  latestByKeyProject(namespace: string, projectId: string): Map<string, ContextEntry> {
+    const rows = this.db
+      .prepare(
+        `SELECT ${CONTEXT_COLUMNS} FROM context_entries
+         WHERE namespace = ? AND project_id = ?
+           AND id NOT IN (SELECT supersedes FROM context_entries WHERE supersedes IS NOT NULL)
+         ORDER BY created_at`,
+      )
+      .all(namespace, projectId) as unknown as ContextRow[];
     const map = new Map<string, ContextEntry>();
     for (const row of rows) {
       const entry = rowToContextEntry(row);
@@ -441,12 +480,40 @@ export class ContextRepository {
     return map;
   }
 
+  /** Latest entry per key across all namespaces scoped to a project. */
+  latestAllProject(projectId: string): Map<string, ContextEntry> {
+    const rows = this.db
+      .prepare(
+        `SELECT ${CONTEXT_COLUMNS} FROM context_entries
+         WHERE project_id = ?
+           AND id NOT IN (SELECT supersedes FROM context_entries WHERE supersedes IS NOT NULL)
+         ORDER BY namespace, created_at`,
+      )
+      .all(projectId) as unknown as ContextRow[];
+    const map = new Map<string, ContextEntry>();
+    for (const row of rows) {
+      const entry = rowToContextEntry(row);
+      map.set(`${entry.namespace}:${entry.key}`, entry);
+    }
+    return map;
+  }
+
   history(key: string, namespace: string): ContextEntry[] {
     const rows = this.db
       .prepare(
         `SELECT ${CONTEXT_COLUMNS} FROM context_entries WHERE namespace = ? AND key = ? ORDER BY created_at`,
       )
       .all(namespace, key) as unknown as ContextRow[];
+    return rows.map(rowToContextEntry);
+  }
+
+  /** History scoped to a project. */
+  historyProject(key: string, namespace: string, projectId: string): ContextEntry[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ${CONTEXT_COLUMNS} FROM context_entries WHERE namespace = ? AND key = ? AND project_id = ? ORDER BY created_at`,
+      )
+      .all(namespace, key, projectId) as unknown as ContextRow[];
     return rows.map(rowToContextEntry);
   }
 }

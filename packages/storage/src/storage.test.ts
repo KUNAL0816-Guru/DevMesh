@@ -165,6 +165,25 @@ describe("projects", () => {
     ).toThrow(); // duplicate name
     s.close();
   });
+
+  it("isolates projects by owner principal (listByOwner)", () => {
+    const s = fileStorage();
+    const ownedA1 = { id: newProjectId(), name: "a1", rootPath: "/tmp/a1", createdAt: new Date().toISOString() };
+    const ownedA2 = { id: newProjectId(), name: "a2", rootPath: "/tmp/a2", createdAt: new Date().toISOString() };
+    const ownedB = { id: newProjectId(), name: "b1", rootPath: "/tmp/b1", createdAt: new Date().toISOString() };
+
+    s.projects.insert({ ...ownedA1, ownerPrincipalId: "principal-a" });
+    s.projects.insert({ ...ownedA2, ownerPrincipalId: "principal-a" });
+    s.projects.insert({ ...ownedB, ownerPrincipalId: "principal-b" });
+
+    expect(s.projects.list()).toHaveLength(3);
+    expect(s.projects.listByOwner("principal-a").map((p) => p.id).sort()).toEqual(
+      [ownedA1.id, ownedA2.id].sort(),
+    );
+    expect(s.projects.listByOwner("principal-b").map((p) => p.id)).toEqual([ownedB.id]);
+    expect(s.projects.listByOwner("nobody")).toHaveLength(0);
+    s.close();
+  });
 });
 
 describe("tasks", () => {
@@ -307,6 +326,42 @@ describe("context (blackboard)", () => {
     ]);
     expect(s.context.get(v1.id)?.supersedes).toBeUndefined();
     expect(s.context.get(v2.id)?.supersedes).toBe(v1.id);
+    s.close();
+  });
+
+  it("scopes entries by project (latestAllProject / latestByKeyProject / historyProject / getProjectId)", () => {
+    const s = fileStorage();
+    const pA = newProjectId();
+    const pB = newProjectId();
+    s.projects.insert({ id: pA, name: "pA", rootPath: "/tmp/pA", createdAt: new Date().toISOString(), ownerPrincipalId: "principal-a" });
+    s.projects.insert({ id: pB, name: "pB", rootPath: "/tmp/pB", createdAt: new Date().toISOString(), ownerPrincipalId: "principal-b" });
+
+    const a1 = makeContextEntry({ namespace: "decision", key: "k", value: "a", createdBy: "architect" });
+    const a2 = makeContextEntry({ namespace: "spec", key: "s", value: "a-spec", createdBy: "architect" });
+    const b1 = makeContextEntry({ namespace: "decision", key: "k", value: "b", createdBy: "architect" });
+    s.context.put(a1, pA);
+    s.context.put(a2, pA);
+    s.context.put(b1, pB);
+
+    expect(s.context.getProjectId(a1.id)).toBe(pA);
+    expect(s.context.getProjectId(b1.id)).toBe(pB);
+    expect(s.context.getProjectId(a2.id)).toBe(pA);
+
+    const allA = s.context.latestAllProject(pA);
+    expect([...allA.keys()].sort()).toEqual(["decision:k", "spec:s"]);
+    expect(allA.get("decision:k")?.value).toBe("a");
+
+    const allB = s.context.latestAllProject(pB);
+    expect([...allB.keys()]).toEqual(["decision:k"]);
+    expect(allB.get("decision:k")?.value).toBe("b");
+
+    expect(s.context.latestByKeyProject("decision", pA).get("k")?.value).toBe("a");
+    expect(s.context.latestByKeyProject("decision", pB).get("k")?.value).toBe("b");
+    expect(s.context.latestByKeyProject("spec", pA).get("s")?.value).toBe("a-spec");
+    expect(s.context.latestByKeyProject("spec", pB)).toEqual(new Map());
+
+    expect(s.context.historyProject("k", "decision", pA).map((e) => e.value)).toEqual(["a"]);
+    expect(s.context.historyProject("k", "decision", pB).map((e) => e.value)).toEqual(["b"]);
     s.close();
   });
 });

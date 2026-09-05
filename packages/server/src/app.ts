@@ -24,6 +24,13 @@ import type { Config } from "./config.js";
 import { authConfigFromConfig, budgetConfigFromConfig, pricingRulesFromConfig } from "./config.js";
 import { normalizeError } from "./errors-map.js";
 import { registerAuth } from "./auth.js";
+import {
+  currentPrincipal,
+  authorizeProject,
+  authorizeRun,
+  authorizeExecution,
+  authorizeApproval,
+} from "./authorize.js";
 import { GitService } from "@devmesh/workspace";
 import { ExecutionService } from "./executions/service.js";
 import { createPriceTable } from "./executions/pricing.js";
@@ -240,7 +247,10 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "request/invalid", message: "body must be {name: string}" },
       });
     }
-    const handle = opts.workspaces.create(parsed.data.name);
+    const principal = currentPrincipal(req);
+    const handle = opts.workspaces.create(parsed.data.name, {
+      ownerPrincipalId: principal?.id ?? null,
+    });
     const record = opts.storage.projects.get(handle.projectId);
     if (!record) {
       return reply.status(500).send({
@@ -250,8 +260,12 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
     return reply.status(201).send(toApiProject(record));
   });
 
-  app.get("/projects", async () => {
-    return { projects: opts.storage.projects.list().map(toApiProject) };
+  app.get("/projects", async (req) => {
+    const principal = currentPrincipal(req);
+    const projects = principal
+      ? opts.storage.projects.listByOwner(principal.id)
+      : opts.storage.projects.list();
+    return { projects: projects.map(toApiProject) };
   });
 
   app.get("/projects/:projectId", async (req, reply) => {
@@ -273,16 +287,12 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "workspace/not-found", message: "no such project" },
       });
     }
+    authorizeProject(opts.storage, currentPrincipal(req), parsedId.data);
     return toApiProject(rec);
   });
 
   // -- executions (runtime-neutral; no shell passthrough) --------------------
   app.post("/projects/:projectId/executions", async (req, reply) => {
-    if (!executions.configured) {
-      return reply.status(503).send({
-        error: { code: "runtime/not-configured", message: "no agent runtime wired" },
-      });
-    }
     const params = z.strictObject({ projectId: z.string() }).safeParse(req.params);
     if (!params.success) {
       return reply.status(400).send({
@@ -293,6 +303,12 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
     if (!parsedId.success) {
       return reply.status(404).send({
         error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    authorizeProject(opts.storage, currentPrincipal(req), parsedId.data);
+    if (!executions.configured) {
+      return reply.status(503).send({
+        error: { code: "runtime/not-configured", message: "no agent runtime wired" },
       });
     }
     const parsedBody = startExecutionBody.safeParse(req.body);
@@ -336,6 +352,7 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "workspace/not-found", message: "no such project" },
       });
     }
+    authorizeProject(opts.storage, currentPrincipal(req), parsedId.data);
     try {
       opts.workspaces.get(parsedId.data); // existence + workspace liveness check
     } catch {
@@ -355,7 +372,7 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "workspace/not-found", message: "no such execution" },
       });
     }
-    const rec = opts.storage.executions.get(params.data.executionId);
+    const rec = authorizeExecution(opts.storage, currentPrincipal(req), params.data.executionId);
     if (!rec) {
       return reply.status(404).send({
         error: { code: "workspace/not-found", message: "no such execution" },
@@ -371,9 +388,15 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "workspace/not-found", message: "no such execution" },
       });
     }
+    const rec = authorizeExecution(opts.storage, currentPrincipal(req), params.data.executionId);
+    if (!rec) {
+      return reply.status(404).send({
+        error: { code: "workspace/not-found", message: "no such execution" },
+      });
+    }
     try {
-      const rec = await executions.cancel(params.data.executionId);
-      return reply.status(202).send({ execution: publicExecution(rec) });
+      const cancelled = await executions.cancel(params.data.executionId);
+      return reply.status(202).send({ execution: publicExecution(cancelled) });
     } catch (err) {
       const problem = normalizeError(err);
       return reply.status(problem.status).send({
@@ -388,11 +411,6 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
   });
 
   app.post("/projects/:projectId/pipeline", async (req, reply) => {
-    if (!executions.configured) {
-      return reply.status(503).send({
-        error: { code: "runtime/not-configured", message: "no agent runtime wired" },
-      });
-    }
     const params = z.strictObject({ projectId: z.string() }).safeParse(req.params);
     if (!params.success) {
       return reply.status(400).send({
@@ -403,6 +421,12 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
     if (!parsedId.success) {
       return reply.status(404).send({
         error: { code: "workspace/not-found", message: "no such project" },
+      });
+    }
+    authorizeProject(opts.storage, currentPrincipal(req), parsedId.data);
+    if (!executions.configured) {
+      return reply.status(503).send({
+        error: { code: "runtime/not-configured", message: "no agent runtime wired" },
       });
     }
     const parsedBody = startPipelineBody.safeParse(req.body);
@@ -478,12 +502,13 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
       });
     }
-    const rec = opts.storage.pipelineRuns.get(parsedId.data);
-    if (!rec) {
+    const resolved = authorizeRun(opts.storage, currentPrincipal(req), parsedId.data);
+    if (!resolved) {
       return reply.status(404).send({
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
       });
     }
+    const rec = resolved.run;
     // Already terminal — idempotent response, no corruption.
     const terminal = rec.status !== "running";
     const orchestrator = runningPipelines.get(parsedId.data);
@@ -512,12 +537,13 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
       });
     }
-    const rec = opts.storage.pipelineRuns.get(parsedId.data);
-    if (!rec) {
+    const resolved = authorizeRun(opts.storage, currentPrincipal(req), parsedId.data);
+    if (!resolved) {
       return reply.status(404).send({
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
       });
     }
+    const rec = resolved.run;
     // Already running or completed — 409 Conflict.
     if (rec.status === "running" || rec.status === "completed") {
       return reply.status(409).send({
@@ -595,6 +621,7 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "workspace/not-found", message: "no such project" },
       });
     }
+    authorizeProject(opts.storage, currentPrincipal(req), parsedId.data);
     const rec = opts.storage.projects.get(parsedId.data);
     if (!rec) {
       return reply.status(404).send({
@@ -618,13 +645,13 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
       });
     }
-    const rec = opts.storage.pipelineRuns.get(parsedId.data);
-    if (!rec) {
+    const resolved = authorizeRun(opts.storage, currentPrincipal(req), parsedId.data);
+    if (!resolved) {
       return reply.status(404).send({
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
       });
     }
-    return { pipeline: rec };
+    return { pipeline: resolved.run };
   });
 
   // GET /pipelines/:runId/tasks
@@ -641,8 +668,8 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
       });
     }
-    const rec = opts.storage.pipelineRuns.get(parsedId.data);
-    if (!rec) {
+    const resolved = authorizeRun(opts.storage, currentPrincipal(req), parsedId.data);
+    if (!resolved) {
       return reply.status(404).send({
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
       });
@@ -664,8 +691,8 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
       });
     }
-    const rec = opts.storage.pipelineRuns.get(parsedId.data);
-    if (!rec) {
+    const resolved = authorizeRun(opts.storage, currentPrincipal(req), parsedId.data);
+    if (!resolved) {
       return reply.status(404).send({
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
       });
@@ -695,8 +722,8 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
       });
     }
-    const rec = opts.storage.pipelineRuns.get(parsedId.data);
-    if (!rec) {
+    const resolved = authorizeRun(opts.storage, currentPrincipal(req), parsedId.data);
+    if (!resolved) {
       return reply.status(404).send({
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
       });
@@ -768,8 +795,8 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
       });
     }
-    const rec = opts.storage.pipelineRuns.get(parsedId.data);
-    if (!rec) {
+    const resolved = authorizeRun(opts.storage, currentPrincipal(req), parsedId.data);
+    if (!resolved) {
       return reply.status(404).send({
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
       });
@@ -803,13 +830,13 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
       });
     }
-    const rec = opts.storage.pipelineRuns.get(parsedId.data);
-    if (!rec) {
+    const resolved = authorizeRun(opts.storage, currentPrincipal(req), parsedId.data);
+    if (!resolved) {
       return reply.status(404).send({
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
       });
     }
-    const allExecs = opts.storage.executions.listByProject(rec.projectId);
+    const allExecs = opts.storage.executions.listByProject(resolved.projectId);
     return { executions: allExecs.filter((e) => e.runId === parsedId.data) };
   });
 
@@ -827,8 +854,8 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
       });
     }
-    const rec = opts.storage.pipelineRuns.get(parsedId.data);
-    if (!rec) {
+    const resolved = authorizeRun(opts.storage, currentPrincipal(req), parsedId.data);
+    if (!resolved) {
       return reply.status(404).send({
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
       });
@@ -856,6 +883,7 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "workspace/not-found", message: "no such project" },
       });
     }
+    authorizeProject(opts.storage, currentPrincipal(req), parsedId.data);
     const rec = opts.storage.projects.get(parsedId.data);
     if (!rec) {
       return reply.status(404).send({
@@ -879,6 +907,7 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "workspace/not-found", message: "no such project" },
       });
     }
+    authorizeProject(opts.storage, currentPrincipal(req), parsedId.data);
     const rec = opts.storage.projects.get(parsedId.data);
     if (!rec) {
       return reply.status(404).send({
@@ -916,13 +945,14 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "workspace/not-found", message: "no such project" },
       });
     }
+    authorizeProject(opts.storage, currentPrincipal(req), parsedId.data);
     const rec = opts.storage.projects.get(parsedId.data);
     if (!rec) {
       return reply.status(404).send({
         error: { code: "workspace/not-found", message: "no such project" },
       });
     }
-    const all = opts.storage.context.latestAll();
+    const all = opts.storage.context.latestAllProject(parsedId.data);
     const grouped: Record<string, unknown[]> = {};
     for (const entry of all.values()) {
       const ns = entry.namespace;
@@ -948,6 +978,7 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "workspace/not-found", message: "no such project" },
       });
     }
+    authorizeProject(opts.storage, currentPrincipal(req), parsedId.data);
     const rec = opts.storage.projects.get(parsedId.data);
     if (!rec) {
       return reply.status(404).send({
@@ -963,7 +994,7 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         },
       });
     }
-    const map = opts.storage.context.latestByKey(nsParsed.data);
+    const map = opts.storage.context.latestByKeyProject(nsParsed.data, parsedId.data);
     return { context: Array.from(map.values()) };
   });
 
@@ -983,6 +1014,7 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "workspace/not-found", message: "no such project" },
       });
     }
+    authorizeProject(opts.storage, currentPrincipal(req), parsedId.data);
     const rec = opts.storage.projects.get(parsedId.data);
     if (!rec) {
       return reply.status(404).send({
@@ -1003,7 +1035,7 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "request/invalid", message: "key is required" },
       });
     }
-    const entries = opts.storage.context.history(params.data.key, nsParsed.data);
+    const entries = opts.storage.context.historyProject(params.data.key, nsParsed.data, parsedId.data);
     return { history: entries };
   });
 
@@ -1021,6 +1053,7 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "workspace/not-found", message: "no such project" },
       });
     }
+    authorizeProject(opts.storage, currentPrincipal(req), parsedId.data);
     const rec = opts.storage.projects.get(parsedId.data);
     if (!rec) {
       return reply.status(404).send({
@@ -1038,7 +1071,7 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
       createdAt: new Date().toISOString(),
       ...parsedBody.data,
     });
-    opts.storage.context.put(entry);
+    opts.storage.context.put(entry, parsedId.data);
     return reply.status(201).send({ context: entry });
   });
 
@@ -1061,18 +1094,41 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "workspace/not-found", message: "no such project" },
       });
     }
-    if (!opts.storage.pipelineRuns.get(body.runId)) {
+    // The pipeline run is the authoritative resource: its persisted project is
+    // the source of truth for authorization. A client-supplied projectId is only
+    // accepted when it matches the run's project (no cross-project references).
+    const run = opts.storage.pipelineRuns.get(body.runId);
+    if (!run) {
       return reply.status(404).send({
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
       });
     }
-    if (body.taskId && !opts.storage.tasks.get(body.taskId)) {
+    const task = body.taskId ? opts.storage.tasks.get(body.taskId) : null;
+    if (body.taskId && !task) {
       return reply.status(404).send({
         error: { code: "task/not-found", message: "no such task" },
       });
     }
+    const runProjectId = projectIdSchema.parse(run.projectId);
+    authorizeProject(opts.storage, currentPrincipal(req), runProjectId);
+    if (body.projectId !== run.projectId) {
+      return reply.status(400).send({
+        error: {
+          code: "request/invalid",
+          message: "projectId does not match the run's project",
+        },
+      });
+    }
+    if (task && (task.projectId !== run.projectId || task.runId !== body.runId)) {
+      return reply.status(400).send({
+        error: {
+          code: "request/invalid",
+          message: "taskId does not belong to the pipeline run",
+        },
+      });
+    }
     const record = approvals.request({
-      projectId: body.projectId,
+      projectId: runProjectId,
       runId: body.runId,
       taskId: body.taskId ?? null,
       spec: {
@@ -1101,7 +1157,7 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "approval/not-found", message: "no such approval" },
       });
     }
-    const rec = opts.storage.approvals.get(parsedId.data);
+    const rec = authorizeApproval(opts.storage, currentPrincipal(req), parsedId.data);
     if (!rec) {
       return reply.status(404).send({
         error: { code: "approval/not-found", message: "no such approval" },
@@ -1122,6 +1178,12 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
     }
     const parsedId = approvalIdSchema.safeParse(params.data.approvalId);
     if (!parsedId.success) {
+      return reply.status(404).send({
+        error: { code: "approval/not-found", message: "no such approval" },
+      });
+    }
+    const existing = authorizeApproval(opts.storage, currentPrincipal(req), parsedId.data);
+    if (!existing) {
       return reply.status(404).send({
         error: { code: "approval/not-found", message: "no such approval" },
       });
@@ -1163,6 +1225,7 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
         error: { code: "workspace/not-found", message: "no such project" },
       });
     }
+    authorizeProject(opts.storage, currentPrincipal(req), parsedId.data);
     const rec = opts.storage.projects.get(parsedId.data);
     if (!rec) {
       return reply.status(404).send({

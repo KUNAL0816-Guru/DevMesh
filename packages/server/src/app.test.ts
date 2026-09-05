@@ -758,10 +758,10 @@ function seedContextData(storage: Storage) {
   const e3 = makeContextEntry({ namespace: "spec", key: "db-engine", value: "sqlite", createdBy: "architect" });
   const e4 = makeContextEntry({ namespace: "decision", key: "auth-strategy", value: "jwt", createdBy: "developer" });
 
-  storage.context.put(e1);
-  storage.context.put(e2);
-  storage.context.put(e3);
-  storage.context.put(e4);
+  storage.context.put(e1, projectId);
+  storage.context.put(e2, projectId);
+  storage.context.put(e3, projectId);
+  storage.context.put(e4, projectId);
 
   return { projectId, e1, e2, e3, e4 };
 }
@@ -1403,7 +1403,7 @@ describe("approvals API (Phase 9B)", () => {
       payload: { decision: "allow" },
     });
     expect(unknown.statusCode).toBe(404);
-    expect(unknown.json().error.code).toBe("storage/not-found");
+    expect(unknown.json().error.code).toBe("approval/not-found");
     await app.close();
   });
 

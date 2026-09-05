@@ -34,6 +34,7 @@ const STATUS_BY_CODE: Readonly<Record<string, number>> = {
   "task/exhausted": 409,
   "budget/exhausted": 409,
   "auth/unauthenticated": 401,
+  "auth/forbidden": 403,
 };
 
 export interface NormalizedError {

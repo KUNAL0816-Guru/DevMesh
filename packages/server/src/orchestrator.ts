@@ -1161,7 +1161,7 @@ export class Orchestrator {
       createdBy: "system",
     });
     try {
-      this.storage.context.put(resumeContext);
+      this.storage.context.put(resumeContext, projectId);
     } catch (err) {
       console.warn(
         "[orchestrator] failed to persist resume context entry",
