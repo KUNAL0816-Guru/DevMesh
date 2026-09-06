@@ -13,7 +13,7 @@ import {
   newTaskId,
 } from "@devmesh/contracts";
 import type { Storage } from "@devmesh/storage";
-import { createStorage, summarizeRunUsage } from "@devmesh/storage";
+import { createStorage, summarizeRunUsage, summarizeTaskUsage } from "@devmesh/storage";
 import { WorkspaceService } from "@devmesh/workspace";
 import { FakeRuntime } from "@devmesh/runtime";
 import { createDefaultAgentRegistry } from "@devmesh/agents";
@@ -1481,6 +1481,103 @@ describe("GET /pipelines/:runId/usage", () => {
     expect(body.usage.unknownExecutionCount).toBe(0);
     expect(body.usage.totals.inputTokens).toBe(0);
     expect(body.usage.totals.outputTokens).toBe(0);
+    await app.close();
+  });
+});
+
+describe("GET /pipelines/:runId/usage/tasks/:taskId", () => {
+  it("returns the usage summary for an existing task in the run", async () => {
+    const { app, storage } = await buildStack();
+    const seeded = seedPipelineData(storage);
+    const res = await app.inject({
+      method: "GET",
+      url: `/pipelines/${seeded.runId}/usage/tasks/${seeded.task1.id}`,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      usage: {
+        taskId: string;
+        runId: string;
+        role: string;
+        title: string;
+        executionCount: number;
+        unknownExecutionCount: number;
+        totals: Record<string, unknown>;
+      };
+    };
+    expect(body.usage.taskId).toBe(seeded.task1.id);
+    expect(body.usage.runId).toBe(seeded.runId);
+    expect(body.usage.role).toBe("architect");
+    expect(body.usage.title).toBe("Architecture analysis");
+
+    const expected = summarizeTaskUsage(storage.db, seeded.task1.id)!;
+    expect(body.usage.executionCount).toBe(expected.executionCount);
+    expect(body.usage.unknownExecutionCount).toBe(expected.unknownExecutionCount);
+    expect(body.usage.totals).toEqual(expected.totals);
+    await app.close();
+  });
+
+  it("returns 404 for a task that does not exist", async () => {
+    const { app, storage } = await buildStack();
+    const seeded = seedPipelineData(storage);
+    const res = await app.inject({
+      method: "GET",
+      url: `/pipelines/${seeded.runId}/usage/tasks/${newTaskId()}`,
+    });
+    expect(res.statusCode).toBe(404);
+    expect((res.json() as { error: { code: string } }).error.code).toBe("task/not-found");
+    await app.close();
+  });
+
+  it("returns 404 for a nonexistent pipeline run", async () => {
+    const { app, storage } = await buildStack();
+    const seeded = seedPipelineData(storage);
+    const res = await app.inject({
+      method: "GET",
+      url: `/pipelines/${newRunId()}/usage/tasks/${seeded.task1.id}`,
+    });
+    expect(res.statusCode).toBe(404);
+    expect((res.json() as { error: { code: string } }).error.code).toBe("pipeline/not-found");
+    await app.close();
+  });
+
+  it("returns 404 when the task belongs to a different run", async () => {
+    const { app, storage } = await buildStack();
+    const seeded = seedPipelineData(storage);
+    const otherRunId = newRunId();
+    storage.pipelineRuns.insert({
+      id: otherRunId,
+      projectId: seeded.projectId,
+      status: "completed",
+      goal: "other run",
+      errorMessage: null,
+      createdAt: "2026-08-02T10:00:00.000Z",
+      finishedAt: "2026-08-02T10:05:00.000Z",
+      durationMs: 300000,
+    });
+    const res = await app.inject({
+      method: "GET",
+      url: `/pipelines/${otherRunId}/usage/tasks/${seeded.task1.id}`,
+    });
+    expect(res.statusCode).toBe(404);
+    expect((res.json() as { error: { code: string } }).error.code).toBe("task/not-found");
+    await app.close();
+  });
+
+  it("returns usage with unknownExecutionCount for executions with null usage", async () => {
+    const { app, storage } = await buildStack();
+    const seeded = seedPipelineData(storage);
+    const res = await app.inject({
+      method: "GET",
+      url: `/pipelines/${seeded.runId}/usage/tasks/${seeded.task2.id}`,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { usage: { executionCount: number; unknownExecutionCount: number; totals: { inputTokens: number | null; outputTokens: number | null } } };
+
+    const expected = summarizeTaskUsage(storage.db, seeded.task2.id)!;
+    expect(body.usage.executionCount).toBe(expected.executionCount);
+    expect(body.usage.unknownExecutionCount).toBe(expected.unknownExecutionCount);
+    expect(body.usage.totals).toEqual(expected.totals);
     await app.close();
   });
 });

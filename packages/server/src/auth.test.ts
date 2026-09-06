@@ -625,6 +625,7 @@ describe("Phase 14B: per-project authorization", () => {
       `/pipelines/${runId}/artifacts`,
       `/pipelines/${runId}/executions`,
       `/pipelines/${runId}/usage`,
+      `/pipelines/${runId}/usage/tasks/${crypto.randomUUID()}`,
     ]) {
       const res = await app.inject({ method: "GET", url, headers: AUTH });
       expect(res.statusCode).toBe(403);
@@ -903,6 +904,7 @@ describe("Phase 14B: IDOR isolation matrix", () => {
       `/pipelines/${fx.runId}/artifacts`,
       `/pipelines/${fx.runId}/executions`,
       `/pipelines/${fx.runId}/usage`,
+      `/pipelines/${fx.runId}/usage/tasks/${crypto.randomUUID()}`,
     ];
     for (const url of getUrls) {
       const res = await app.inject({ method: "GET", url, headers: AUTH });

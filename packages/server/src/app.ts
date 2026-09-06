@@ -15,7 +15,7 @@ import {
 } from "@devmesh/contracts";
 import { ApprovalGate } from "./approvals.js";
 import type { Storage } from "@devmesh/storage";
-import { summarizeRunUsage } from "@devmesh/storage";
+import { summarizeRunUsage, summarizeTaskUsage } from "@devmesh/storage";
 import type { WorkspaceService, ProjectRecord } from "@devmesh/workspace";
 import type { AgentRuntime } from "@devmesh/runtime";
 import type { AgentRegistry } from "@devmesh/agents";
@@ -903,6 +903,45 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
     if (!summary) {
       return reply.status(404).send({
         error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    return { usage: summary };
+  });
+
+  // GET /pipelines/:runId/usage/tasks/:taskId
+  app.get("/pipelines/:runId/usage/tasks/:taskId", async (req, reply) => {
+    const params = z
+      .strictObject({ runId: z.string(), taskId: z.string() })
+      .safeParse(req.params);
+    if (!params.success) {
+      return reply.status(400).send({
+        error: { code: "request/invalid", message: "invalid run id or task id" },
+      });
+    }
+    const parsedRun = runIdSchema.safeParse(params.data.runId);
+    if (!parsedRun.success) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    const resolved = authorizeRun(opts.storage, currentPrincipal(req), parsedRun.data);
+    if (!resolved) {
+      return reply.status(404).send({
+        error: { code: "pipeline/not-found", message: "no such pipeline run" },
+      });
+    }
+    // The run is authoritative: the task's persisted run must match the
+    // requested run so the route never crosses project/run boundaries.
+    const parsedTask = taskIdSchema.safeParse(params.data.taskId);
+    if (!parsedTask.success) {
+      return reply.status(404).send({
+        error: { code: "task/not-found", message: "no such task" },
+      });
+    }
+    const summary = summarizeTaskUsage(opts.storage.db, parsedTask.data);
+    if (!summary || summary.runId !== parsedRun.data) {
+      return reply.status(404).send({
+        error: { code: "task/not-found", message: "no such task" },
       });
     }
     return { usage: summary };
