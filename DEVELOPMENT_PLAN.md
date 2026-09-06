@@ -10,9 +10,11 @@
 ## Current State Summary
 
 DevMesh is a multi-agent AI software engineering platform. A user describes a
-project; four specialized agents (architect, developer, tester, reviewer)
-collaborate to build it inside a git workspace. The control plane is a single
-Node.js process (hexagonal modular monolith) with seven packages. The initial
+project; specialized agents collaborate to build it inside a git workspace. The
+control plane is a single Node.js process (hexagonal modular monolith) with nine
+packages. There are eight canonical agent roles (architect, developer, tester,
+reviewer, planner, debugger, documenter, devops) and a four-stage default
+execution pipeline (architect → developer → tester → reviewer). The initial
 agent runtime is OpenCode behind a swappable adapter port.
 
 **What works today:**
@@ -28,8 +30,8 @@ agent runtime is OpenCode behind a swappable adapter port.
 - Pipeline stage persistence + stage-progress tracking (Phase 7B)
 - Context blackboard REST API (Phase 7A)
 - Terminal-state-safe lifecycle mutations and classified error handling (Phase 6E)
-- 4 agent definitions with role-specific permissions and system prompts
-- SQLite storage with 11 migrations, 10 repositories
+- 8 agent definitions with role-specific permissions and system prompts
+- SQLite storage with 13 migrations, 10 repositories
 - Workspace service with symlink escape protection and FIFO mutex locking
 - Usage reporting + persistence (Phase 8A): runtime-reported tokens recorded per execution
 - Usage aggregation (Phase 8B): read-only run/task rollups with correct unknown semantics
@@ -112,7 +114,7 @@ packages/
                    project plugin token + approval request-id columns (Phase 14D)
   workspace/       Git facade, file I/O, path safety, per-key async mutex,
                    pluginToken on project create (Phase 14D)
-  agents/          AgentRegistry, 4 built-in agent definitions
+  agents/          AgentRegistry, 8 built-in agent definitions (4 initial + 4 Phase 11)
   opencode-adapter/ OpenCode CLI adapter (NDJSON, process-group kill, outputFormat,
                    runtime auto-approval --auto / per-request autoApprove plumbing) (Phase 14C),
                    serve-mode broker (OpencodeServeRuntime) + hybrid runtime
@@ -1173,6 +1175,15 @@ releases) pause the pipeline until a human approves or denies.
    The gate is hit on both the initial run AND the resumed loop, so a blocked
    run that was cancelled picks up its decision (approved/denied) or re-requests
    while still pending — blocked state survives a resume without duplication.
+5. **Phase 9B.1: DAG approval parity.** The approval gate is wired into the DAG
+   scheduler (`orchestrator.ts` DAG run loop): before a plan task is launched,
+   the card is transitioned `pending → ready` and the gate is checked; if the
+   task is gated it blocks without consuming a concurrency slot. Independent
+   tasks with satisfied deps continue past the blocked task; dependent tasks
+   wait for the dependency's gate to resolve. Denial blocks the task and the
+   remaining tasks and fails the run. DAG acceptance tests (`Phase 9B.1 — DAG
+   approval gate parity`) cover block/approve-resume, block/deny-fail, cancel,
+   and idempotent re-entry through the DAG scheduler.
 
 #### Acceptance Criteria
 
@@ -1194,7 +1205,8 @@ releases) pause the pipeline until a human approves or denies.
 
 **Phase 9 tests: 12 new in Phase 9B (7 API + 5 orchestrator); storage/contracts
 coverage from 9A retained. Gate applies to the linear chain and the resume
-loop; plan-task (DAG) gating is not yet wired (see Roadmap note).**
+loop; Phase 9B.1 extends the same gate to multi-task plan (DAG) tasks (see
+Roadmap note).**
 
 ### Phase 10: Model/Provider Gateway — COMPLETE
 
@@ -2058,17 +2070,27 @@ additions; 14D delivered ~24 serve-mode + ~14 permission-bridge + ~23 plugin
 
 ---
 
-## Remaining Roadmap (Future Phases — Not Yet Started)
+## Roadmap Status
+
+### Completed
 
 | Phase | Focus | ADR Ref | Est. Tests | Status |
 |---|---|---|---|---|
-| 8C | Cost pricing + budget enforcement | Consequence | ~10 | ✅ Complete (47 tests) |
-| 9 | Approval flow | Events catalog | ~10 | ✅ Complete (12 new Phase 9B tests; 9A storage covered) |
+| 8A–8C | Usage accounting (reporting, aggregation, pricing/budget) | ADR Consequence | ~47 | ✅ Complete |
+| 9 | Approval flow | Events catalog | ~12 | ✅ Complete (incl. DAG parity — see note) |
 | 10 | Model/provider gateway | Amendment 6 | ~8 | ✅ Complete |
-| 11 | Additional agent roles | Amendment 3 | ~8 | ✅ Complete |
-| 12 | Local/offline model adapter | Amendment 9 | ~5 | ✅ Complete (17 tests) |
-| 13 | Frontend/UI | Amendment 7 | ~2 | 13A–13G ✅ Complete; 13H ⬜ Next |
-| 14 | Security hardening, permissions, MCP & plugin packaging | ADR/README | ~12 | 14A ✅ Complete; 14B ✅ Complete; 14C ✅ Complete; 14D ✅ Complete; 14E ✅ Complete |
+| 11 | Additional agent roles | Amendment 3 | ~8 | ✅ Complete (all 8 roles) |
+| 12 | Local/offline model adapter | Amendment 9 | ~17 | ✅ Complete |
+| 13A–13G | Frontend/UI (usage API, dashboard, SSE, artifacts/usage, approvals) | Amendment 7 | — | ✅ Complete |
+| 14A–14E | Security hardening (auth → MCP server) | ADR/README | ~30 | ✅ Complete |
+
+### Current / Next
+
+| Phase | Focus | ADR Ref | Status |
+|---|---|---|---|
+| 13H | Next frontend/UI sub-phase | Amendment 7 | ⬜ Not Started |
+
+### Notes
 
 > Phases 13–14 are tracked in the roadmap. Phase 13A–13G and Phase 14A–14E
 > (authentication + project authorization + permission policy + live per-tool
@@ -2076,10 +2098,10 @@ additions; 14D delivered ~24 serve-mode + ~14 permission-bridge + ~23 plugin
 > the next sub-phase. Detailed goals, acceptance criteria, and required tests
 > for each appear above.
 >
-> **Roadmap note (Phase 9B boundary):** the approval gate currently guards the
-> linear chain (initial run + resume). Multi-task plan (DAG) tasks — Phase 7F —
-> are not yet gateable; wiring the gate into the DAG scheduler is the natural
-> next increment. All other Phase 9 acceptance criteria are met.
+> **Roadmap note (Phase 9B):** the approval gate guards both the linear chain
+> (initial run + resume) and multi-task plan (DAG) tasks via Phase 9B.1 DAG
+> approval parity, which wires the gate into the DAG scheduler. All Phase 9
+> acceptance criteria are met.
 >
 > **Phase 13 prerequisite:** the `GET /pipelines/:runId/usage` endpoint
 > (`summarizeRunUsage`/`summarizeTaskUsage`) was added in Phase 13A.
