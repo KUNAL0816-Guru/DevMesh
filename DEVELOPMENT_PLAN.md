@@ -1,9 +1,9 @@
 # DevMesh Development Plan
 
 > Status: active
-> Last updated: 2026-09-05 (post Phase 14C — Phases 0–12 complete; Phases 13A–13G complete; Phase 13H next; Phases 14A–14C complete; Phase 14D next)
+> Last updated: 2026-09-06 (post Phase 14D — Phases 0–12 complete; Phases 13A–13G complete; Phase 13H next; Phases 14A–14D complete; Phase 14E next)
 > Reference: docs/adr/0001-approved-architecture.md
-> Test baseline: 741 passed, 5 skipped, 0 failed (Phase 14C; historical: Phase 14B was 700 passed, Phase 14A was 679 passed, Phase 13G was 645 passed, Phase 12 was 607 passed, Phase 11 was 590 passed, Phase 10 was 574 passed)
+> Test baseline: 822 passed, 5 skipped, 0 failed (Phase 14D corrective verification reported before documentation synchronization; historical: Phase 14C was 741 passed, Phase 14B was 700 passed, Phase 14A was 679 passed, Phase 13G was 645 passed, Phase 12 was 607 passed, Phase 11 was 590 passed, Phase 10 was 574 passed)
 
 ---
 
@@ -65,7 +65,21 @@ agent runtime is OpenCode behind a swappable adapter port.
   budget reservation; ASK routes through the existing approval infrastructure
   (kind `"permission"`); ALLOW starts the runtime with per-request auto-approval
   plumbing. Full deny-by-default enforcement for previously unmatched non-read
-  operations during live tool execution is deferred to Phase 14D.
+  operations during live tool execution is implemented in Phase 14D.
+- Live per-tool permission interception (Phase 14D): DevMesh now performs live
+  per-tool permission interception and enforcement through the OpenCode
+  serve-mode broker / hybrid runtime. This is runtime enforcement, not merely
+  telemetry — every individual tool call during an execution is intercepted,
+  passed through the canonical policy engine (`decisionForTool`), and
+  ALLOWed / ASKed / DENYed before the tool runs. Live ASK requests reuse the
+  existing `ApprovalGate` with request-specific approval identity. Deferred to
+  Phase 14D from Phase 14C, this closes the boundary 14C deliberately did not
+  cross (per-tool default-deny for previously unmatched non-read operations).
+- OpenCode plugin packaging (Phase 14D): a new `packages/plugin` package
+  generates and installs a deterministic, dependency-free OpenCode plugin
+  (`.opencode/plugins/devmesh-permission.js`) plus a control-plane
+  `POST /permissions/tool` route that enforces policy via a per-project plugin
+  token.
 
 ---
 
@@ -77,23 +91,34 @@ packages/
                    artifact types, context entries, prompts, pipeline run schema,
                    plan integrity validation, permission contracts/context/schema
                    (PermissionAction/Resource/Profile/Rule/Setting, PolicyDecision,
-                   PermissionRequestContext, makeDenyByDefaultProfile) (Phase 14C)
+                   PermissionRequestContext, makeDenyByDefaultProfile) (Phase 14C),
+                   per-tool wire schemas (ToolPermissionRequest/ToolPermissionDecision)
+                   + newPluginToken() (Phase 14D)
   runtime/         AgentRuntime port interface (incl. outputFormat/structured,
-                   per-request autoApprove plumbing) (Phase 14C), FakeRuntime,
-                   RuntimeError
-  storage/         SQLite persistence (node:sqlite), 10 repositories, 11 migrations,
+                   per-request autoApprove plumbing) (Phase 14C), onToolPermission
+                   callback + ToolPermissionRequest/ToolPermissionDecision +
+                   optional dispose() (Phase 14D), FakeRuntime, RuntimeError
+  storage/         SQLite persistence (node:sqlite), 13 migrations, 10 repositories,
                    EventBus, diagnostic queries (pipelineRunSummary/pipelineHealth),
-                   project owner + context project scoping (Phase 14B)
-  workspace/       Git facade, file I/O, path safety, per-key async mutex
+                   project owner + context project scoping (Phase 14B),
+                   project plugin token + approval request-id columns (Phase 14D)
+  workspace/       Git facade, file I/O, path safety, per-key async mutex,
+                   pluginToken on project create (Phase 14D)
   agents/          AgentRegistry, 4 built-in agent definitions
   opencode-adapter/ OpenCode CLI adapter (NDJSON, process-group kill, outputFormat,
-                   runtime auto-approval --auto / per-request autoApprove plumbing) (Phase 14C)
+                   runtime auto-approval --auto / per-request autoApprove plumbing) (Phase 14C),
+                   serve-mode broker (OpencodeServeRuntime) + hybrid runtime
+                   (OpenCodeHybridRuntime) + tool permission catalog (Phase 14D)
+  plugin/          OpenCode permission plugin packaging: source generation,
+                   installer, env config, tool catalog (Phase 14D, new package)
   server/          Fastify HTTP server, orchestrator, execution service,
                    verification (SHA-256 + independent test replay), artifact
                    builder (structured-first, text-parsing fallback), SSE streaming,
                    approval workflow (ApprovalGate + REST endpoints),
                    bearer authentication (Phase 14A) + project authorization (Phase 14B),
-                   permission policy evaluation + execution enforcement (Phase 14C)
+                   permission policy evaluation + execution enforcement (Phase 14C),
+                   decisionForTool + permission bridge (POST /permissions/tool) +
+                   per-tool approval identity (Phase 14D)
 ```
 
 ---
@@ -1436,20 +1461,22 @@ browser.
 included in the backend test baseline (645 passed). Backend tests added in
 13A and 13C are included in that baseline.
 
-### Phase 14: Security Hardening — 14A, 14B & 14C COMPLETE; 14D NEXT; 14E NOT STARTED
+### Phase 14: Security Hardening — 14A, 14B, 14C & 14D COMPLETE; 14E NEXT
 
 **Goal:** Production-hardening items referenced across the ADR and README:
 authentication/authorization for a multi-user deployment, a contract-level
 permission policy, wiring the existing `permission.requested`/
-`permission.resolved` events, and packaging the OpenCode plugin and MCP server.
+`permission.resolved` events, live per-tool permission interception through the
+OpenCode serve-mode broker plus the OpenCode plugin packaging/install, and
+packaging the MCP server.
 
 Phase 14 is delivered as sub-phases. Phase 14A (authentication foundation),
-Phase 14B (authorization & project isolation), and Phase 14C (permission policy)
-are complete; together they establish the authentication + project-authorization
-foundation and the agent permission-policy layer with execution-time enforcement
-and approval/event integration. Phase 14D (live per-tool permission interception
-/ OpenCode plugin) is the next sub-phase; Phase 14E (MCP server) is not yet
-started.
+Phase 14B (authorization & project isolation), Phase 14C (permission policy),
+and Phase 14D (live per-tool permission interception / OpenCode plugin) are
+complete; together they establish the authentication + project-authorization
+foundation, the agent permission-policy layer with run- and tool-level
+enforcement, live per-tool interception, and approval/event integration.
+Phase 14E (MCP server) is the next sub-phase and has not been started.
 
 #### Phase 14A: Authentication Foundation — COMPLETE (commit `dddf8c8`)
 
@@ -1713,44 +1740,190 @@ enforcement during runtime/tool execution (that is Phase 14D), the OpenCode
 plugin, and the MCP server. OAuth/OIDC/JWT/RBAC/admin/membership systems are not
 introduced by 14C.
 
-#### Phase 14D: Live Permission Interception / OpenCode Plugin — NOT STARTED (NEXT)
+#### Phase 14D: Live Permission Interception / OpenCode Plugin — COMPLETE (commit `82b5363`)
 
 **Goal:** Live per-tool permission interception and enforcement during
 runtime/tool execution — the boundary that Phase 14C deliberately does not cross.
-Where Phase 14C enforces the policy at the execution gate (before a run starts)
-and, for matched/unmatched non-read operations, still allows previously
-unmatched non-read operations to run unblocked at the run-level policy layer,
-Phase 14D will carry the ALLOW/ASK/DENY decision to each individual tool call
-during runtime execution and enforce default-deny for previously unmatched
+Where Phase 14C enforces the policy at the execution gate (before a run starts),
+Phase 14D carries the ALLOW/ASK/DENY decision to each individual tool call
+during runtime execution and enforces default-deny for previously unmatched
 operations per-tool. It also covers the OpenCode plugin packaging/install into
 projects.
 
+**Live per-tool interception flow:**
+
+```
+OpenCode permission.asked
+        ↓
+DevMesh serve broker (OpencodeServeRuntime, SSE event stream)
+        ↓
+tool permission normalization (permissionResourceForTool)
+        ↓
+decisionForTool()               (canonical policy engine)
+        ↓
+ALLOW / ASK / DENY
+        ↓
+OpenCode permission reply       (once / reject)
+```
+
+This is **runtime enforcement**, not merely telemetry — every individual tool
+call during an execution is intercepted, normalized, evaluated against the
+canonical policy engine, and ALLOWed / ASKed / DENYed **before** the tool runs.
+An unknown tool never runs (rejects immediately); an unhandled ask never runs;
+a DENY always rejects.
+
+**OpenCode serve-mode broker / hybrid runtime:**
+
+| Deliverable | Status |
+|---|---|
+| `OpencodeServeRuntime` (`packages/opencode-adapter/src/serve-mode.ts`) — external `opencode serve --port 0 --hostname 127.0.0.1` child process; owns all OpenCode serve protocol knowledge (SSE framing, permission lifecycle) behind the `AgentRuntime` port | done |
+| Hybrid runtime `OpenCodeHybridRuntime` (`composite.ts`) — composes the serve capability with the existing run-mode runtime: structured-output executions (architect/tester/reviewer) keep run mode (serve lacks structured output); other executions use serve mode for live per-tool gating | done |
+| Loopback/localhost serve server; shared broker process across executions with per-execution/session isolation (each execution owns its own session and a `RunCtx`; SSE events are strictly session-scoped) | done |
+| SSE permission events — subscribes to the event stream before submitting the prompt so no post-request event is missed; `permission.asked` → interception path | done |
+| Permission reply handling — replies `{response:"once"|"reject"}` exactly once per ask; duplicate/subsequent asks ignored | done |
+| Fail-closed behavior — unknown tool, malformed payload, unhandled ask, SSE disconnect, server process exit, timeout, cancellation, and `dispose()` all fail closed (tool never runs; pending asks rejected) | done |
+| Cancellation/timeout/disposal — `cancelRun`/timeout abort the opencode session; shared broker released only via `dispose()` at shutdown | done |
+| `DEVMESH_OPENCODE_SERVE=true` → serve/hybrid path (default); `DEVMESH_OPENCODE_SERVE=false` → legacy pure run-mode path | done |
+
+**Policy semantics (Phase 14D — tool level):**
+
+- `read` default posture remains **allow** (workspace is inspectable).
+- Live **non-read** operations **fail closed** (default deny) when no rule matches.
+- Explicit `allow` works.
+- Explicit `ask` enters the approval flow.
+- Explicit `deny` remains authoritative.
+- Patterned rules are **target-scoped** (only apply when the tool's target
+  matches the rule's globs).
+- **Scoped rules cannot widen permissions** — an unmatched target falls back to
+  the resource posture (allow for read, deny for everything else).
+- **Unknown tools/resources fail closed** (DENY).
+
+Phase 14C is a **run/start-level policy gate**; Phase 14D is **live per-tool
+interception**. 14C did *not* have live per-tool enforcement.
+
+**Approval gate integration:**
+
+| Behavior | Status |
+|---|---|
+| Live ASK requests reuse the existing DevMesh `ApprovalGate` (kind `permission`) | done |
+| Tool permission requests have **request-specific approval identity** | done |
+| OpenCode permission request ID is propagated for correlation (`ToolPermissionRequest.requestId`, stored as `approvals.request_id`) | done |
+| START approval retains its existing resume/reuse semantics (`(runId, taskId)` → `(runId, kind)` — unchanged) | done |
+| START approval cannot approve a later tool-level ASK (distinct `requestId`-based identity) | done |
+| Successive tool permission requests receive **independent** approvals (`(runId, requestId)` dedup key — distinct requests never share an approval) | done |
+| Human DENY remains DENY | done |
+| Cancellation / timeout / disconnect fail closed | done |
+
+The `requestId`-based approval identity means redelivered asks reuse exactly
+their own approval, but distinct requests never deduplicate to a shared
+approval.
+
+**`--auto` safety:**
+
+- OpenCode `--auto` is only passed when DevMesh policy resolves ALLOW **and**
+  autoApprove configuration permits it (`effectiveAutoApprove`).
+- ASK and DENY never use `--auto`.
+- Per-request policy cannot be bypassed through a client override.
+- Live permission interception remains authoritative.
+- `--auto` itself is **not** the DevMesh policy engine.
+
+**Plugin package (`packages/plugin`, new):**
+
+| Deliverable | Status |
+|---|---|
+| OpenCode plugin source generation (`plugin-source.ts` → write verbatim `.opencode/plugins/devmesh-permission.js`) — plain JS, dependency-free, self-contained ESM | done |
+| Runtime environment lookup — all env vars read at runtime inside opencode (`DEVMESH_PLUGIN_SERVER`, `DEVMESH_PLUGIN_TOKEN`, `DEVMESH_AGENT_ROLE`, `DEVMESH_PLUGIN_PROJECT_ID`, `DEVMESH_PLUGIN_RUN_ID`, `DEVMESH_PLUGIN_TASK_ID`) | done |
+| **No secret interpolation into generated source** — untrusted values are never embedded; the token is passed via environment at runtime | done |
+| Installer (`installer.ts` → `installPlugin`) — deterministic, safe, idempotent `.opencode/plugins/devmesh-permission.js` placement | done |
+| `.gitignore` handling — writes a `.gitignore` containing `*` so plugin artifacts never appear in the managed project's git status | done |
+| Fail-closed behavior — plugin throws to deny the tool unless the control-plane response is verbatim `allow`; `ask` (the standalone plugin cannot prompt), network failure, non-ok HTTP, unparseable response, and unknown tool all deny | done |
+| Plugin control-plane communication — `'tool.execute.before'` hook POSTs `{role, tool, projectId, runId, taskId?, target?}` to `${server}/permissions/tool` with a bounded `AbortSignal.timeout` (300s) | done |
+| Standalone-safe — without `DEVMESH_PLUGIN_SERVER` the plugin exports an empty object (no enforcement); a manual opencode session in a DevMesh workspace behaves normally | done |
+
+**Plugin-token architecture:**
+
+| Property | Status |
+|---|---|
+| Project-specific plugin token (`newPluginToken()` → `dpk_` + 48 hex chars, cryptographically random) | done |
+| Token generated during project creation; stored with the project (`projects.plugin_token`, migration 12) | done |
+| Token is **not** exposed through normal project API responses (`toApiProject` keeps `{id, name, createdAt}`) | done |
+| Token is distinct from `DEVMESH_AUTH_TOKEN` | done |
+| Plugin uses `x-devmesh-project-token` header | done |
+| Token is **not** embedded into plugin source | done |
+
+**Control-plane endpoint (`POST /permissions/tool`):**
+
+| Deliverable | Status |
+|---|---|
+| Project-token authentication via `x-devmesh-project-token` header, constant-time comparison (`secureCompare`) | done |
+| Missing/invalid/unknown-project token → 401 (indistinguishable) | done |
+| Malformed request → 400 (no partial evaluation) | done |
+| Unknown tool → `{decision:"deny", reason:"unknown tool … default deny"}` | done |
+| Reuses the canonical `decisionForTool()` engine (same `ProfileProvider` as the live serve broker — one policy source, never two) | done |
+| Project isolation — token bound to `projectId` in the body; a token minted for one project never authorizes another | done |
+| No Bearer token requirement for this plugin route (per-project plugin token is the trust boundary) | done |
+| `/permissions` is deliberately handled as an API route rather than SPA fallback (404 handler treats it as an API path) | done |
+
+This route is a **pure policy query** over the canonical engine — it never mints
+an approval and never gates; enforcement happens in the live broker or the
+plugin. It is not a replacement for the main bearer authentication system.
+
+**Security properties actually implemented:**
+
+- Project-specific token with cross-project token isolation.
+- Token not returned in ordinary project payloads.
+- No token interpolation into plugin source.
+- Plugin/control-plane failures fail closed.
+- Loopback serve broker (localhost/127.0.0.1).
+- No secrets introduced into source control.
+
+Token rotation, rate limiting, audit logging, OAuth, OIDC, JWT, and RBAC are
+**out of scope** for Phase 14D — they remain future possibilities.
+
+**Storage changes:**
+
+- Migration 12 (`project-plugin-token`): `ALTER TABLE projects ADD COLUMN
+  plugin_token`.
+- Migration 13 (`approval-request-id`): `ALTER TABLE approvals ADD COLUMN
+  request_id` + index `(run_id, request_id)` — the per-request approval
+  identity for live tool approvals.
+
 **Acceptance Criteria**
 
-- [ ] Live per-tool permission interception/enforcement during runtime/tool
+- [x] Live per-tool permission interception/enforcement during runtime/tool
       execution
-- [ ] Default-deny enforcement per-tool for previously unmatched operations
-- [ ] OpenCode plugin packages and installs into a project
+- [x] Default-deny enforcement per-tool for previously unmatched operations
+- [x] OpenCode plugin packages and installs into a project
 
-#### Phase 14E: MCP Server — NOT STARTED
+#### Phase 14E: MCP Server — NOT STARTED (NEXT)
 
-**Goal:** Expose DevMesh state (pipelines, artifacts, context) to tools over MCP.
+**Goal:** Expose DevMesh state (pipelines, artifacts, context) to tools over
+MCP. This sub-phase concerns MCP integration / server work; the specific
+architecture (transport, package, endpoints, authentication, tools/resources)
+has not been resolved and will be determined by the Phase 14E audit.
 
 **Acceptance Criteria**
 
 - [ ] MCP server exposes pipelines/artifacts/context
 
-**Required Tests (remaining Phase 14 sub-phases)**
+**Required Tests (remaining Phase 14 sub-phase — 14E only)**
 
 | File | Tests |
 |---|---|
-| `server/app.test.ts` | MCP routes (14E) — auth (14A/14B) and permission-flow (14C) coverage already provided via `server/auth.test.ts` and the 14C policy suites |
-| `integrations/plugin.test.ts` (new) | Plugin packaging/install (14D) |
+| `server/app.test.ts` | MCP routes (14E) — auth (14A/14B) and permission-flow (14C/14D) coverage already provided via `server/auth.test.ts`, the 14C policy suites, and the 14D permission-bridge/serve-mode suites |
 
-**Estimated new tests: remaining** (14D–14E; 14A delivered 53 tests in
-`auth.test.ts`; 14B delivered 2 storage tests plus the `auth.test.ts`
-authorization matrix; 14C delivered the 7+21+11 policy/contracts/executions
-tests plus adapter and orchestrator additions)
+**Phase 14 total test baseline (final Phase 14D corrective verification
+reported before documentation synchronization):** 40 test files passed, 2
+skipped, 822 tests passed, 5 skipped. Previous Phase 14D implementation
+baseline was 39 files passed, 2 skipped, 789 passed, 5 skipped; Phase 14C
+historical baseline was 741 passed, 5 skipped.
+
+**Estimated new tests:** 14D delivered ~24 serve-mode + ~14 permission-bridge +
+~23 plugin + ~12 policy-executions + ~7 policy + hybrid/bootstrap additions.
+14E (MCP) remains to be delivered. Historical delivered tests: 14A = 53 in
+`auth.test.ts`; 14B = 2 storage tests plus the `auth.test.ts` authorization
+matrix; 14C = the 7+21+11 policy/contracts/executions tests plus adapter and
+orchestrator additions.
 
 ---
 
@@ -1774,12 +1947,13 @@ tests plus adapter and orchestrator additions)
 | 11 | Additional agent roles | Amendment 3 | ~8 | ✅ Complete |
 | 12 | Local/offline model adapter | Amendment 9 | ~5 | ✅ Complete (17 tests) |
 | 13 | Frontend/UI | Amendment 7 | ~2 | 13A–13G ✅ Complete; 13H ⬜ Next |
-| 14 | Security hardening, permissions, MCP & plugin packaging | ADR/README | ~12 | 14A ✅ Complete; 14B ✅ Complete; 14C ✅ Complete; 14D ⬜ Next; 14E ⬜ Not started |
+| 14 | Security hardening, permissions, MCP & plugin packaging | ADR/README | ~12 | 14A ✅ Complete; 14B ✅ Complete; 14C ✅ Complete; 14D ✅ Complete; 14E ⬜ Next / Not started |
 
-> Phases 13–14 are tracked in the roadmap. Phase 13A–13G and the Phase 14A–14C
-> security foundation (authentication + project authorization + permission
-> policy) are implemented; Phase 13H and Phase 14D are the next sub-phases.
-> Detailed goals, acceptance criteria, and required tests for each appear above.
+> Phases 13–14 are tracked in the roadmap. Phase 13A–13G and Phase 14A–14D
+> (authentication + project authorization + permission policy + live per-tool
+> interception / OpenCode plugin) are implemented; Phase 13H and Phase 14E are
+> the next sub-phases. Detailed goals, acceptance criteria, and required tests
+> for each appear above.
 >
 > **Roadmap note (Phase 9B boundary):** the approval gate currently guards the
 > linear chain (initial run + resume). Multi-task plan (DAG) tasks — Phase 7F —
@@ -1791,7 +1965,7 @@ tests plus adapter and orchestrator additions)
 
 ---
 
-## Appendix: Test File Inventory (post Phase 14C)
+## Appendix: Test File Inventory (post Phase 14D)
 
 | File | Tests | Area |
 |---|---|---|
@@ -1805,10 +1979,11 @@ tests plus adapter and orchestrator additions)
 | `contracts/src/pipeline.test.ts` | 7 | Pipeline run schema |
 | `contracts/src/pricing.test.ts` | 7 | Pricing schema + unit conversion (8C) |
 | `contracts/src/permissions.test.ts` | 7 | Permission profiles + policy decision schema (14C) |
-| `runtime/src/fake.test.ts` | 6 | FakeRuntime (incl. structured output) |
+| `runtime/src/fake.test.ts` | 6 | FakeRuntime (incl. structured output + toolAsks) |
 | `agents/src/agents.test.ts` | 8 | Registry + builtins |
 | `opencode-adapter/src/adapter.test.ts` | 7+ | Adapter integration (incl. per-request autoApprove override, 14C) |
-| `storage/src/storage.test.ts` | 96 | All repositories + migrations + diagnostics + usage aggregation (incl. committed-only 8C variants) + approvals (9A) + project-owner & context project scoping (14B) |
+| `opencode-adapter/src/serve-mode.test.ts` | 24 | OpencodeServeRuntime via stub serve protocol (20) + cross-session correlation/isolation safety (4) + OpenCodeHybridRuntime routing (14D) |
+| `storage/src/storage.test.ts` | 96 | All repositories + migrations + diagnostics + usage aggregation (incl. committed-only 8C variants) + approvals (9A) + project-owner & context project scoping (14B) + plugin token / approval request-id (14D) |
 | `workspace/src/git.test.ts` | 20 | Git operations + checkpoints |
 | `workspace/src/locks.test.ts` | 6 | MutexMap |
 | `workspace/src/paths.test.ts` | 5 | Path safety |
@@ -1823,17 +1998,20 @@ tests plus adapter and orchestrator additions)
 | `server/src/budget-orchestrator.test.ts` | 4 | Orchestrator budget reaction (8C) |
 | `server/src/pipeline-sse.test.ts` | 24 | SSE streaming |
 | `server/src/auth.test.ts` | 53 | Phase 14A bearer auth foundation + Phase 14B per-project authorization / IDOR isolation (14A, 14B) |
-| `server/src/policy.test.ts` | 21 | Permission policy evaluator (14C): glob matching, run disposition, decisions, effectiveAutoApprove |
-| `server/src/policy-executions.test.ts` | 11 | Permission policy × execution/service integration (14C): deny/ask/allow, approval bridge, fail-closed, cancellation, event tagging, no duplicate request |
+| `server/src/policy.test.ts` | 28 | Permission policy evaluator (14C: glob matching, run disposition, decisions, effectiveAutoApprove; 14D: decisionForTool) |
+| `server/src/policy-executions.test.ts` | 23 | Permission policy × execution/service integration (14C: deny/ask/allow, approval bridge, fail-closed, cancellation, event tagging, no duplicate request; 14D: per-tool handler integration) |
+| `server/src/permission-bridge.test.ts` | 14 | Phase 14D control-plane `POST /permissions/tool`: token auth matrix, fail-closed deny paths, policy query semantics |
+| `server/src/bootstrap.test.ts` | 11 | Runtime wiring incl. hybrid OpenCodeHybridRuntime serve-mode selection (14D) |
 | `server/src/orchestrator-real.test.ts` | 1 | Real OpenCode (gated) |
 | `server/src/opencode-real.test.ts` | 4 | Real OpenCode E2E (gated) |
+| `plugin/src/plugin.test.ts` | 23 | Phase 14D OpenCode plugin packaging / install / env / source generation |
 | `client/src/utils/format.test.ts` | ~20 | Formatting helpers (Phase 13F + Phase 13G approval display) |
 | `client/src/hooks/usePipelineStream.test.ts` | ~6 | SSE stream hook (Phase 13E) |
-| **Total (listed)** | **~597 `it(`/`test(` occurrences summed** | 14A adds 53 in auth.test.ts; 14B adds +2 in storage.test.ts (owner isolation + context scoping); 14C adds 7 (permissions.test.ts) + 21 (policy.test.ts) + 11 (policy-executions.test.ts) plus adapter/executions/orchestrator additions |
+| **Total (listed)** | **~`it(`/`test(` occurrences summed** | 14A adds 53 in auth.test.ts; 14B adds +2 in storage.test.ts (owner isolation + context scoping); 14C adds 7 (permissions.test.ts) + 21 (policy.test.ts) + 11 (policy-executions.test.ts) plus adapter/executions/orchestrator additions; 14D adds +7 (policy.test.ts) +12 (policy-executions.test.ts) +24 (serve-mode.test.ts) +14 (permission-bridge.test.ts) +23 (plugin.test.ts) + hybrid/bootstrap/storage additions |
 
 > Counts above reflect the `it(`/`test(` occurrences per file and are
 > approximate (vitest's numeric total includes dynamically-defined subtests);
-> the authoritative number comes from `npm test` (741 passed, 5 skipped, 0 failed).
+> the authoritative number comes from `npm test` (822 passed, 5 skipped, 0 failed).
 > Frontend tests (client package) run in a separate Vitest config and are not
 > included in that count.
 
