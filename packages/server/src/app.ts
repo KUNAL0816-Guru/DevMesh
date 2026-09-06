@@ -8,6 +8,7 @@ import {
   artifactKindSchema,
   contextEntrySchema,
   contextNamespaceSchema,
+  newPluginToken,
   projectIdSchema,
   runIdSchema,
   taskIdSchema,
@@ -38,7 +39,8 @@ import { VERIFICATION_COMMAND_PATTERN } from "./executions/commands.js";
 import { Orchestrator } from "./orchestrator.js";
 import type { DomainEvent } from "@devmesh/contracts";
 import { PipelineEventStream } from "./pipeline-sse.js";
-import type { ProfileProvider } from "./policy.js";
+import { DEFAULT_PROFILE_PROVIDER, type ProfileProvider } from "./policy.js";
+import { registerPermissionToolRoute } from "./permission-bridge.js";
 
 export const APP_VERSION = "0.1.0";
 
@@ -126,6 +128,10 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
   // layer and the orchestrator. Constructed before ExecutionService so a
   // Phase 14C ASK policy can be bridged through it.
   const approvals = new ApprovalGate(opts.storage);
+  // Phase 14C/D: the ONE canonical policy source for this app — shared by the
+  // live serve broker (ExecutionService) and the plugin permission bridge so a
+  // tool call can never be judged against two different policy engines.
+  const profileProvider: ProfileProvider = opts.policyBaselines ?? DEFAULT_PROFILE_PROVIDER;
   const executions = new ExecutionService({
     storage: opts.storage,
     workspaces: opts.workspaces,
@@ -138,7 +144,7 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
     ...(priceRules.length > 0 ? { pricing: createPriceTable(priceRules) } : {}),
     approvalGate: approvals,
     autoApprove: opts.config.opencodeAutoApprove,
-    ...(opts.policyBaselines ? { policyBaselines: opts.policyBaselines } : {}),
+    policyBaselines: profileProvider,
   });
 
   // In-memory registry of active pipeline runs (runId → Orchestrator).
@@ -194,6 +200,15 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
   // -- Phase 14A: Bearer authentication ------------------------------------
   registerAuth(app, authConfigFromConfig(opts.config));
 
+  // -- Phase 14D: OpenCode permission plugin bridge -------------------------
+  // Shares the exact policy engine used by the live serve broker
+  // (profileProvider above). No Bearer hook applies to /permissions/*; the
+  // per-project plugin token is the trust boundary (see permission-bridge.ts).
+  registerPermissionToolRoute(app, {
+    storage: opts.storage,
+    policyBaselines: profileProvider,
+  });
+
   // -- static frontend (SPA fallback) ---------------------------------------
   const serverDir = dirname(fileURLToPath(import.meta.url));
   const defaultStaticRoot = opts.staticRoot ?? join(serverDir, "..", "..", "client", "dist");
@@ -215,6 +230,7 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
       p.startsWith("/executions") ||
       p.startsWith("/approvals") ||
       p.startsWith("/auth") ||
+      p.startsWith("/permissions") ||
       p.startsWith("/api");
     if (!isApi && existsSync(defaultStaticRoot)) {
       void reply.sendFile("index.html");
@@ -261,6 +277,10 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
     const principal = currentPrincipal(req);
     const handle = opts.workspaces.create(parsed.data.name, {
       ownerPrincipalId: principal?.id ?? null,
+      // Phase 14D: every project gets its own OpenCode permission-plugin token
+      // at creation (the token authorizes /permissions/tool queries for this
+      // project only; it is never returned by the API).
+      pluginToken: newPluginToken(),
     });
     const record = opts.storage.projects.get(handle.projectId);
     if (!record) {

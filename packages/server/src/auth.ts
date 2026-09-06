@@ -32,7 +32,7 @@ declare module "fastify" {
 }
 
 /** Constant-time string comparison to prevent timing attacks. */
-function secureCompare(a: string, b: string): boolean {
+export function secureCompare(a: string, b: string): boolean {
   const bufA = Buffer.from(a, "utf8");
   const bufB = Buffer.from(b, "utf8");
   if (bufA.length !== bufB.length) {

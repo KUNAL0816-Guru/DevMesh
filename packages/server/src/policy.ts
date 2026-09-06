@@ -233,3 +233,53 @@ export function effectiveAutoApprove(
 ): boolean {
   return decision === "allow" && configAutoApprove;
 }
+
+/**
+ * Phase 14D: per-tool disposal of a single tool-call request.
+ *
+ * Read this as the run-level disposition projected onto ONE tool invocation:
+ * - No setting for the resource: `read` keeps its inspect posture (allow);
+ *   every other resource FAILS CLOSED (deny) — absent policy never means allow
+ *   for a mutating/network tool.
+ * - Shorthand action equal to the default posture (`read: "allow"`): allow.
+ * - Shorthand action otherwise: authored as-is (allow/ask/deny).
+ * - Unpatterned rule: authored as-is.
+ * - Patterned rule: applies ONLY when the tool's target matches a pattern;
+ *   unmatched targets fall back to the resource posture (allow for read, deny
+ *   for everything else — a scoped rule never widens a non-read tool).
+ * An authored `deny` always lands as deny; nothing below overrules it.
+ */
+export function decisionForTool(input: {
+  profile: PermissionProfile;
+  resource: PermissionResource;
+  target?: string;
+}): { action: PermissionAction; reason: string } {
+  const { profile, resource, target } = input;
+  const setting = profile[resource];
+  if (setting === undefined) {
+    return resource === "read"
+      ? { action: "allow", reason: "read has no authored policy — default posture allows inspection" }
+      : {
+          action: "deny",
+          reason: `${resource} has no authored policy — default deny (fail closed)`,
+        };
+  }
+  if (typeof setting === "string") {
+    if (equalsPosture(resource, setting)) {
+      return { action: "allow", reason: `${resource}=${setting} equals the default posture` };
+    }
+    return { action: setting, reason: `explicit profile action ${resource}=${setting}` };
+  }
+  if (setting.patterns && setting.patterns.length > 0) {
+    if (target !== undefined && setting.patterns.some((p) => matchesGlob(target, p))) {
+      return { action: setting.action, reason: `rule ${resource} matches target "${target}"` };
+    }
+    return resource === "read"
+      ? { action: "allow", reason: `read rule matches nothing for "${target ?? ""}" — posture allows` }
+      : {
+          action: "deny",
+          reason: `rule for ${resource} matches nothing for "${target ?? ""}" — default deny`,
+        };
+  }
+  return { action: setting.action, reason: `unpatterned rule for ${resource}` };
+}

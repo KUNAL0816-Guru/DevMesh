@@ -1,6 +1,49 @@
+import type { PermissionResource } from "@devmesh/contracts";
+
 /** Terminal outcomes of an agent execution (task-level, not process-level). */
 export const executionStatuses = ["completed", "failed", "timeout", "cancelled"] as const;
 export type ExecutionStatus = (typeof executionStatuses)[number];
+
+/**
+ * Phase 14D: vendor-neutral per-tool permission intercept. A live runtime
+ * (e.g. the OpenCode serve-mode broker) raises one of these for every tool
+ * call it is asked to gate, BEFORE the tool executes, and DevMesh core answers
+ * it via the policy engine. `resource` is a contracts `PermissionResource`;
+ * `tool` stays opaque vendor text; `target` is the concrete argument being
+ * acted on (file path, command line, URL) when one is known.
+ */
+export interface ToolPermissionRequest {
+  /** The DevMesh execution the tool call belongs to. */
+  executionId: string;
+  /** Contracts permission resource ("read", "edit", "bash", ...). */
+  resource: PermissionResource;
+  /** Opaque runtime tool name (e.g. "edit"); never interpreted by core. */
+  tool: string;
+  /**
+   * Concrete argument being acted on (file path, command, URL).
+   */
+  target?: string;
+  /**
+   * Vendor pattern strings the ask was raised for (informational only).
+   */
+  patterns?: string[];
+  /**
+   * Stable vendor-native permission request id (e.g. the OpenCode `per_...`
+   * id) when the runtime surfaces one. Used for EXACT per-request approval
+   * correlation: the same id means the same permission request (a retry or
+   * redelivery) and must never be shared across distinct requests. Absent for
+   * runtimes without request ids — core then mints an execution-scoped
+   * identity so every tool ask still owns its own approval.
+   */
+  requestId?: string;
+}
+
+/** The answer core gives a live tool request: execute or block the tool. */
+export interface ToolPermissionDecision {
+  decision: "allow" | "deny";
+  /** Human-readable reason for the reply (surfaced in events and logs). */
+  reason: string;
+}
 
 /** Where an agent run happens: absolute path, pre-approved by DevMesh core. */
 export interface AgentExecutionRequest {
@@ -35,6 +78,15 @@ export interface AgentExecutionRequest {
    * policy decision ever sets this to true.
    */
   autoApprove?: boolean;
+  /**
+   * Phase 14D live per-tool permission interception. When provided, the
+   * runtime surfaces every tool call it gates as an out-of-band request and
+   * only lets the tool run when the handler returns `allow`. When absent, the
+   * runtime applies its configured posture and auto-blocks unknown asks
+   * (DevMesh fail-closed default). OpenCode specifics stay in the adapter;
+   * this port is vendor-neutral.
+   */
+  onToolPermission?: (request: ToolPermissionRequest) => Promise<ToolPermissionDecision>;
 }
 
 export type AgentStreamEvent =
@@ -102,4 +154,10 @@ export interface AgentRuntime {
   supportsAgent?(agentRuntimeName: string): boolean;
   /** Cheap liveness/version probe; may throw RuntimeError. */
   health?(): Promise<{ healthy: boolean; version?: string }>;
+  /**
+   * Release runtime-owned resources (e.g. a long-lived serve-mode broker
+   * process) at shutdown. Idempotent; optional for runtimes with nothing to
+   * clean up.
+   */
+  dispose?(): Promise<void>;
 }

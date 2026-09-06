@@ -52,6 +52,15 @@ export const configSchema = z.strictObject({
   /** Binary used by the OpenCode adapter (PATH-resolvable or absolute). */
   opencodeBin: z.string().min(1).default("opencode"),
   /**
+   * Phase 14D: run non-structured executions through an external `opencode
+   * serve` broker with live per-tool permission interception instead of one
+   * `opencode run` process per execution. Structured-output executions
+   * (architect/tester/reviewer) keep using run mode, since `opencode serve`
+   * does not support structured output. Default true; false restores the
+   * Phase 14C run-mode-only behavior.
+   */
+  opencodeServe: z.boolean().default(true),
+  /**
    * Approve OpenCode permission requests (--auto). Default false: the
    * headless CLI then auto-rejects tool permission requests.
    */
@@ -185,7 +194,8 @@ function parseJsonEnv(raw: string | undefined, label: string): unknown {
 /**
  * Load configuration from the environment (all optional):
  *   DEVMESH_HOST, DEVMESH_PORT, DEVMESH_DATA_ROOT, DEVMESH_LOG_LEVEL,
- *   DEVMESH_RUNTIME, DEVMESH_OPENCODE_BIN, DEVMESH_OPENCODE_AUTO_APPROVE,
+ *   DEVMESH_RUNTIME, DEVMESH_OPENCODE_BIN, DEVMESH_OPENCODE_SERVE,
+ *   DEVMESH_OPENCODE_AUTO_APPROVE,
  *   DEVMESH_EXEC_TIMEOUT_MS, DEVMESH_BUDGET (JSON budget config),
  *   DEVMESH_PRICING (JSON array of pricing rules),
  *   DEVMESH_GATEWAY, DEVMESH_GATEWAY_BASE_URL, DEVMESH_GATEWAY_API_KEY,
@@ -203,6 +213,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     logLevel: env.DEVMESH_LOG_LEVEL,
     runtime: env.DEVMESH_RUNTIME,
     opencodeBin: env.DEVMESH_OPENCODE_BIN,
+    opencodeServe:
+      env.DEVMESH_OPENCODE_SERVE === undefined
+        ? undefined
+        : ["1", "true", "yes"].includes(env.DEVMESH_OPENCODE_SERVE.toLowerCase()),
     opencodeAutoApprove:
       env.DEVMESH_OPENCODE_AUTO_APPROVE === undefined
         ? undefined

@@ -26,6 +26,15 @@ export interface CommonRequestApproval {
   projectId: ProjectId;
   runId: RunId;
   taskId: TaskId | null;
+  /**
+   * Phase 14D: exact per-request identity for live per-tool approvals (e.g.
+   * the OpenCode permission request id). When present, deduplication is scoped
+   * strictly to (runId, requestId) — a distinct request NEVER finds an earlier
+   * approval, so a run-level approval can never satisfy a tool ask and two
+   * successive tool asks never share one approval. Absent keeps the historical
+   * resume/reuse behavior for run-level (START) approvals.
+   */
+  requestId?: string;
   spec: ApprovalSpec;
 }
 
@@ -59,7 +68,12 @@ export class ApprovalGate {
    */
   request(input: CommonRequestApproval): ApprovalRecord {
     // Reconstruct from persisted state first (resumability).
-    const existing = this.findExisting(input.runId, input.taskId, input.spec.kind);
+    const existing = this.findExisting(
+      input.runId,
+      input.taskId,
+      input.spec.kind,
+      input.requestId,
+    );
     if (existing) return existing;
 
     const record: ApprovalRecord = {
@@ -76,6 +90,7 @@ export class ApprovalGate {
       resolvedAt: null,
       decision: null,
       decidedBy: null,
+      requestId: input.requestId ?? null,
     };
     this.storage.approvals.insert(record);
     this.emit({
@@ -180,12 +195,25 @@ export class ApprovalGate {
    * restart, resumed run with a recreated task card) never duplicates a row or
    * re-emits `approval.requested`. Precise (runId, taskId) match first; falls
    * back to (runId, kind) because resume mints new task ids for the same stage.
+   *
+   * Phase 14D: a live per-request approval identifies itself with `requestId`
+   * and is matched STRICTLY by (runId, requestId). A distinct request can never
+   * collide with a run-level approval or with another request, because the
+   * request id is minted by the runtime for exactly one ask.
    */
   private findExisting(
     runId: string,
     taskId: TaskId | null,
     kind: string,
+    requestId?: string,
   ): ApprovalRecord | null {
+    if (requestId !== undefined) {
+      return (
+        this.storage.approvals
+          .listByRun(runId)
+          .find((a) => a.runId === runId && a.requestId === requestId) ?? null
+      );
+    }
     const approvals = this.storage.approvals.listByRun(runId);
     const byTask = approvals.find((a) => a.runId === runId && a.taskId === taskId);
     if (byTask) return byTask;

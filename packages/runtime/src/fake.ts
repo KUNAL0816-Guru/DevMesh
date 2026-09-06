@@ -1,3 +1,4 @@
+import type { PermissionResource } from "@devmesh/contracts";
 import type {
   AgentExecutionRequest,
   AgentExecutionResult,
@@ -6,11 +7,19 @@ import type {
   AgentUsage,
   ExecutionStatus,
   RunningExecution,
+  ToolPermissionDecision,
 } from "./types.js";
 
 export interface FakeStep {
   /** Events emitted on the stream when this step begins. */
   events?: AgentStreamEvent[];
+  /**
+   * Phase 14D: serve-mode-style tool calls this step raises mid-run, each
+   * answered through the request's `onToolPermission` handler (the same port
+   * the external broker uses). The decisions are recorded on the runtime for
+   * assertions; a step with unanswered asks fails closed.
+   */
+  toolAsks?: Array<{ resource: PermissionResource; tool: string; target?: string; requestId?: string }>;
   /** Side effect against the workspace (simulates the agent editing files). */
   effect?: () => void | Promise<void>;
 }
@@ -61,6 +70,8 @@ export class FakeRuntime implements AgentRuntime {
   readonly name = "fake";
   private readonly scriptOrFactory: FakeScript | FakeScriptFactory;
   private readonly live = new Map<string, LiveRun>();
+  /** Phase 14D: tool name -> decision recorded per execution. */
+  private readonly toolDecisions = new Map<string, Map<string, ToolPermissionDecision>>();
 
   constructor(script: FakeScript | FakeScriptFactory) {
     this.scriptOrFactory = script;
@@ -73,6 +84,11 @@ export class FakeRuntime implements AgentRuntime {
 
   isRunning(executionId: string): boolean {
     return this.live.has(executionId);
+  }
+
+  /** Last Phase 14D decision the fake recorded for a tool in an execution. */
+  toolDecision(executionId: string, tool: string): ToolPermissionDecision | undefined {
+    return this.toolDecisions.get(executionId)?.get(tool);
   }
 
   start(request: AgentExecutionRequest): RunningExecution {
@@ -125,6 +141,30 @@ export class FakeRuntime implements AgentRuntime {
         if (run.cancelled) break;
         if (Date.now() >= deadline) break;
         for (const e of step.events ?? []) emit(e);
+        // Phase 14D: answer the step's tool calls through the onToolPermission
+        // port exactly like the serve-mode broker does, one ask at a time.
+        for (const ask of step.toolAsks ?? []) {
+          if (run.cancelled) break;
+          let decision: ToolPermissionDecision;
+          if (request.onToolPermission) {
+            decision = await request.onToolPermission({
+              executionId: request.executionId,
+              resource: ask.resource,
+              tool: ask.tool,
+              ...(ask.target !== undefined ? { target: ask.target } : {}),
+              ...(ask.requestId !== undefined ? { requestId: ask.requestId } : {}),
+            });
+          } else {
+            // Same fail-closed posture as the broker with no handler attached.
+            decision = { decision: "deny", reason: "no permission handler attached — fail closed" };
+          }
+          let perTool = this.toolDecisions.get(request.executionId);
+          if (!perTool) {
+            perTool = new Map();
+            this.toolDecisions.set(request.executionId, perTool);
+          }
+          perTool.set(ask.tool, decision);
+        }
         // interruptible sleep, capped by the timeout budget so deadlines fire
         const budgetLeft = Math.max(deadline - Date.now(), 1);
         const slept = await new Promise<boolean>((res) => {

@@ -30,6 +30,7 @@ interface ProjectRow {
   root_path: string;
   created_at: string;
   owner_principal_id: string | null;
+  plugin_token: string | null;
 }
 
 export interface ProjectRecord {
@@ -39,6 +40,8 @@ export interface ProjectRecord {
   createdAt: string;
   /** Phase 14B: Principal who created this project. NULL in single-user mode. */
   ownerPrincipalId?: string | null;
+  /** Phase 14D: Per-project OpenCode permission plugin token. NULL when absent. */
+  pluginToken?: string | null;
 }
 
 const eventJson = <T>(json: string, what: string): T => {
@@ -58,6 +61,7 @@ function rowToProject(r: ProjectRow): ProjectRecord {
     rootPath: r.root_path,
     createdAt: r.created_at,
     ownerPrincipalId: r.owner_principal_id ?? null,
+    pluginToken: r.plugin_token ?? null,
   };
 }
 
@@ -142,10 +146,17 @@ export class ProjectRepository {
     projectIdSchema.parse(p.id);
     this.db
       .prepare(
-        `INSERT INTO projects (id, name, root_path, created_at, owner_principal_id)
-         VALUES (?, ?, ?, ?, ?)`,
+        `INSERT INTO projects (id, name, root_path, created_at, owner_principal_id, plugin_token)
+         VALUES (?, ?, ?, ?, ?, ?)`,
       )
-      .run(p.id, p.name, p.rootPath, p.createdAt, p.ownerPrincipalId ?? null);
+      .run(
+        p.id,
+        p.name,
+        p.rootPath,
+        p.createdAt,
+        p.ownerPrincipalId ?? null,
+        p.pluginToken ?? null,
+      );
   }
 
   get(id: ProjectId): ProjectRecord | null {
@@ -1229,6 +1240,12 @@ export interface ApprovalRecord {
   resolvedAt: string | null;
   decision: ApprovalDecision | null;
   decidedBy: string | null;
+  /**
+   * Phase 14D: exact per-request identity for per-tool approvals. NULL for
+   * run-level/START approvals, which keep the (runId, taskId)/(runId, kind)
+   * resume dedup. When set, deduplication is scoped to (runId, requestId) only.
+   */
+  requestId?: string | null;
 }
 
 interface ApprovalRow {
@@ -1245,11 +1262,12 @@ interface ApprovalRow {
   resolved_at: string | null;
   decision: string | null;
   decided_by: string | null;
+  request_id: string | null;
 }
 
 const APPROVAL_COLUMNS =
   "id, project_id, run_id, task_id, kind, title, detail, risk, status, " +
-  "requested_at, resolved_at, decision, decided_by";
+  "requested_at, resolved_at, decision, decided_by, request_id";
 
 function rowToApproval(row: ApprovalRow): ApprovalRecord {
   return {
@@ -1266,6 +1284,7 @@ function rowToApproval(row: ApprovalRow): ApprovalRecord {
     resolvedAt: row.resolved_at,
     decision: row.decision as ApprovalDecision | null,
     decidedBy: row.decided_by,
+    requestId: row.request_id,
   };
 }
 
@@ -1277,8 +1296,8 @@ export class ApprovalRepository {
       .prepare(
         `INSERT INTO approvals
          (id, project_id, run_id, task_id, kind, title, detail, risk, status,
-          requested_at, resolved_at, decision, decided_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          requested_at, resolved_at, decision, decided_by, request_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         rec.id,
@@ -1294,6 +1313,7 @@ export class ApprovalRepository {
         rec.resolvedAt ?? null,
         rec.decision ?? null,
         rec.decidedBy ?? null,
+        rec.requestId ?? null,
       );
     return rec;
   }

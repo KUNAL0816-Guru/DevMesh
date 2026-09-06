@@ -257,6 +257,28 @@ const MIGRATIONS: readonly Migration[] = [
        CREATE INDEX idx_context_project ON context_entries(project_id, namespace);`,
     ],
   },
+  {
+    version: 12,
+    name: "project-plugin-token",
+    up: [
+      `ALTER TABLE projects ADD COLUMN plugin_token TEXT;
+       -- Phase 14D: per-project token for the OpenCode permission plugin.
+       -- NULL for projects created before 14D or when plugin is disabled.`,
+    ],
+  },
+  {
+    version: 13,
+    name: "approval-request-id",
+    up: [
+      `ALTER TABLE approvals ADD COLUMN request_id TEXT;
+       -- Phase 14D: exact per-request identity for live tool approvals
+       -- (e.g. the OpenCode permission request id). NULL for run-level /
+       -- START approvals, which keep the (runId, taskId)/(runId, kind)
+       -- resume identity. Tool asks with a request_id are deduplicated ONLY
+       -- by (run_id, request_id) so distinct requests never share an approval.
+       CREATE INDEX idx_approvals_request ON approvals(run_id, request_id);`,
+    ],
+  },
 ];
 
 function currentVersion(db: DatabaseSync): number {

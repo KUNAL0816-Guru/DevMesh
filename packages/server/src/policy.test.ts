@@ -8,6 +8,7 @@ import {
 } from "@devmesh/contracts";
 import {
   decisionForExecution,
+  decisionForTool,
   effectiveAutoApprove,
   evaluateSetting,
   matchesGlob,
@@ -222,5 +223,87 @@ describe("effectiveAutoApprove", () => {
     expect(effectiveAutoApprove(false, "allow")).toBe(false);
     expect(effectiveAutoApprove(true, "ask")).toBe(false);
     expect(effectiveAutoApprove(true, "deny")).toBe(false);
+  });
+});
+
+describe("decisionForTool (Phase 14D per-tool interception)", () => {
+  it("allows read and fails CLOSED for every other resource when policy is empty", () => {
+    const profile = {};
+    expect(decisionForTool({ profile, resource: "read", target: "src/a.ts" }).action).toBe(
+      "allow",
+    );
+    for (const resource of permissionResources) {
+      if (resource === "read") continue;
+      expect(
+        decisionForTool({ profile, resource, target: "anything" }).action,
+        `${resource} with no policy must deny`,
+      ).toBe("deny");
+    }
+  });
+
+  it("treats the derived posture (read=allow) as allow", () => {
+    expect(decisionForTool({ profile: { read: "allow" }, resource: "read" }).action).toBe(
+      "allow",
+    );
+  });
+
+  it("applies authored shorthand actions exactly", () => {
+    expect(
+      decisionForTool({
+        profile: { bash: "allow" },
+        resource: "bash",
+        target: "git status",
+      }).action,
+    ).toBe("allow");
+    expect(
+      decisionForTool({ profile: { edit: "ask" }, resource: "edit", target: "src/a.ts" }).action,
+    ).toBe("ask");
+    expect(decisionForTool({ profile: { read: "deny" }, resource: "read" }).action).toBe("deny");
+  });
+
+  it("applies patterned rules only on target match and falls back to posture otherwise", () => {
+    const profile = makeDenyByDefaultProfile({
+      bash: { action: "allow", patterns: ["git *", "npm test*"] },
+    });
+    expect(
+      decisionForTool({ profile, resource: "bash", target: "git status" }).action,
+    ).toBe("allow");
+    expect(
+      decisionForTool({ profile, resource: "bash", target: "rm -rf /" }).action,
+    ).toBe("deny");
+    expect(decisionForTool({ profile, resource: "bash" }).action).toBe("deny");
+  });
+
+  it("a scoped read rule never widens non-read tools", () => {
+    const profile: PermissionProfile = { read: { action: "allow", patterns: ["src/**"] } };
+    expect(decisionForTool({ profile, resource: "read", target: "src/a.ts" }).action).toBe(
+      "allow",
+    );
+    expect(decisionForTool({ profile, resource: "read", target: "secret.txt" }).action).toBe(
+      "allow",
+    );
+    expect(
+      decisionForTool({ profile, resource: "edit", target: "src/a.ts" }).action,
+    ).toBe("deny");
+  });
+
+  it("applies unpatterned rules as authored actions", () => {
+    expect(
+      decisionForTool({ profile: { edit: { action: "deny" } }, resource: "edit", target: "x" })
+        .action,
+    ).toBe("deny");
+  });
+
+  it("an explicit deny always lands as deny, pattern-match or not", () => {
+    expect(
+      decisionForTool({
+        profile: { bash: { action: "deny", patterns: ["git *"] } },
+        resource: "bash",
+        target: "git status",
+      }).action,
+    ).toBe("deny");
+    expect(decisionForTool({ profile: { bash: "deny" }, resource: "bash", target: "" }).action).toBe(
+      "deny",
+    );
   });
 });

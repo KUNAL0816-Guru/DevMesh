@@ -139,12 +139,29 @@ describe("runtime selection (buildRuntime)", () => {
     }
   });
 
-  it("runtime=opencode remains the existing OpenCode path", async () => {
-    // Attempting to select the OpenCode runtime still emits a health event
-    // tagged with the runtime name ("opencode"), independent of whether the
+  it("runtime=opencode composes the Phase 14D hybrid by default (opencode-hybrid)", async () => {
+    // `opencodeServe` defaults on, so `runtime=opencode` composes the hybrid
+    // (per-execution OpenCode adapter + serve broker). The health event is
+    // tagged with the composite runtime name, independent of whether the
     // binary is actually installed (health resolves unhealthy but is still
     // recorded with runtime.name).
     const config = testConfig({ DEVMESH_RUNTIME: "opencode" });
+    const server = await startServer({ config, installSignals: false });
+    try {
+      const events = healthEvents(server);
+      expect(events.length).toBeGreaterThanOrEqual(1);
+      const last = events[events.length - 1]!;
+      expect(last.runtimeId).toBe("opencode-hybrid");
+    } finally {
+      await server.shutdown();
+    }
+  });
+
+  it("runtime=opencode with opencodeServe=false stays the Phase 14C run-mode path", async () => {
+    const config = testConfig({
+      DEVMESH_RUNTIME: "opencode",
+      DEVMESH_OPENCODE_SERVE: "false",
+    });
     const server = await startServer({ config, installSignals: false });
     try {
       const events = healthEvents(server);

@@ -26,8 +26,9 @@ export interface ProjectRecord {
   createdAt: string;
   /** Phase 14B: Principal who created this project. NULL in single-user mode. */
   ownerPrincipalId?: string | null;
+  /** Phase 14D: Per-project OpenCode permission plugin token. NULL when absent. */
+  pluginToken?: string | null;
 }
-
 /** Persistence port for project registrations (implemented by storage). */
 export interface ProjectStore {
   insert(project: ProjectRecord): void;
@@ -52,6 +53,11 @@ export interface CreateWorkspaceOptions {
   createdAt?: string;
   /** Phase 14B: Principal who creates this project (sets owner). */
   ownerPrincipalId?: string | null;
+  /**
+   * Phase 14D: Per-project OpenCode permission plugin token. When set, the
+   * project's plugin can authenticate against the DevMesh control plane.
+   */
+  pluginToken?: string | null;
 }
 
 export interface ReadFileOptions {
@@ -133,6 +139,7 @@ export class WorkspaceService {
       rootPath: root,
       createdAt: options.createdAt ?? new Date().toISOString(),
       ownerPrincipalId: options.ownerPrincipalId ?? null,
+      pluginToken: options.pluginToken ?? null,
     });
     return { projectId: id, name: slug, root };
   }

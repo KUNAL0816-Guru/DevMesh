@@ -19,12 +19,28 @@ import { reconcileInterrupted } from "./executions/service.js";
  */
 async function buildRuntime(config: Config): Promise<AgentRuntime | null> {
   if (config.runtime === "opencode") {
-    const { OpencodeAdapter } = await import("@devmesh/opencode-adapter");
-    return new OpencodeAdapter({
+    const { OpencodeAdapter, OpencodeServeRuntime, OpenCodeHybridRuntime } = await import(
+      "@devmesh/opencode-adapter"
+    );
+    const runRuntime = new OpencodeAdapter({
       binaryPath: config.opencodeBin,
       autoApprove: config.opencodeAutoApprove,
       model: config.opencodeModel,
     });
+    if (config.opencodeServe) {
+      // Phase 14D hybrid: structured-output executions run through the
+      // per-execution binary (14C), everything else through the serve broker
+      // with live per-tool permission interception. `autoApprove` is forwarded
+      // per request by the handler wrapper at the execution layer.
+      return new OpenCodeHybridRuntime(
+        runRuntime,
+        new OpencodeServeRuntime({
+          binaryPath: config.opencodeBin,
+          model: config.opencodeModel,
+        }),
+      );
+    }
+    return runRuntime;
   }
   if (config.runtime === "opencode-local") {
     const { OpenAiCompatibleRuntime } = await import("@devmesh/opencode-adapter");
@@ -118,6 +134,8 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Runnin
     if (shuttingDown) return;
     shuttingDown = true;
     await app.close(); // onClose hook closes storage
+    // Release runtime-owned resources (e.g. the serve-mode broker process).
+    if (runtime && runtime.dispose) await runtime.dispose();
   };
 
   if (opts.installSignals !== false) {

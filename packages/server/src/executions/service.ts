@@ -6,6 +6,7 @@ import {
   tokenUsageSchema,
   type AgentRole,
   type ArtifactProducer,
+  type PermissionProfile,
   type PricingRule,
   type ProjectId,
   type RunId,
@@ -17,6 +18,8 @@ import {
   RuntimeError,
   type AgentRuntime,
   type RunningExecution,
+  type ToolPermissionDecision,
+  type ToolPermissionRequest,
 } from "@devmesh/runtime";
 import { AgentRegistryError, type AgentDefinition, type AgentRegistry } from "@devmesh/agents";
 import {
@@ -39,6 +42,7 @@ import { runVerificationCommand } from "./commands.js";
 import type { ApprovalGate } from "../approvals.js";
 import {
   decisionForExecution,
+  decisionForTool,
   effectiveAutoApprove,
   PermissionError,
   type ExecutionPermissionResult,
@@ -196,6 +200,8 @@ function persistedUsage(usage: unknown): ExecutionUsage | null {
  */
 export class ExecutionService {
   private readonly active = new Map<string, RunningExecution>();
+  /** Per-execution tool-ask cancellation signals (Phase 14D). */
+  private readonly toolCancels = new Map<string, AbortController>();
   private readonly ledger: BudgetLedger;
   private readonly priceTable: PriceTable | null;
 
@@ -350,6 +356,23 @@ export class ExecutionService {
     // error) so an in-flight execution never leaks its token reservation.
     for (const r of reservation) this.ledger.reserve(r.kind, r.id, r.tokens);
 
+    // Phase 14D: per-execution cancellation signal for tool asks awaiting a
+    // human decision. `cancel()` fires it BEFORE asking the runtime, so a
+    // blocked tool ask fails closed instead of hanging the run's promise.
+    const provider = this.opts.policyBaselines ?? baselineProfile;
+    const toolCancel = new AbortController();
+    this.toolCancels.set(executionId, toolCancel);
+    const terminateToolAsk = (): boolean => toolCancel.signal.aborted;
+    const onToolPermission = this.makeToolPermissionHandler({
+      rec,
+      role: def.role,
+      profile: provider(def.role),
+      pipelineRunId: card ? card.runId : runId,
+      projectId: handle.projectId,
+      taskId: card?.id ?? null,
+      isCancelled: terminateToolAsk,
+    });
+
     let running: RunningExecution;
     try {
       running = runtime.start({
@@ -364,8 +387,12 @@ export class ExecutionService {
           permission.decision,
         ),
         ...(input.outputFormat ? { outputFormat: input.outputFormat } : {}),
+        // Live per-tool interception (serve-mode broker). Harmless under the
+        // run-mode binary, whose sessions never raise permission asks.
+        onToolPermission,
       });
     } catch (err) {
+      this.toolCancels.delete(executionId);
       this.finalizeRuntimeFailure(rec, err, reservation);
       throw err instanceof RuntimeError ? err : new RuntimeError("runtime/unavailable", String(err));
     }
@@ -376,6 +403,7 @@ export class ExecutionService {
       .catch((err: unknown) => this.finalizeRuntimeFailure(rec, err, reservation))
       .finally(() => {
         this.active.delete(handle.projectId);
+        this.toolCancels.delete(executionId);
       });
 
     return rec;
@@ -393,6 +421,10 @@ export class ExecutionService {
         `execution ${executionId} is not active (status: ${rec.status})`,
       );
     }
+    // Fail tool asks that are blocked on a human decision BEFORE the runtime
+    // tears the session down, so nothing waits longer than the cancel itself.
+    this.toolCancels.get(executionId)?.abort();
+    this.toolCancels.delete(executionId);
     await running.cancel(reason ?? "cancelled via API");
     return this.opts.storage.executions.get(executionId) ?? rec;
   }
@@ -562,6 +594,100 @@ export class ExecutionService {
     }
 
     return result;
+  }
+
+  /**
+   * Phase 14D: the runtime-facing per-tool permission callback. Pure policy is
+   * evaluated per ask (`decisionForTool` — see policy.ts); allow/deny are
+   * answered immediately, `ask` bridges to the shared ApprovalGate and blocks
+   * until a human decides, the run is cancelled (fail closed), or no gate is
+   * wired (fail closed). Every ask resolves to allow or deny exactly once and
+   * emits the canonical requested/resolved events under a `tool:` permission id.
+   */
+  private makeToolPermissionHandler(ctx: {
+    rec: ExecutionRecord;
+    role: AgentRole;
+    profile: PermissionProfile;
+    pipelineRunId: RunId;
+    projectId: ProjectId;
+    taskId: TaskId | null;
+    isCancelled: () => boolean;
+  }): (request: ToolPermissionRequest) => Promise<ToolPermissionDecision> {
+    const { rec, role, profile, pipelineRunId, projectId, taskId, isCancelled } = ctx;
+    let toolAskSeq = 0;
+    return async (request) => {
+      const permissionId = `tool:${role}:${rec.id}:${toolAskSeq++}`.slice(0, 128);
+      // Phase 14D: per-request identity. When the runtime surfaced its own id
+      // (e.g. the OpenCode permission request id) it is the approval identity,
+      // so a distinct ask can NEVER reuse a run-level approval, and a redelivered
+      // ask reuses exactly its own approval (no duplicate row/event). Runtimes
+      // without request ids get an execution-scoped minted identity instead —
+      // every tool ask still owns an approval of its own.
+      const requestIdentity = request.requestId ?? permissionId;
+      const disposal = decisionForTool({
+        profile,
+        resource: request.resource,
+        target: request.target,
+      });
+      if (disposal.action === "allow") {
+        this.emitPermissionResolved(rec.id, permissionId, pipelineRunId, projectId, "allow");
+        return { decision: "allow", reason: `allowed by policy — ${disposal.reason}` };
+      }
+      if (disposal.action === "deny") {
+        this.emitPermissionResolved(rec.id, permissionId, pipelineRunId, projectId, "deny");
+        return { decision: "deny", reason: `denied by policy — ${disposal.reason}` };
+      }
+      // ask - write a durable approval and wait for a human decision.
+      const gate = this.opts.approvalGate ?? null;
+      if (!gate) {
+        this.emitPermissionResolved(rec.id, permissionId, pipelineRunId, projectId, "deny");
+        return { decision: "deny", reason: "no approval gate configured — tool denied (fail closed)" };
+      }
+      const approval = gate.request({
+        projectId,
+        runId: pipelineRunId,
+        taskId,
+        requestId: requestIdentity,
+        spec: {
+          kind: "permission",
+          title: `Tool permission: ${request.resource} (${request.tool})${request.target ? `: ${request.target}` : ""}`,
+          detail: [
+            `role: ${role}`,
+            `tool: ${request.tool}`,
+            `target: ${request.target ?? "(none)"}`,
+            `policy: ${disposal.reason}`,
+          ]
+            .join("\n")
+            .slice(0, 4000),
+          risk: "high",
+        },
+      });
+      if (approval.status === "pending") {
+        this.emit({
+          ts: new Date().toISOString(),
+          runId: pipelineRunId,
+          projectId,
+          actor: "system",
+          type: "permission.requested",
+          sessionId: rec.id,
+          permissionId,
+          tool: request.tool,
+        });
+      }
+      const resolved = await gate.waitAnyResolution([approval.id], () => isCancelled());
+      if (resolved?.status === "approved") {
+        this.emitPermissionResolved(rec.id, permissionId, pipelineRunId, projectId, "allow");
+        return { decision: "allow", reason: `approved via approval gate — ${disposal.reason}` };
+      }
+      this.emitPermissionResolved(rec.id, permissionId, pipelineRunId, projectId, "deny");
+      return {
+        decision: "deny",
+        reason:
+          resolved === null
+            ? "execution cancelled while awaiting tool approval — tool denied"
+            : "tool approval denied",
+      };
+    };
   }
 
   /** Emit the canonical resolved event for a consumed permission decision. */

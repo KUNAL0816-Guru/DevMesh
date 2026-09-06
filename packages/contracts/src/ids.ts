@@ -33,3 +33,15 @@ export const newSessionId = (raw: string): SessionId =>
   sessionIdSchema.parse(raw);
 export const newContextEntryId = (): ContextEntryId =>
   contextEntryIdSchema.parse(uuid());
+
+/**
+ * Phase 14D: Per-project OpenCode permission plugin token. A cryptographically
+ * random secret that the installed plugin presents to the control plane so the
+ * per-tool permission endpoint can authenticate it without a bearer principal.
+ */
+export function newPluginToken(): string {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  return `dpk_${hex}`;
+}

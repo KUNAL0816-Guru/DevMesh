@@ -1,5 +1,7 @@
 import { z } from "zod";
 import { globPatternSchema } from "./common.js";
+import { agentRoleSchema } from "./roles.js";
+import { projectIdSchema, runIdSchema, taskIdSchema } from "./ids.js";
 import type { AgentRole } from "./roles.js";
 
 export const permissionActions = ["allow", "ask", "deny"] as const;
@@ -91,3 +93,42 @@ export function makeDenyByDefaultProfile(
     ...(webfetch !== undefined ? { webfetch } : {}),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Phase 14D: per-tool permission wire schemas (OpenCode enforcement plugin)
+// ---------------------------------------------------------------------------
+
+/**
+ * Request body for POST /permissions/tool — the OpenCode plugin delegates every
+ * tool call decision here. `role` is the agent role currently executing in the
+ * run; `tool` is the OpenCode tool name (e.g. "bash", "edit", "webfetch");
+ * `target` is the concrete argument being acted on (command line, file path,
+ * URL) when there is one. The project token (header) authorizes the request.
+ */
+export const toolPermissionRequestSchema = z.strictObject({
+  role: agentRoleSchema,
+  tool: z.string().min(1).max(80),
+  target: z.string().max(2000).optional(),
+  projectId: projectIdSchema,
+  runId: runIdSchema,
+  taskId: taskIdSchema.optional(),
+});
+export type ToolPermissionRequest = z.infer<typeof toolPermissionRequestSchema>;
+
+/**
+ * Response body for POST /permissions/tool — the plugin enforces decision.
+ * `ask` is returned verbatim when the policy requests a human decision; the
+ * standalone plugin cannot prompt, so it rejects an `ask` (fail closed) while
+ * the live serve broker surfaces it through its own approval flow.
+ */
+export const toolPermissionDecisionSchema = z.object({
+  decision: z.enum(["allow", "ask", "deny"]),
+  action: permissionActionSchema,
+  resource: permissionResourceSchema.optional(),
+  tool: z.string().min(1).max(80),
+  reason: z.string().min(1).max(512),
+  matchedPattern: z.string().max(512).optional(),
+  runId: z.string().max(200).optional(),
+  approvalId: z.string().max(200).optional(),
+});
+export type ToolPermissionDecision = z.infer<typeof toolPermissionDecisionSchema>;
