@@ -1,9 +1,9 @@
 # DevMesh Development Plan
 
 > Status: active
-> Last updated: 2026-09-06 (post Phase 14D — Phases 0–12 complete; Phases 13A–13G complete; Phase 13H next; Phases 14A–14D complete; Phase 14E next)
+> Last updated: 2026-09-06 (post Phase 14E — Phases 0–12 complete; Phases 13A–13G complete; Phase 13H next; Phases 14A–14E complete)
 > Reference: docs/adr/0001-approved-architecture.md
-> Test baseline: 822 passed, 5 skipped, 0 failed (Phase 14D corrective verification reported before documentation synchronization; historical: Phase 14C was 741 passed, Phase 14B was 700 passed, Phase 14A was 679 passed, Phase 13G was 645 passed, Phase 12 was 607 passed, Phase 11 was 590 passed, Phase 10 was 574 passed)
+> Test baseline: 852 passed, 5 skipped, 0 failed (Phase 14E full repository suite; historical: Phase 14D was 822 passed, Phase 14C was 741 passed, Phase 14B was 700 passed, Phase 14A was 679 passed, Phase 13G was 645 passed, Phase 12 was 607 passed, Phase 11 was 590 passed, Phase 10 was 574 passed)
 
 ---
 
@@ -80,6 +80,14 @@ agent runtime is OpenCode behind a swappable adapter port.
   (`.opencode/plugins/devmesh-permission.js`) plus a control-plane
   `POST /permissions/tool` route that enforces policy via a per-project plugin
   token.
+- Read-only MCP server (Phase 14E): a new `packages/mcp` package exposes
+  seven read-only MCP tools over Streamable HTTP (`POST /mcp`) using the
+  official `@modelcontextprotocol/sdk` v1.30.0. The MCP surface reuses the
+  Phase 14A bearer authentication and Phase 14B project/run authorization
+  model; no independent MCP authorization system is introduced. Tools return
+  safe metadata — workspace paths, SHA-256 hashes, command evidence, and
+  internal details are never surfaced. The server is stateless per HTTP
+  request (fresh MCP server + transport per request, no persisted sessions).
 
 ---
 
@@ -111,6 +119,10 @@ packages/
                    (OpenCodeHybridRuntime) + tool permission catalog (Phase 14D)
   plugin/          OpenCode permission plugin packaging: source generation,
                    installer, env config, tool catalog (Phase 14D, new package)
+  mcp/             Read-only MCP server: @modelcontextprotocol/sdk (1.30.0),
+                   Streamable HTTP transport, seven read-only tools with
+                   project/run authorization and safe response shaping
+                   (Phase 14E, new package)
   server/          Fastify HTTP server, orchestrator, execution service,
                    verification (SHA-256 + independent test replay), artifact
                    builder (structured-first, text-parsing fallback), SSE streaming,
@@ -118,7 +130,8 @@ packages/
                    bearer authentication (Phase 14A) + project authorization (Phase 14B),
                    permission policy evaluation + execution enforcement (Phase 14C),
                    decisionForTool + permission bridge (POST /permissions/tool) +
-                   per-tool approval identity (Phase 14D)
+                   per-tool approval identity (Phase 14D),
+                   MCP endpoint registration (POST /mcp) (Phase 14E)
 ```
 
 ---
@@ -1461,7 +1474,7 @@ browser.
 included in the backend test baseline (645 passed). Backend tests added in
 13A and 13C are included in that baseline.
 
-### Phase 14: Security Hardening — 14A, 14B, 14C & 14D COMPLETE; 14E NEXT
+### Phase 14: Security Hardening — Phases 14A–14E COMPLETE
 
 **Goal:** Production-hardening items referenced across the ADR and README:
 authentication/authorization for a multi-user deployment, a contract-level
@@ -1472,11 +1485,11 @@ packaging the MCP server.
 
 Phase 14 is delivered as sub-phases. Phase 14A (authentication foundation),
 Phase 14B (authorization & project isolation), Phase 14C (permission policy),
-and Phase 14D (live per-tool permission interception / OpenCode plugin) are
-complete; together they establish the authentication + project-authorization
-foundation, the agent permission-policy layer with run- and tool-level
-enforcement, live per-tool interception, and approval/event integration.
-Phase 14E (MCP server) is the next sub-phase and has not been started.
+Phase 14D (live per-tool permission interception / OpenCode plugin), and
+Phase 14E (MCP server) are all complete. Together they establish the
+authentication + project-authorization foundation, the agent permission-policy
+layer with run- and tool-level enforcement, live per-tool interception,
+approval/event integration, and the read-only MCP server.
 
 #### Phase 14A: Authentication Foundation — COMPLETE (commit `dddf8c8`)
 
@@ -1895,35 +1908,143 @@ Token rotation, rate limiting, audit logging, OAuth, OIDC, JWT, and RBAC are
 - [x] Default-deny enforcement per-tool for previously unmatched operations
 - [x] OpenCode plugin packages and installs into a project
 
-#### Phase 14E: MCP Server — NOT STARTED (NEXT)
+#### Phase 14E: MCP Server — COMPLETE (commit `d1d0e04`)
 
-**Goal:** Expose DevMesh state (pipelines, artifacts, context) to tools over
-MCP. This sub-phase concerns MCP integration / server work; the specific
-architecture (transport, package, endpoints, authentication, tools/resources)
-has not been resolved and will be determined by the Phase 14E audit.
+**Goal:** Expose DevMesh state (pipelines, artifacts, context, approvals,
+usage) to tools over MCP. The MCP surface is intentionally read-only: it
+returns safe metadata and bounded preview information without exposing
+workspace internals, execution mutations, or runtime control.
+
+**Package: `packages/mcp` (`@devmesh/mcp`)**
+
+New package containing the MCP server, tool definitions, authorization
+context, and error handling. Depends on `@modelcontextprotocol/sdk` v1.30.0
+and `@devmesh/contracts` / `@devmesh/storage`.
+
+**Architecture:**
+
+| Component | Status |
+|---|---|
+| `@modelcontextprotocol/sdk` v1.30.0 | done — official MCP SDK |
+| `McpServer` from `@modelcontextprotocol/sdk/server/mcp.js` | done |
+| `StreamableHTTPServerTransport` from `@modelcontextprotocol/sdk/server/streamableHttp.js` | done |
+| `POST /mcp` — Streamable HTTP endpoint | done |
+| Stateless per HTTP request (fresh `McpServer` + transport per request, no persisted sessions) | done |
+| `AsyncLocalStorage` propagates Phase 14A `request.auth` principal to tool handlers | done |
+| `McpAuthorization` interface — delegates to Phase 14B `authorizeProject` / `authorizeRun` | done |
+| No MCP resources, prompts, or subscriptions — tools only | done |
+| No SSE MCP transport, WebSocket MCP transport, or persistent MCP sessions | done |
+
+**Endpoint (`POST /mcp`):**
+
+`/mcp` is included in the Phase 14A `API_PREFIXES` allowlist. When
+`DEVMESH_AUTH_TOKEN` is configured:
+
+- `POST /mcp` requires `Authorization: Bearer <token>`.
+- Missing/invalid bearer authentication is rejected with 401
+  `auth/unauthenticated`.
+- The bearer token is not returned by the MCP surface.
+
+When authentication is disabled (single-user mode), `/mcp` is accessible
+without a token, preserving the existing single-user workflow.
+
+**MCP tool surface (seven read-only tools):**
+
+| Tool | Input | Authorization | Description |
+|---|---|---|---|
+| `list_projects` | none | project-scoped via principal | Lists projects the authenticated principal owns (all in single-user mode). Returns id, name, createdAt only — no workspace paths, plugin tokens, or owner identities. |
+| `list_pipelines` | `projectId` | `authorizeProject` | Lists pipeline runs for a project. |
+| `get_pipeline` | `runId`, optional `projectId` | `authorizeRun` (run's persisted project is authoritative) | Fetches a single pipeline run. Caller-supplied `projectId` is rejected when it disagrees with the run's project. |
+| `list_artifacts` | `runId`, optional `kind` | `authorizeRun` | Lists artifact metadata plus bounded preview. File paths, SHA-256 hashes, command evidence, and raw payloads are never surfaced. |
+| `get_context` | `projectId`, optional `namespace` | `authorizeProject` | Reads latest context entries through project-scoped context repository only — global/cross-project history is never queried. |
+| `list_approvals` | `projectId` | `authorizeProject` | Lists pending approval requests for a project. Read-only — resolved requests and approval mutations are out of scope. |
+| `get_run_usage` | `runId` | `authorizeRun` | Aggregates token/cost usage for a pipeline run with per-task breakdown. Unknown values reported as null. |
+
+**Authorization model:**
+
+MCP reuses the Phase 14B authorization model rather than creating an
+independent MCP authorization system:
+
+- Project authorization is based on the authenticated principal and persisted
+  project ownership/isolation.
+- Run access is authorized against the run's authoritative project.
+- Caller-supplied project identity must not override persisted ownership.
+- Cross-project access is rejected.
+- `get_pipeline` authorizes the run before exposing it.
+- `get_context` uses project-scoped access and must not leak global context.
+
+**Response safety:**
+
+The MCP surface returns intentionally restricted information:
+
+| Category | Exposed | Not Exposed |
+|---|---|---|
+| Artifacts | id, kind, projectId, runId, taskId, producedBy, createdAt, bounded preview | workspace filesystem paths, SHA-256 values, commands, working directories, raw payloads |
+| Projects | id, name, createdAt | workspace root paths, plugin tokens, owner principal identities |
+| General errors | safe `McpToolError` message or generic "internal error" | internal stack traces, server details, diagnostic information |
+
+**Error handling:**
+
+- `McpToolError` maps to `isError: true` tool results with safe messages.
+- Phase 14B `auth/forbidden` errors surface their safe message (never a
+  successful empty response).
+- Unknown errors collapse to a generic "internal error while running tool
+  `<name>`" — no stacks, diagnostics, or internals are ever surfaced over
+  MCP.
+- The HTTP transport handler catches unhandled errors and returns a generic
+  JSON-RPC `-32603` internal error.
+
+**Explicit non-goals (not implemented in Phase 14E):**
+
+- MCP resources / prompts / subscriptions
+- MCP mutation tools (creating projects, creating/running pipelines, approving
+  or denying approvals, modifying artifacts, modifying context)
+- Shell / terminal execution tools
+- Workspace write tools
+- Agent execution tools
+- Runtime control tools
+- Independent MCP authorization system
+- Persistent MCP sessions
+- Bidirectional MCP execution control
+- SSE or WebSocket MCP transports
 
 **Acceptance Criteria**
 
-- [ ] MCP server exposes pipelines/artifacts/context
+- [x] MCP server exposes read-only tools for pipelines, artifacts, context,
+      approvals, and usage
+- [x] `POST /mcp` endpoint serves Streamable HTTP transport
+- [x] Stateless per HTTP request (fresh server + transport, no session state)
+- [x] Phase 14A bearer authentication enforced on `/mcp`
+- [x] Phase 14B project/run authorization reused for all tool calls
+- [x] Cross-project access rejected
+- [x] Safe response shaping — no filesystem paths, hashes, commands, or
+      internal details surfaced
+- [x] Generic error handling — no stack traces or internals exposed
+- [x] Seven read-only tools; no mutation, execution, or write tools
+- [x] Existing 14A–14D functionality unaffected
 
-**Required Tests (remaining Phase 14 sub-phase — 14E only)**
+**Required Tests (Phase 14E)**
 
 | File | Tests |
 |---|---|
-| `server/app.test.ts` | MCP routes (14E) — auth (14A/14B) and permission-flow (14C/14D) coverage already provided via `server/auth.test.ts`, the 14C policy suites, and the 14D permission-bridge/serve-mode suites |
+| `packages/mcp/src/server.test.ts` | 13 — MCP package unit tests: tool registration, tool execution, authorization delegation, error handling, response shaping |
+| `packages/server/src/mcp.test.ts` | 17 — HTTP integration tests: Streamable HTTP transport, bearer auth (valid/missing/invalid), project/run authorization (owner match, cross-project rejection, not-found), tool invocations over HTTP, malformed requests, unknown tool behavior, error safety |
 
-**Phase 14 total test baseline (final Phase 14D corrective verification
-reported before documentation synchronization):** 40 test files passed, 2
-skipped, 822 tests passed, 5 skipped. Previous Phase 14D implementation
-baseline was 39 files passed, 2 skipped, 789 passed, 5 skipped; Phase 14C
-historical baseline was 741 passed, 5 skipped.
+**Phase 14E test baseline:** 13/13 MCP package tests passed; 17/17 MCP HTTP
+integration tests passed; 30 total Phase 14E-specific focused tests passed.
 
-**Estimated new tests:** 14D delivered ~24 serve-mode + ~14 permission-bridge +
-~23 plugin + ~12 policy-executions + ~7 policy + hybrid/bootstrap additions.
-14E (MCP) remains to be delivered. Historical delivered tests: 14A = 53 in
-`auth.test.ts`; 14B = 2 storage tests plus the `auth.test.ts` authorization
-matrix; 14C = the 7+21+11 policy/contracts/executions tests plus adapter and
-orchestrator additions.
+**Phase 14 total test baseline (Phase 14E full repository suite):** 852
+tests passed, 5 skipped, 0 failed. Previous Phase 14D corrective verification
+was 822 passed, 5 skipped; Phase 14C historical baseline was 741 passed, 5
+skipped. Full suite executed with constrained Vitest worker settings due to
+repository memory constraints.
+
+**Estimated new tests:** 14E delivered 13 MCP package + 17 MCP HTTP integration
+= 30 focused tests. Historical delivered tests: 14A = 53 in `auth.test.ts`;
+14B = 2 storage tests plus the `auth.test.ts` authorization matrix; 14C =
+the 7+21+11 policy/contracts/executions tests plus adapter and orchestrator
+additions; 14D delivered ~24 serve-mode + ~14 permission-bridge + ~23 plugin
++ ~12 policy-executions + ~7 policy + hybrid/bootstrap additions.
 
 ---
 
@@ -1947,12 +2068,12 @@ orchestrator additions.
 | 11 | Additional agent roles | Amendment 3 | ~8 | ✅ Complete |
 | 12 | Local/offline model adapter | Amendment 9 | ~5 | ✅ Complete (17 tests) |
 | 13 | Frontend/UI | Amendment 7 | ~2 | 13A–13G ✅ Complete; 13H ⬜ Next |
-| 14 | Security hardening, permissions, MCP & plugin packaging | ADR/README | ~12 | 14A ✅ Complete; 14B ✅ Complete; 14C ✅ Complete; 14D ✅ Complete; 14E ⬜ Next / Not started |
+| 14 | Security hardening, permissions, MCP & plugin packaging | ADR/README | ~12 | 14A ✅ Complete; 14B ✅ Complete; 14C ✅ Complete; 14D ✅ Complete; 14E ✅ Complete |
 
-> Phases 13–14 are tracked in the roadmap. Phase 13A–13G and Phase 14A–14D
+> Phases 13–14 are tracked in the roadmap. Phase 13A–13G and Phase 14A–14E
 > (authentication + project authorization + permission policy + live per-tool
-> interception / OpenCode plugin) are implemented; Phase 13H and Phase 14E are
-> the next sub-phases. Detailed goals, acceptance criteria, and required tests
+> interception / OpenCode plugin + MCP server) are implemented; Phase 13H is
+> the next sub-phase. Detailed goals, acceptance criteria, and required tests
 > for each appear above.
 >
 > **Roadmap note (Phase 9B boundary):** the approval gate currently guards the
@@ -1965,7 +2086,7 @@ orchestrator additions.
 
 ---
 
-## Appendix: Test File Inventory (post Phase 14D)
+## Appendix: Test File Inventory (post Phase 14E)
 
 | File | Tests | Area |
 |---|---|---|
@@ -2005,13 +2126,15 @@ orchestrator additions.
 | `server/src/orchestrator-real.test.ts` | 1 | Real OpenCode (gated) |
 | `server/src/opencode-real.test.ts` | 4 | Real OpenCode E2E (gated) |
 | `plugin/src/plugin.test.ts` | 23 | Phase 14D OpenCode plugin packaging / install / env / source generation |
+| `mcp/src/server.test.ts` | 13 | Phase 14E MCP package: tool registration, execution, authorization delegation, error handling |
+| `server/src/mcp.test.ts` | 17 | Phase 14E MCP HTTP integration: Streamable HTTP transport, bearer auth, project/run authorization, tool calls over HTTP, malformed/unknown-tool/error behavior |
 | `client/src/utils/format.test.ts` | ~20 | Formatting helpers (Phase 13F + Phase 13G approval display) |
 | `client/src/hooks/usePipelineStream.test.ts` | ~6 | SSE stream hook (Phase 13E) |
-| **Total (listed)** | **~`it(`/`test(` occurrences summed** | 14A adds 53 in auth.test.ts; 14B adds +2 in storage.test.ts (owner isolation + context scoping); 14C adds 7 (permissions.test.ts) + 21 (policy.test.ts) + 11 (policy-executions.test.ts) plus adapter/executions/orchestrator additions; 14D adds +7 (policy.test.ts) +12 (policy-executions.test.ts) +24 (serve-mode.test.ts) +14 (permission-bridge.test.ts) +23 (plugin.test.ts) + hybrid/bootstrap/storage additions |
+| **Total (listed)** | **~`it(`/`test(` occurrences summed** | 14A adds 53 in auth.test.ts; 14B adds +2 in storage.test.ts (owner isolation + context scoping); 14C adds 7 (permissions.test.ts) + 21 (policy.test.ts) + 11 (policy-executions.test.ts) plus adapter/executions/orchestrator additions; 14D adds +7 (policy.test.ts) +12 (policy-executions.test.ts) +24 (serve-mode.test.ts) +14 (permission-bridge.test.ts) +23 (plugin.test.ts) + hybrid/bootstrap/storage additions; 14E adds +13 (mcp/server.test.ts) +17 (server/mcp.test.ts) |
 
 > Counts above reflect the `it(`/`test(` occurrences per file and are
 > approximate (vitest's numeric total includes dynamically-defined subtests);
-> the authoritative number comes from `npm test` (822 passed, 5 skipped, 0 failed).
+> the authoritative number comes from `npm test` (852 passed, 5 skipped, 0 failed).
 > Frontend tests (client package) run in a separate Vitest config and are not
 > included in that count.
 
