@@ -41,6 +41,7 @@ import type { DomainEvent } from "@devmesh/contracts";
 import { PipelineEventStream } from "./pipeline-sse.js";
 import { DEFAULT_PROFILE_PROVIDER, type ProfileProvider } from "./policy.js";
 import { registerPermissionToolRoute } from "./permission-bridge.js";
+import { registerMcpEndpoint } from "./mcp.js";
 
 export const APP_VERSION = "0.1.0";
 
@@ -209,6 +210,12 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
     policyBaselines: profileProvider,
   });
 
+  // -- Phase 14E: read-only MCP server over Streamable HTTP ------------------
+  // POST /mcp only. Authentication is Phase 14A's Bearer hook (added /mcp to
+  // the API prefix allowlist in auth.ts); authorization is injected from the
+  // exact Phase 14B authorize functions used by every REST route above.
+  registerMcpEndpoint(app, { storage: opts.storage });
+
   // -- static frontend (SPA fallback) ---------------------------------------
   const serverDir = dirname(fileURLToPath(import.meta.url));
   const defaultStaticRoot = opts.staticRoot ?? join(serverDir, "..", "..", "client", "dist");
@@ -231,6 +238,7 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
       p.startsWith("/approvals") ||
       p.startsWith("/auth") ||
       p.startsWith("/permissions") ||
+      p.startsWith("/mcp") ||
       p.startsWith("/api");
     if (!isApi && existsSync(defaultStaticRoot)) {
       void reply.sendFile("index.html");

@@ -15,6 +15,7 @@ export default defineConfig({
       "@devmesh/runtime": pkgRoot("runtime"),
       "@devmesh/opencode-adapter": pkgRoot("opencode-adapter"),
       "@devmesh/server": pkgRoot("server"),
+      "@devmesh/mcp": pkgRoot("mcp"),
     },
   },
   test: {

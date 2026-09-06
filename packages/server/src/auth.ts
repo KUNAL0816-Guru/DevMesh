@@ -53,7 +53,7 @@ export function secureCompare(a: string, b: string): boolean {
  * All other paths (/, /assets/*, SPA fallback, unknown routes) are
  * unauthenticated — preserving the existing single-user dev workflow.
  */
-const API_PREFIXES = ["/health", "/projects", "/pipelines", "/executions", "/approvals", "/auth"];
+const API_PREFIXES = ["/health", "/projects", "/pipelines", "/executions", "/approvals", "/auth", "/mcp"];
 
 /**
  * Returns true when the path matches an API prefix and should be authenticated.

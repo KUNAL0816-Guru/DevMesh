@@ -1,0 +1,27 @@
+{
+  "name": "@devmesh/mcp",
+  "version": "0.1.0",
+  "description": "DevMesh read-only MCP server (Phase 14E)",
+  "type": "module",
+  "license": "UNLICENSED",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@devmesh/contracts": "*",
+    "@devmesh/storage": "*",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.0.5"
+  }
+}
